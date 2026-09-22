@@ -301,6 +301,29 @@ def cancel_inflight(c, sql):
     print("[cancel] PASS")
     return qid
 
+
+def https_order_by(c):
+    """H4（https 侧）：ORDER BY → 写端 coalesce(1) 单 part → 终态恰 1 个 presigned endpoint，行序保持。"""
+    import urllib.request
+    import pyarrow.ipc
+    endpoints, records, qid = poll_terminal(c, "SELECT id FROM range(5000) ORDER BY id")
+    assert len(endpoints) == 1, f"H4 violated: {len(endpoints)} endpoints for ORDER BY in https mode"
+    ticket, locations = parse_endpoint(endpoints[0])
+    assert ticket is None and len(locations) == 1
+    with urllib.request.urlopen(locations[0]) as resp:
+        table = pyarrow.ipc.open_stream(resp.read()).read_all()
+    rows = table.column("id").to_pylist()
+    assert len(rows) == 5000 and rows == sorted(rows), "order must be preserved"
+    print(f"[https-order] single endpoint, 5000 rows in order: PASS")
+    from minio import Minio
+    import json
+    m = Minio("localhost:9000", access_key="minioadmin", secret_key="minioadmin", secure=False)
+    mani = json.loads(m.get_object("fg-results", f"results/spark/fg/{qid}/manifest.json").read())
+    assert len(mani["parts"]) == 1 and mani["parts"][0]["recordCount"] == 5000, \
+        "write side must coalesce to a single part"
+    print("[https-order] write-side coalesce(1): PASS")
+    return qid
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "legacy"
     c = client()
@@ -312,6 +335,8 @@ if __name__ == "__main__":
         poll_flight_info(c, "SELECT id FROM range(5000) ORDER BY id", 5000)
     elif which == "https":
         https_presign(c, "SELECT id, id * 3 AS t FROM range(3000)", 3000, do_renew=True)
+    elif which == "https-order":
+        https_order_by(c)
     elif which == "cancel":
         cancel_inflight(c, "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")
     else:
