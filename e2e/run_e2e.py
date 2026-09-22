@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""FG M1 e2e（实测通过 2026-09）：原始 FlightClient + grpcio PollFlightInfo。
-
-实测要点（arrow-java 19 / pyarrow 25 / macOS）：
-  - Basic 握手：单条 HandshakeRequest{payload=Flight.BasicAuth{username=2,password=3}}；
-    后续调用带二进制头 auth-token-bin（非 authorization Bearer）
-  - PollFlightInfo 请求体直接是 FlightDescriptor{descriptor_type=CMD(2), command=Any}（非 FlightData）
-  - CancelFlightInfo 是 doAction（类型名 "CancelFlightInfo"），body=CancelFlightInfoRequest
-  - pyarrow FlightClient 无 poll/cancel_flight_info 客户端 API（⑥ 矩阵结论）
-  - 运行需清代理变量（脚本已内置）
-
-用法：python3 e2e/run_e2e.py legacy|poll|poll-multi|cancel
-环境：见仓库 README/计划书 §4（PG16+MinIO+引擎薄壳+gateway）。依赖：pyarrow、grpcio、minio。
-"""
-
+"""FG M1 e2e：pyarrow 原始 FlightClient（手工编码 Flight SQL protobuf）+ grpcio PollFlightInfo。"""
 import base64
 import os
 import struct
@@ -213,6 +200,84 @@ def poll_flight_info(c, sql, expect_rows, max_polls=90):
     print("[poll] PASS")
     return qid
 
+
+def parse_endpoint(epb):
+    """FlightEndpoint{ticket=1{data=1}, location=2{uri=1}} → (ticket_data|None, [urls])"""
+    ticket = None; locations = []
+    for fno, w, v in walk(epb):
+        if fno == 1:
+            for f2, w2, v2 in walk(v):
+                if f2 == 1:
+                    ticket = v2
+        elif fno == 2:
+            for f2, w2, v2 in walk(v):
+                if f2 == 1:
+                    locations.append(v2.decode())
+    return ticket, locations
+
+
+def poll_terminal(c, sql, max_polls=90):
+    """轮询至终态，返回 (endpoints_raw_bytes, records, qid)。"""
+    import grpc
+    ch = grpc.insecure_channel("localhost:32010")
+    md = (("auth-token-bin", c.headers[0][1]),)
+    any_msg = f_string(1, TYPE_QUERY) + f_bytes(2, f_string(1, sql))
+    descriptor = varint((1 << 3) | 0) + varint(2) + f_bytes(2, any_msg)
+    poll = ch.unary_unary("/arrow.flight.protocol.FlightService/PollFlightInfo",
+                          request_serializer=lambda x: x, response_deserializer=lambda x: x)
+    info_bytes = None
+    for i in range(max_polls):
+        raw = poll(descriptor, metadata=md)
+        fields = {f: v for f, w, v in walk(raw) if w == 2}
+        if 2 not in [f for f, w, v in walk(raw)]:
+            info_bytes = fields[1]
+            print(f"[https] terminal after {i + 1} polls")
+            break
+        time.sleep(1)
+    assert info_bytes, "not terminal in time"
+    endpoints, records, qid = [], None, "?"
+    for fno, w, v in walk(info_bytes):
+        if fno == 3 and w == 2:
+            endpoints.append(v)
+        elif fno == 4 and w == 0:
+            records = v
+        elif fno == 7 and w == 2:
+            qid = v.decode()
+    return endpoints, records, qid
+
+
+def https_presign(c, sql, expect_rows, do_renew=False):
+    import urllib.request
+    import pyarrow.ipc
+    endpoints, records, qid = poll_terminal(c, sql)
+    total = 0
+    first_ep = endpoints[0] if endpoints else None
+    for epb in endpoints:
+        ticket, locations = parse_endpoint(epb)
+        assert ticket is None, f"https endpoint must carry EMPTY ticket, got {ticket!r}"
+        assert locations, "https endpoint must carry presigned location"
+        url = locations[0]
+        with urllib.request.urlopen(url) as resp:
+            payload = resp.read()
+        table = pyarrow.ipc.open_stream(payload).read_all()
+        total += table.num_rows
+        print(f"[https] GET presigned -> rows={table.num_rows} cols={table.column_names} bytes={len(payload)}")
+    assert total == expect_rows, f"rows {total} != {expect_rows}"
+    print("[https] PASS")
+    if do_renew and first_ep is not None:
+        body = f_bytes(1, first_ep)
+        results = list(c.do_action(fl.Action("RenewFlightEndpoint", body)))
+        assert results, "renew returned no result"
+        raw = results[0].body.to_pybytes()
+        _, urls = parse_endpoint(raw)
+        assert urls, "renewed endpoint has no location"
+        with urllib.request.urlopen(urls[0]) as resp:
+            table = pyarrow.ipc.open_stream(resp.read()).read_all()
+        print(f"[renew] new presigned URL -> rows={table.num_rows} cols={table.column_names}")
+        assert table.num_rows > 0
+        print("[renew] PASS")
+    return qid
+
 def cancel_inflight(c, sql):
     info = c.get_flight_info(command_descriptor(sql))
     qid = info.app_metadata.decode()
@@ -245,6 +310,8 @@ if __name__ == "__main__":
         poll_flight_info(c, "SELECT id FROM range(1000)", 1000)
     elif which == "poll-multi":
         poll_flight_info(c, "SELECT id FROM range(5000) ORDER BY id", 5000)
+    elif which == "https":
+        https_presign(c, "SELECT id, id * 3 AS t FROM range(3000)", 3000, do_renew=True)
     elif which == "cancel":
         cancel_inflight(c, "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")
     else:
