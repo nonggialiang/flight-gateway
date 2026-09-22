@@ -32,6 +32,8 @@
          PollFlightInfo/RenewFlightEndpoint/CancelFlightInfo/https-location are all present) -->
     <arrow.version>19.0.0</arrow.version>
     <spark.version>3.5.9</spark.version>
+    <!-- arrow version bundled in the Spark 3.5.9 distro; sink compiles against it (provided) -->
+    <spark.arrow.version>12.0.1</spark.arrow.version>
     <scala.version>2.13.14</scala.version>
     <scala.binary.version>2.13</scala.binary.version>
 
@@ -42,7 +44,8 @@
     <config.version>1.4.3</config.version>
     <slf4j.version>2.0.13</slf4j.version>
     <logback.version>1.5.6</logback.version>
-    <jackson.version>2.17.2</jackson.version>
+    <!-- align with Spark 3.5.9's jackson line (D3); gateway-side manifest JSON 也用它 -->
+    <jackson.version>2.15.2</jackson.version>
     <javax.inject.version>1</javax.inject.version>
 
     <postgresql.version>42.7.3</postgresql.version>
@@ -59,13 +62,9 @@
 
   <dependencyManagement>
     <dependencies>
-      <dependency>
-        <groupId>org.apache.arrow</groupId>
-        <artifactId>arrow-bom</artifactId>
-        <version>${arrow.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
+      <!-- 注意：arrow-bom 19 不在根 DM 引入——它会强改 Kit 内 Spark 自带 arrow 12 的版本（D3）。
+           gateway 侧模块（common/spi/orchestrator/result-store/frontend）各自显式声明
+           ${arrow.version} 的 arrow 构件；Kit（sink/app/client）自管 Spark 对齐版本。 -->
 
       <dependency><groupId>org.fg</groupId><artifactId>fg-common</artifactId><version>${project.version}</version></dependency>
       <dependency><groupId>org.fg</groupId><artifactId>fg-engine-spi</artifactId><version>${project.version}</version></dependency>

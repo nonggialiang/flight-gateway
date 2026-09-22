@@ -15,6 +15,10 @@
 
   <dependencies>
     <dependency><groupId>org.fg</groupId><artifactId>fg-common</artifactId></dependency>
-    <dependency><groupId>org.apache.arrow</groupId><artifactId>arrow-vector</artifactId></dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-vector</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
   </dependencies>
 </project>

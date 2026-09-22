@@ -14,8 +14,16 @@
   <description>Service framework (ported from Dremio OSS common/legacy), thread pools, config, allocator, metrics.</description>
 
   <dependencies>
-    <dependency><groupId>org.apache.arrow</groupId><artifactId>arrow-memory-core</artifactId></dependency>
-    <dependency><groupId>org.apache.arrow</groupId><artifactId>arrow-memory-netty</artifactId></dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-memory-core</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-memory-netty</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
 
     <dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId></dependency>
     <dependency><groupId>com.typesafe</groupId><artifactId>config</artifactId></dependency>
