@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-#!/usr/bin/env python3
 """FG M1 e2e（实测通过 2026-09）：原始 FlightClient + grpcio PollFlightInfo。
 
 实测要点（arrow-java 19 / pyarrow 25 / macOS）：
