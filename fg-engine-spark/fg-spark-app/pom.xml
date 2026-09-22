@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.fg</groupId>
+    <artifactId>flight-gateway</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>fg-spark-app</artifactId>
+  <name>FG Spark Kit :: Engine App (thin shell)</name>
+  <description>Thin engine shell: load fg-result DSv2 + vanilla SparkConnectServer + lifecycle hooks (ZK agent lands in M2).</description>
+
+  <dependencies>
+    <dependency><groupId>org.fg</groupId><artifactId>fg-spark-sink</artifactId></dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-connect_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+
+  <build><plugins>
+    <plugin>
+      <groupId>net.alchim31.maven</groupId>
+      <artifactId>scala-maven-plugin</artifactId>
+    </plugin>
+    <plugin>
+      <groupId>org.apache.maven.plugins</groupId>
+      <artifactId>maven-compiler-plugin</artifactId>
+      <executions>
+        <execution><id>default-compile</id><phase>none</phase></execution>
+        <execution><id>default-testCompile</id><phase>none</phase></execution>
+      </executions>
+    </plugin>
+  </plugins></build>
+</project>

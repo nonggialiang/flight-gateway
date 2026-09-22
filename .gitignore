@@ -1,0 +1,15 @@
+target/
+*.class
+*.jar
+!.mvn/wrapper/*.jar
+.idea/
+*.iml
+.DS_Store
+dependency-reduced-pom.xml
+*.log
+spark-warehouse/
+derby.log
+metastore_db/
+__pycache__/
+.venv/
+*.arrows

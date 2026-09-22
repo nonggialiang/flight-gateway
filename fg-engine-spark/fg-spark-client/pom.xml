@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.fg</groupId>
+    <artifactId>flight-gateway</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>fg-spark-client</artifactId>
+  <name>FG Spark Kit :: Gateway-side Client (thin Connect stub)</name>
+  <description>SqlEngine implementation over a thin Spark Connect gRPC stub: plan assembly, submit-and-detach, reattach, interrupt.</description>
+
+  <dependencies>
+    <dependency><groupId>org.fg</groupId><artifactId>fg-common</artifactId></dependency>
+    <dependency><groupId>org.fg</groupId><artifactId>fg-engine-spi</artifactId></dependency>
+
+    <!-- Spark Connect proto (org.apache.spark.sql.connect.proto) -->
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-connect-common_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
+    </dependency>
+
+    <!-- Kit self-managed gRPC/protobuf versions (D3: no leakage beyond kit) -->
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-netty-shaded</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-protobuf</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-stub</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.google.protobuf</groupId>
+      <artifactId>protobuf-java</artifactId>
+      <version>${protobuf.version}</version>
+    </dependency>
+    <dependency><groupId>javax.annotation</groupId><artifactId>javax.annotation-api</artifactId></dependency>
+    <dependency><groupId>org.apache.arrow</groupId><artifactId>arrow-vector</artifactId></dependency>
+
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><scope>test</scope></dependency>
+    <dependency><groupId>org.assertj</groupId><artifactId>assertj-core</artifactId><scope>test</scope></dependency>
+  </dependencies>
+
+  <build><plugins>
+    <plugin>
+      <groupId>net.alchim31.maven</groupId>
+      <artifactId>scala-maven-plugin</artifactId>
+    </plugin>
+    <plugin>
+      <groupId>org.apache.maven.plugins</groupId>
+      <artifactId>maven-compiler-plugin</artifactId>
+      <executions>
+        <execution><id>default-compile</id><phase>none</phase></execution>
+        <execution><id>default-testCompile</id><phase>none</phase></execution>
+      </executions>
+    </plugin>
+  </plugins></build>
+</project>
