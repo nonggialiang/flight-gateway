@@ -324,6 +324,35 @@ def https_order_by(c):
     print("[https-order] write-side coalesce(1): PASS")
     return qid
 
+
+def part_retry(c):
+    """单分片可重试（F3/v0.16）：PART 票 DoGet 中途 kill → 同票重发全量。"""
+    import time
+    endpoints, records, qid = poll_terminal(c, "SELECT id FROM range(100000)")
+    assert len(endpoints) == 2
+    tickets = []
+    for epb in endpoints:
+        t, locs = parse_endpoint(epb)
+        assert t is not None and all(not u.startswith("http") for u in locs)
+        tickets.append(t)
+
+    # part0：读首个 chunk 即断流
+    r0 = c.do_get(fl.Ticket(tickets[0]))
+    chunk0, _ = r0.read_chunk()
+    print(f"[retry] part0 partial {chunk0.num_rows} rows, killing stream")
+    close = getattr(r0, "close", None)
+    if close:
+        close()
+    time.sleep(1)
+
+    t0 = c.do_get(fl.Ticket(tickets[0])).read_all()
+    t1 = c.do_get(fl.Ticket(tickets[1])).read_all()
+    assert t0.num_rows == 50000 and t1.num_rows == 50000
+    ids = sorted(t0.column("id").to_pylist() + t1.column("id").to_pylist())
+    assert ids == list(range(100000))
+    print("[retry] ALL PASS")
+    return qid
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "legacy"
     c = client()
@@ -337,6 +366,8 @@ if __name__ == "__main__":
         https_presign(c, "SELECT id, id * 3 AS t FROM range(3000)", 3000, do_renew=True)
     elif which == "https-order":
         https_order_by(c)
+    elif which == "retry":
+        part_retry(c)
     elif which == "cancel":
         cancel_inflight(c, "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")
     else:
