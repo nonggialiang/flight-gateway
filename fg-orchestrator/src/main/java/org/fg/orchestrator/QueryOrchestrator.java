@@ -144,11 +144,22 @@ public class QueryOrchestrator implements Service {
             logger.warn("Order detection failed for {}: {}", row.queryId(), e.toString());
           }
 
+          // H4：partitions hint 裁决——顺序敏感：HTTPS 强制单对象；RELAY 禁 repartition(K) 用自然分区
+          Integer configured = null;
+          if (config.hasPath("fg.result.partitions")) {
+            configured = config.getInt("fg.result.partitions");
+          }
+          Integer partitionsHint = configured;
+          if (row.ordered()) {
+            partitionsHint = row.mode() == OperationRow.Mode.HTTPS ? 1 : null;
+          }
+
           MaterializationSpec spec =
               new MaterializationSpec(
                   "s3://" + objects.bucket() + "/" + row.resultKeyPrefix() + "/",
                   true,
-                  config.getInt("fg.result.batch.max.records"));
+                  config.getInt("fg.result.batch.max.records"),
+                  partitionsHint);
 
           CompletableFuture<EngineExecutionHandle> submitted =
               engine.submit(
