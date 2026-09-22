@@ -33,6 +33,12 @@
           <goals><goal>shade</goal></goals>
           <configuration>
             <createDependencyReducedPom>false</createDependencyReducedPom>
+            <transformers>
+              <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                <mainClass>org.fg.dist.GatewayDaemon</mainClass>
+              </transformer>
+              <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+            </transformers>
             <filters>
               <filter>
                 <artifact>*:*</artifact>
@@ -41,6 +47,23 @@
                   <exclude>META-INF/*.DSA</exclude>
                   <exclude>META-INF/*.RSA</exclude>
                 </excludes>
+              </filter>
+              <!-- 只保留 logback 绑定（log4j-slf4j2-impl 会被 SLF4J 优先选中导致日志丢失） -->
+              <filter>
+                <artifact>org.apache.logging.log4j:log4j-slf4j2-impl</artifact>
+                <excludes><exclude>**</exclude></excludes>
+              </filter>
+              <filter>
+                <artifact>org.apache.logging.log4j:log4j-slf4j-impl</artifact>
+                <excludes><exclude>**</exclude></excludes>
+              </filter>
+              <filter>
+                <artifact>org.slf4j:slf4j-reload4j</artifact>
+                <excludes><exclude>**</exclude></excludes>
+              </filter>
+              <filter>
+                <artifact>org.slf4j:slf4j-log4j12</artifact>
+                <excludes><exclude>**</exclude></excludes>
               </filter>
             </filters>
           </configuration>

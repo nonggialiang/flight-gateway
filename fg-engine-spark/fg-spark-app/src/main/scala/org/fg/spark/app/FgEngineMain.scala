@@ -22,14 +22,14 @@ object FgEngineMain {
     val builder = SparkSession.builder().appName("fg-spark-engine")
 
     // s3a 静态 scoped 凭证（D5）：launcher 注入系统属性 → spark conf
-    prop("fg.result.s3.endpoint").foreach(builder.config("fs.s3a.endpoint", _))
-    prop("fg.result.s3.access-key").foreach(builder.config("fs.s3a.access.key", _))
-    prop("fg.result.s3.secret-key").foreach(builder.config("fs.s3a.secret.key", _))
-    builder.config("fs.s3a.path.style.access", "true")
-    builder.config("fs.s3a.connection.ssl.enabled",
+    prop("fg.result.s3.endpoint").foreach(builder.config("spark.hadoop.fs.s3a.endpoint", _))
+    prop("fg.result.s3.access-key").foreach(builder.config("spark.hadoop.fs.s3a.access.key", _))
+    prop("fg.result.s3.secret-key").foreach(builder.config("spark.hadoop.fs.s3a.secret.key", _))
+    builder.config("spark.hadoop.fs.s3a.path.style.access", "true")
+    builder.config("spark.hadoop.fs.s3a.connection.ssl.enabled",
       prop("fg.result.s3.endpoint").exists(_.startsWith("https")))
     // 避免结果小对象走 multipart
-    builder.config("fs.s3a.multipart.size", "32M")
+    builder.config("spark.hadoop.fs.s3a.multipart.size", "32M")
 
     // Connect server 端口与 reattachable 执行（⑤ 主路径依赖）
     builder.config("spark.connect.grpc.port",

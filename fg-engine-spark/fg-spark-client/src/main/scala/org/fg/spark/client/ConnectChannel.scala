@@ -1,11 +1,18 @@
 package org.fg.spark.client
 
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder
-import io.grpc.{CallOptions, ClientCall, ManagedChannel, Metadata, MethodDescriptor, Status}
+import io.grpc.{ClientInterceptor, ForwardingClientCall}
+import io.grpc.stub.ClientCallStreamObserver
+import io.grpc.{ClientCall, CallOptions, ManagedChannel, Metadata, MethodDescriptor}
 
-import java.util.concurrent.{CompletableFuture, TimeUnit}
+import java.util.concurrent.TimeUnit
 
-/** Connect 通道（薄 stub）：管理 channel、元数据头、可取消的服务端流与 unary 调用。 */
+/**
+ * Connect 通道（薄 stub）：官方生成 stub + 元数据拦截器。
+ *
+ * <p>detach 语义经 {@link CancelCapture} 拦截器捕获 ClientCallStreamObserver 实现
+ * （提交即 detach：首响应捕获 operationId 后 cancel 流）。
+ */
 final class ConnectChannel(uri: String) extends AutoCloseable {
 
   private val (host, port) = ConnectChannel.parse(uri)
@@ -19,78 +26,59 @@ final class ConnectChannel(uri: String) extends AutoCloseable {
     m
   }
 
-  /**
-   * 服务端流调用，返回可取消句柄。onMessage 每响应一次；流终经 onDone(status)。
-   * 用于 execute（提交即 detach：首响应后 cancel）与 reattach（消费到流终）。
-   */
-  private[client] def serverStream[Req, Resp](
-      method: MethodDescriptor[Req, Resp],
-      request: Req,
-      user: String,
-      sessionId: String,
-      onMessage: Resp => Unit,
-      onDone: Status => Unit): () => Unit = {
-    val call: ClientCall[Req, Resp] =
-      channel.newCall(method, CallOptions.DEFAULT)
-    startStream(call, request, user, sessionId, onMessage, onDone)
-  }
+  /** 附加 user_id/session_id 元数据的拦截器。 */
+  def attachHeadersInterceptor(user: String, sessionId: String): ClientInterceptor =
+    io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers(user, sessionId))
 
-  /** unary 调用（AnalyzePlan/Interrupt/ReleaseExecute）：带超时。 */
-  private[client] def unary[Req, Resp](
-      method: MethodDescriptor[Req, Resp],
-      request: Req,
+  /** 无超时的服务端流（execute/reattach）；cancel 捕获器由调用方持有。 */
+  def serverStreamingStub[StubT](
+      mk: io.grpc.Channel => StubT,
       user: String,
       sessionId: String,
-      timeoutMs: Long): CompletableFuture[Resp] = {
-    val future = new CompletableFuture[Resp]()
-    val call: ClientCall[Req, Resp] =
-      channel.newCall(method, CallOptions.DEFAULT.withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS))
-    startStream[Req, Resp](
-      call,
-      request,
-      user,
-      sessionId,
-      onMessage = (resp: Resp) => future.complete(resp),
-      onDone = (status: Status) =>
-        if (!future.isDone) {
-          future.completeExceptionally(
-            if (status.getCause != null) status.getCause
-            else new IllegalStateException(s"unary call failed: $status"))
-        }
-    )
-    future
-  }
+      cancelCapture: CancelCapture): StubT =
+    mk(
+      io.grpc.ClientInterceptors.intercept(
+        channel,
+        java.util.Arrays.asList(attachHeadersInterceptor(user, sessionId), cancelCapture)))
 
-  private def startStream[Req, Resp](
-      call: ClientCall[Req, Resp],
-      request: Req,
-      user: String,
-      sessionId: String,
-      onMessage: Resp => Unit,
-      onDone: Status => Unit): () => Unit = {
-    val listener = new io.grpc.ClientCall.Listener[Resp] {
-      private var done = false
-      override def onMessage(message: Resp): Unit = synchronized {
-        if (!done) onMessage(message)
-      }
-      override def onClose(status: Status, trailers: Metadata): Unit = synchronized {
-        if (!done) {
-          done = true
-          onDone(status)
-        }
-      }
-    }
-    call.start(listener, headers(user, sessionId))
-    call.request(2)
-    call.sendMessage(request)
-    call.halfClose()
-    () => call.cancel("fg client cancelled", null)
+  /** 带超时的 unary stub（AnalyzePlan/Interrupt/ReleaseExecute）。 */
+  def unaryStub[StubT](mk: io.grpc.Channel => StubT, user: String, sessionId: String,
+      timeoutMs: Long): StubT = {
+    val intercepted = io.grpc.ClientInterceptors.intercept(
+      channel, java.util.Arrays.asList(attachHeadersInterceptor(user, sessionId)))
+    mk(intercepted)
   }
 
   override def close(): Unit = {
     channel.shutdownNow()
     channel.awaitTermination(5, TimeUnit.SECONDS)
   }
+}
+
+/** 捕获底层 ClientCallStreamObserver 以支持 cancel（提交即 detach）。 */
+final class CancelCapture extends ClientInterceptor {
+  @volatile private var observer: ClientCallStreamObserver[_] = _
+
+  def cancel(message: String): Unit = {
+    val obs = observer
+    if (obs != null) obs.cancel(message, null)
+  }
+
+  override def interceptCall[ReqT, RespT](
+      method: MethodDescriptor[ReqT, RespT],
+      callOptions: CallOptions,
+      next: io.grpc.Channel): ClientCall[ReqT, RespT] =
+    new ForwardingClientCall.SimpleForwardingClientCall[ReqT, RespT](next.newCall(method, callOptions)) {
+      override def start(
+          responseListener: ClientCall.Listener[RespT],
+          headers: Metadata): Unit = {
+        delegate match {
+          case obs: ClientCallStreamObserver[RespT] => observer = obs
+          case _ =>
+        }
+        super.start(responseListener, headers)
+      }
+    }
 }
 
 private[client] object ConnectChannel {

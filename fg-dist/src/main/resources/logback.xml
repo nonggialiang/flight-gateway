@@ -6,7 +6,8 @@
   </appender>
 
   <logger name="org.fg" level="INFO"/>
-  <logger name="org.apache.arrow" level="WARN"/>
+  <logger name="org.apache.arrow.flight" level="DEBUG"/>
+  <logger name="org.apache.arrow" level="INFO"/>
   <logger name="io.grpc" level="WARN"/>
 
   <root level="INFO">

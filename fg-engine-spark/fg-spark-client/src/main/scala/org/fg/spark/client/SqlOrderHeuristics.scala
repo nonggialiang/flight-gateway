@@ -28,8 +28,9 @@ object SqlOrderHeuristics {
                 && regionMatchesIgnoreCase(s, i, "ORDER", 0, 5)
                 && isWordBoundary(s, i - 1)
                 && isWordBoundary(s, i + 5)) {
-              val after = i + 5
-              if (matchesAt(s, after, "BY") && isWordBoundary(s, after - 1) && isWordBoundary(s, after + 2)) {
+              var after = i + 5
+              while (after < n && s.charAt(after) == ' ') after += 1 // 跳过空格
+              if (matchesAt(s, after, "BY") && isWordBoundary(s, after + 2)) {
                 return true
               }
             }

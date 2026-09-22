@@ -114,20 +114,31 @@ final class ResultRelay {
 
     long readinessTimeoutMs = config.getDurationMs("fg.relay.client.readiness.timeout");
     BufferAllocator child = allocator.newChildAllocator("fg-relay-" + t.queryId(), 0, Long.MAX_VALUE);
+    VectorSchemaRoot out = null;
     try {
-      boolean started = false;
+      // 单一输出 root（putNext 序列化的是 start() 注册的 root 实例）；
+      // 各 part 经 VectorUnloader/VectorLoader 装载进该 root
+      org.apache.arrow.vector.VectorLoader loader = null;
       long rows = 0;
       for (ResultManifest.Part part : parts) {
         try (InputStream in = objects.getObject(ObjectStoreService.objectName(part.uri()));
             ArrowStreamReader reader = new ArrowStreamReader(in, child)) {
-          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          VectorSchemaRoot src = reader.getVectorSchemaRoot();
+          if (out == null) {
+            out = VectorSchemaRoot.create(src.getSchema(), child);
+            listener.start(out);
+            loader = new org.apache.arrow.vector.VectorLoader(out);
+          }
           while (reader.loadNextBatch()) {
-            if (!started) {
-              listener.start(root);
-              started = true;
+            org.apache.arrow.vector.ipc.message.ArrowRecordBatch batch =
+                new org.apache.arrow.vector.VectorUnloader(src).getRecordBatch();
+            try {
+              loader.load(batch);
+            } finally {
+              batch.close();
             }
             putNextWhenClientReady(listener, readinessTimeoutMs, t.queryId());
-            rows += root.getRowCount();
+            rows += out.getRowCount();
           }
         }
       }
@@ -140,6 +151,9 @@ final class ResultRelay {
       logger.warn("Relay failed for {}: {}", t.queryId(), e.toString());
       listener.error(CallStatus.INTERNAL.withDescription("Relay failed: " + e.getMessage()).toRuntimeException());
     } finally {
+      if (out != null) {
+        out.close();
+      }
       child.close();
     }
   }

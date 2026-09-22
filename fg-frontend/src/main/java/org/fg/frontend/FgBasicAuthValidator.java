@@ -34,7 +34,14 @@ final class FgBasicAuthValidator implements BasicAuthValidator {
 
   @Override
   public Optional<String> isValid(byte[] token) {
+    if (token == null) {
+      return Optional.empty();
+    }
     String user = tokenToUser.get(new String(token, StandardCharsets.UTF_8));
+    if (user == null) {
+      org.slf4j.LoggerFactory.getLogger(FgBasicAuthValidator.class)
+          .warn("Unknown token presented (len={})", token.length);
+    }
     return Optional.ofNullable(user);
   }
 }

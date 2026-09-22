@@ -10,7 +10,6 @@ import java.io.InputStream;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
-import okhttp3.HttpUrl;
 import org.fg.result.manifest.ResultManifest;
 
 /**
@@ -105,15 +104,18 @@ public final class ObjectStoreService implements AutoCloseable {
     }
   }
 
-  /** part uri（如 s3://bucket/key 或纯 key）→ object key。 */
+  /** part uri（如 s3a://bucket/key 或纯 key）→ object key（去 scheme+bucket，仅留 key）。 */
   public static String objectName(String partUri) {
-    HttpUrl url = HttpUrl.parse(partUri);
-    if (url != null) {
-      // s3:// style: host = bucket
-      String encoded = url.encodedPath();
-      return encoded.startsWith("/") ? encoded.substring(1) : encoded;
+    if (!partUri.contains("://")) {
+      return partUri;
     }
-    return partUri;
+    try {
+      java.net.URI uri = java.net.URI.create(partUri);
+      String path = uri.getPath() == null ? "" : uri.getPath();
+      return path.startsWith("/") ? path.substring(1) : path;
+    } catch (Exception e) {
+      return partUri;
+    }
   }
 
   public static String objectKey(String resultKeyPrefix, String name) {

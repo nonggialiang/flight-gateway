@@ -38,9 +38,9 @@
     <scala.binary.version>2.13</scala.binary.version>
 
     <guava.version>33.2.1-jre</guava.version>
-    <!-- kit self-managed grpc/protobuf (D3) -->
-    <grpc.version>1.62.2</grpc.version>
-    <protobuf.version>3.25.3</protobuf.version>
+    <!-- kit self-managed grpc/protobuf (D3)：与 arrow 19 线统一（spark connect proto 在 4.x 运行时兼容加载） -->
+    <grpc.version>1.79.0</grpc.version>
+    <protobuf.version>4.33.4</protobuf.version>
     <config.version>1.4.3</config.version>
     <slf4j.version>2.0.13</slf4j.version>
     <logback.version>1.5.6</logback.version>
@@ -57,7 +57,7 @@
 
     <junit.version>5.10.2</junit.version>
     <assertj.version>3.26.0</assertj.version>
-    <testcontainers.version>1.19.8</testcontainers.version>
+    <testcontainers.version>1.20.6</testcontainers.version>
   </properties>
 
   <dependencyManagement>

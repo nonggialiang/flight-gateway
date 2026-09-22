@@ -172,6 +172,89 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
 
   // ------------------------------------------------------------- 取消 / 续期
 
+  /**
+   * CancelFlightInfo / RenewFlightEndpoint 是 Flight SQL action（arrow-java 的
+   * FlightSqlProducer 默认不识别，需在此分发；兼容两种类型名拼写）。
+   */
+  @Override
+  public void doAction(
+      FlightProducer.CallContext context,
+      org.apache.arrow.flight.Action action,
+      FlightProducer.StreamListener<org.apache.arrow.flight.Result> listener) {
+    switch (action.getType()) {
+      case "CancelFlightInfo", "arrow.flight.protocol.sql.CancelFlightInfo" -> {
+        try {
+          CancelFlightInfoRequest request = CancelFlightInfoRequest.deserialize(java.nio.ByteBuffer.wrap(action.getBody()));
+          cancelFlightInfo(
+              request,
+              context,
+              new FlightProducer.StreamListener<CancelStatus>() {
+                @Override
+                public void onNext(CancelStatus status) {
+                  java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+                  int number =
+                      org.apache.arrow.flight.impl.Flight.CancelStatus
+                          .valueOf("CANCEL_STATUS_" + status.name())
+                          .getNumber();
+                  while (true) {
+                    int bb = number & 0x7F;
+                    number >>>= 7;
+                    b.write(bb | (number == 0 ? 0 : 0x80));
+                    if (number == 0) {
+                      break;
+                    }
+                  }
+                  listener.onNext(new org.apache.arrow.flight.Result(b.toByteArray()));
+                }
+
+                @Override
+                public void onError(Throwable t) {
+                  listener.onError(t);
+                }
+
+                @Override
+                public void onCompleted() {}
+              });
+          listener.onCompleted();
+        } catch (Exception e) {
+          listener.onError(invalid("Cancel failed: " + e.getMessage()));
+        }
+      }
+      case "RenewFlightEndpoint", "arrow.flight.protocol.sql.RenewFlightEndpoint" -> {
+        try {
+          RenewFlightEndpointRequest request =
+              RenewFlightEndpointRequest.deserialize(java.nio.ByteBuffer.wrap(action.getBody()));
+          renewFlightEndpoint(
+              request,
+              context,
+              new FlightProducer.StreamListener<FlightEndpoint>() {
+                @Override
+                public void onNext(FlightEndpoint endpoint) {
+                  try {
+                    listener.onNext(
+                        new org.apache.arrow.flight.Result(flightEndpointBytes(endpoint)));
+                  } catch (Exception e) {
+                    listener.onError(invalid("Renew serialize failed"));
+                  }
+                }
+
+                @Override
+                public void onError(Throwable t) {
+                  listener.onError(t);
+                }
+
+                @Override
+                public void onCompleted() {}
+              });
+          listener.onCompleted();
+        } catch (Exception e) {
+          listener.onError(invalid("Renew failed: " + e.getMessage()));
+        }
+      }
+      default -> super.doAction(context, action, listener);
+    }
+  }
+
   @Override
   public void cancelFlightInfo(
       CancelFlightInfoRequest request,
@@ -302,6 +385,12 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
         ordered,
         new IpcOption(),
         queryId.getBytes(StandardCharsets.UTF_8));
+  }
+
+  private static byte[] flightEndpointBytes(FlightEndpoint endpoint) throws Exception {
+    java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+    b.write(endpoint.serialize().array());
+    return b.toByteArray();
   }
 
   private static FlightRuntimeException invalid(String message) {

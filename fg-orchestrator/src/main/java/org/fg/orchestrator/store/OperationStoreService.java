@@ -13,16 +13,10 @@ import org.flywaydb.core.Flyway;
  */
 public final class OperationStoreService implements Service {
 
-  private final GatewayConfig config;
-  private HikariDataSource dataSource;
-  private OperationStoreDao dao;
+  private final HikariDataSource dataSource;
+  private final OperationStoreDao dao;
 
   public OperationStoreService(GatewayConfig config) {
-    this.config = config;
-  }
-
-  @Override
-  public void start() {
     HikariConfig hikari = new HikariConfig();
     hikari.setJdbcUrl(config.getString("fg.db.url"));
     hikari.setUsername(config.getString("fg.db.username"));
@@ -30,14 +24,17 @@ public final class OperationStoreService implements Service {
     hikari.setMaximumPoolSize(config.getInt("fg.db.max.pool.size"));
     hikari.setPoolName("fg-operation-store");
     this.dataSource = new HikariDataSource(hikari);
+    this.dao = new OperationStoreDao(dataSource);
+  }
 
+  @Override
+  public void start() {
+    // 迁移在启动期执行（DAO 已在构造器就绪，供装配期获取）
     Flyway.configure()
         .dataSource(dataSource)
         .locations("classpath:db/migration")
         .load()
         .migrate();
-
-    this.dao = new OperationStoreDao(dataSource);
   }
 
   @Override

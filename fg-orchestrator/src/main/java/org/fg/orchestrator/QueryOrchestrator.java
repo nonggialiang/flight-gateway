@@ -156,7 +156,8 @@ public class QueryOrchestrator implements Service {
 
           MaterializationSpec spec =
               new MaterializationSpec(
-                  "s3://" + objects.bucket() + "/" + row.resultKeyPrefix() + "/",
+                  // s3a：Hadoop FileSystem 的实际 scheme（s3:// 无 FS 实现）
+                  "s3a://" + objects.bucket() + "/" + row.resultKeyPrefix() + "/",
                   true,
                   config.getInt("fg.result.batch.max.records"),
                   partitionsHint);

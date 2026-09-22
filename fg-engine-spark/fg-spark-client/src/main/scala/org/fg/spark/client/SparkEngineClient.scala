@@ -1,7 +1,6 @@
 package org.fg.spark.client
 
-import com.google.protobuf.ByteString
-import io.grpc.Status
+import io.grpc.stub.StreamObserver
 import org.apache.arrow.vector.types.pojo.Schema
 import org.apache.spark.connect.proto._
 import org.fg.common.config.GatewayConfig
@@ -36,16 +35,13 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
 
   override def analyzeSchema(session: EngineSession, sql: String, timeout: Duration): Schema = {
     val s = session.asInstanceOf[SparkEngineSession]
-    val request =
-      MaterializationPlanner.analyzePlanRequest(s.user, s.gatewaySessionId, sql)
-    val response = channel
-      .unary[AnalyzePlanRequest, AnalyzePlanResponse](
-        SparkConnectServiceGrpc.getAnalyzePlanMethod,
-        request,
-        s.user,
-        s.gatewaySessionId,
-        timeout.toMillis)
-      .get()
+    val stub = channel
+      .unaryStub[SparkConnectServiceGrpc.SparkConnectServiceBlockingStub](
+        ch => SparkConnectServiceGrpc.newBlockingStub(ch),
+        s.user, s.gatewaySessionId, timeout.toMillis)
+      .withDeadlineAfter(timeout.toMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+    val response = stub.analyzePlan(
+      MaterializationPlanner.analyzePlanRequest(s.user, s.gatewaySessionId, sql))
     val dt = response.getSchema.getSchema
     if (dt != null && dt.getKindCase == DataType.KindCase.STRUCT) {
       MaterializationPlanner.toArrowSchema(dt.getStruct)
@@ -67,36 +63,45 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
     val s = session.asInstanceOf[SparkEngineSession]
     val request = MaterializationPlanner.executePlanRequest(s.user, s.gatewaySessionId, sql, spec)
     val future = new CompletableFuture[EngineExecutionHandle]()
+    val capture = new CancelCapture
+    val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
+      ch => SparkConnectServiceGrpc.newStub(ch),
+      s.user, s.gatewaySessionId, capture)
 
-    lazy val cancel: () => Unit = channel.serverStream[ExecutePlanRequest, ExecutePlanResponse](
-      SparkConnectServiceGrpc.getExecutePlanMethod,
-      request,
-      s.user,
-      s.gatewaySessionId,
-      onMessage = (resp: ExecutePlanResponse) => {
-        val opId = resp.getOperationId
+    async.executePlan(request, new StreamObserver[ExecutePlanResponse] {
+      private var done = false
+
+      override def onNext(value: ExecutePlanResponse): Unit = synchronized {
+        if (done) return
+        val opId = value.getOperationId
         if (opId != null && !opId.isEmpty && !future.isDone) {
+          done = true
           val handle = new EngineExecutionHandle("spark", opId)
-          listener.onHandle(handle)
-          future.complete(handle)
-          // 提交即 detach：拿到 operationId 即断流（引擎照常执行、manifest 照落，⑤ 主路径）
-          cancel()
-        }
-        // 忽略后续响应（ObservedMetrics 等由 attach 者消费）
-      },
-      onDone = (status: Status) => {
-        if (!future.isDone) {
-          if (status.isOk) {
-            // 流正常结束但未捕获 operationId：执行或已终态，交由 manifest 对账判定
-            future.completeExceptionally(
-              new IllegalStateException(s"execute stream ended without operationId: $status"))
-          } else {
-            future.completeExceptionally(
-              new IllegalStateException(s"execute stream failed: $status"))
+          try listener.onHandle(handle)
+          catch {
+            case _: Throwable => // 触发实例回调异常不阻断 detach
           }
+          future.complete(handle)
+          // 提交即 detach（⑤ 主路径）：引擎照常执行、manifest 照落
+          capture.cancel("fg: detached after operationId capture")
+        }
+        // 其余响应（ObservedMetrics 等）由 attach 者消费
+      }
+
+      override def onError(t: Throwable): Unit = synchronized {
+        if (!future.isDone) {
+          future.completeExceptionally(t)
         }
       }
-    )
+
+      override def onCompleted(): Unit = synchronized {
+        if (!future.isDone) {
+          // 流正常结束但未捕获 operationId：执行或已终态，交由 manifest 对账判定
+          future.completeExceptionally(
+            new IllegalStateException("execute stream completed without operationId"))
+        }
+      }
+    })
     future
   }
 
@@ -113,22 +118,30 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
       .setClientType("fg-gateway")
       .setOperationId(handle.handle())
       .build()
-    channel.serverStream[ReattachExecuteRequest, ExecutePlanResponse](
-      SparkConnectServiceGrpc.getReattachExecuteMethod,
-      request,
-      s.user,
-      s.gatewaySessionId,
-      onMessage = (_: ExecutePlanResponse) => {
-        // 消费响应流（含 ObservedMetrics/进度）；offset 续传由服务端维护
-      },
-      onDone = (status: Status) => {
+    val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
+      ch => SparkConnectServiceGrpc.newStub(ch),
+      s.user, s.gatewaySessionId, new CancelCapture)
+
+    async.reattachExecute(request, new StreamObserver[ExecutePlanResponse] {
+      override def onNext(value: ExecutePlanResponse): Unit = {
+        // 消费响应流（含 ObservedMetrics）；offset 续传由服务端维护
+      }
+
+      override def onError(t: Throwable): Unit = {
+        val code = t match {
+          case e: io.grpc.StatusRuntimeException => e.getStatus.getCode
+          case _ => io.grpc.Status.Code.UNKNOWN
+        }
         val outcome =
-          if (status.isOk) ExecutionOutcome.completed()
-          else if (Status.Code.CANCELLED == status.getCode) ExecutionOutcome.cancelled()
-          else ExecutionOutcome.unknown(s"reattach stream closed: $status")
+          if (code == io.grpc.Status.Code.CANCELLED) ExecutionOutcome.cancelled()
+          else ExecutionOutcome.unknown(s"reattach stream closed: $t")
         future.complete(outcome)
       }
-    )
+
+      override def onCompleted(): Unit = {
+        future.complete(ExecutionOutcome.completed())
+      }
+    })
     future
   }
 
@@ -143,13 +156,11 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
       .setOperationId(handle.handle())
       .build()
     channel
-      .unary[InterruptRequest, InterruptResponse](
-        SparkConnectServiceGrpc.getInterruptMethod,
-        request,
-        s.user,
-        s.gatewaySessionId,
-        30_000L)
-      .get()
+      .unaryStub[SparkConnectServiceGrpc.SparkConnectServiceBlockingStub](
+        ch => SparkConnectServiceGrpc.newBlockingStub(ch),
+        s.user, s.gatewaySessionId, 30_000L)
+      .withDeadlineAfter(30, java.util.concurrent.TimeUnit.SECONDS)
+      .interrupt(request)
   }
 
   override def releaseExecution(handle: EngineExecutionHandle): Unit = {
@@ -158,18 +169,15 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
       .setUserContext(UserContext.newBuilder().setUserId("fg-gateway"))
       .setClientType("fg-gateway")
       .setOperationId(handle.handle())
-      .setReleaseAll(
-        org.apache.spark.connect.proto.ReleaseExecuteRequest.ReleaseAll.newBuilder().build())
+      .setReleaseAll(ReleaseExecuteRequest.ReleaseAll.newBuilder().build())
       .build()
     try {
       channel
-        .unary[ReleaseExecuteRequest, ReleaseExecuteResponse](
-          SparkConnectServiceGrpc.getReleaseExecuteMethod,
-          request,
-          "fg-gateway",
-          "",
-          30_000L)
-        .get()
+        .unaryStub[SparkConnectServiceGrpc.SparkConnectServiceBlockingStub](
+          ch => SparkConnectServiceGrpc.newBlockingStub(ch),
+          "fg-gateway", "", 30_000L)
+        .withDeadlineAfter(30, java.util.concurrent.TimeUnit.SECONDS)
+        .releaseExecute(request)
     } catch {
       case _: Exception => // 幂等
     }
@@ -189,11 +197,13 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
   }
 }
 
-/** Connect 会话：gateway 会话 ↔ Connect session 一一映射（sessionId 同值传递）。 */
+/** Connect 会话：gateway 会话 ↔ Connect session 一一映射。Connect 要求 session_id 为
+ * UUID（INVALID_HANDLE.FORMAT 校验），由 gateway 会话引用确定性派生。 */
 final class SparkEngineSession(val ctx: GatewaySession, channel: ConnectChannel)
     extends EngineSession {
   val user: String = ctx.user()
-  val gatewaySessionId: String = ctx.sessionId()
+  val gatewaySessionId: String =
+    java.util.UUID.nameUUIDFromBytes(("fg-" + ctx.sessionId()).getBytes("UTF-8")).toString
 
   override def sessionId(): String = gatewaySessionId
 
