@@ -120,6 +120,30 @@ public class QueryOrchestrator implements Service {
     return new Registration(stored, isNew);
   }
 
+  /**
+   * 等待 AnalyzePlan 回填 schema（JDBC prepare 期需真实 dataset_schema 判定 StatementType）。
+   * 触发已在 register 发生；AnalyzePlan 失败/超时返回 null（空 schema）。
+   */
+  public byte[] waitForSchema(String queryId) {
+    long deadline =
+        System.nanoTime()
+            + TimeUnit.MILLISECONDS.toNanos(config.getDurationMs("fg.query.prepare.timeout"));
+    try {
+      while (System.nanoTime() < deadline) {
+        OperationRow row = dao.get(queryId).orElse(null);
+        if (row == null || row.schemaBytes() != null) {
+          return row == null ? null : row.schemaBytes();
+        }
+        TimeUnit.MILLISECONDS.sleep(100);
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (java.sql.SQLException e) {
+      logger.warn("Schema wait read failed for {}: {}", queryId, e.toString());
+    }
+    return null;
+  }
+
   /** AnalyzePlan（有界）→ 异步提交（提交即 detach，首响应回调落 operationId）。 */
   private void triggerExecution(OperationRow row) {
     controlExecutor.submit(() -> {

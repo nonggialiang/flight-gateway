@@ -9,6 +9,7 @@ import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.grpc.CredentialCallOption;
 import org.apache.arrow.flight.sql.FlightSqlClient;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -38,15 +39,25 @@ public final class JavaClientE2E {
     try (BufferAllocator alloc = new RootAllocator(Long.MAX_VALUE);
         FlightClient client =
             FlightClient.builder(alloc, Location.forGrpcInsecure(HOST, PORT)).build()) {
-      client.authenticateBasic(USER, PASSWORD);
+      // auth2（网关 auth2-only；arrow-java Handshake 只走 auth1 handler，与 JDBC 互斥）
+      CredentialCallOption credential = client.authenticateBasicToken(USER, PASSWORD)
+          .orElseThrow(() -> new IllegalStateException("no credential returned"));
       try (FlightSqlClient sql = new FlightSqlClient(client)) {
         switch (which) {
-          case "legacy" -> readAll(sql,
+          case "legacy" -> readAll(sql, credential,
               "SELECT id, id * 2 AS dbl FROM range(1000)", 1000, "[java-legacy]");
-          case "legacy-long" -> readAll(sql,
+          case "legacy-long" -> readAll(sql, credential,
               "SELECT id % 1000 AS k, count(*) AS cnt FROM range(20000000) GROUP BY id % 1000",
               1000, "[java-legacy-long]");
-          case "cancel" -> cancel(sql);
+          case "cancel" -> cancel(sql, credential);
+          case "prepare" -> {
+            // 复刻 JDBC 驱动路径（驱动即 shade 的 FlightSqlClient.prepare/execute）
+            try (FlightSqlClient.PreparedStatement ps = sql.prepare(
+                "SELECT id, id * 2 AS dbl FROM range(1000)", credential)) {
+              FlightInfo info = ps.execute(credential);
+              streamAll(sql, credential, info, 1000, "[java-prepare]");
+            }
+          }
           default -> throw new IllegalArgumentException("unknown case " + which);
         }
       }
@@ -54,16 +65,27 @@ public final class JavaClientE2E {
   }
 
   /** GetFlightInfo 快返 STREAM 票 → 逐 endpoint DoGet（查询在途时挂满全程）→ 断言行数。 */
-  private static void readAll(FlightSqlClient sql, String query, long expected, String tag) {
+  private static void readAll(FlightSqlClient sql, CredentialCallOption credential,
+      String query, long expected, String tag) {
     long t0 = System.nanoTime();
-    FlightInfo info = sql.execute(query);
+    FlightInfo info = sql.execute(query, credential);
+    streamAll(sql, credential, info, expected, tag, t0);
+  }
+
+  private static void streamAll(FlightSqlClient sql, CredentialCallOption credential,
+      FlightInfo info, long expected, String tag) {
+    streamAll(sql, credential, info, expected, tag, System.nanoTime());
+  }
+
+  private static void streamAll(FlightSqlClient sql, CredentialCallOption credential,
+      FlightInfo info, long expected, String tag, long t0) {
     String qid = info.getAppMetadata() == null
         ? "?" : new String(info.getAppMetadata());
     System.out.printf("%s endpoints=%d queryId=%s...%n", tag, info.getEndpoints().size(),
         qid.substring(0, Math.min(8, qid.length())));
     long total = 0;
     for (FlightEndpoint ep : info.getEndpoints()) {
-      try (FlightStream fs = sql.getStream(ep.getTicket())) {
+      try (FlightStream fs = sql.getStream(ep.getTicket(), credential)) {
         while (fs.next()) {
           total += fs.getRoot().getRowCount();
         }
@@ -78,14 +100,16 @@ public final class JavaClientE2E {
   }
 
   /** 在途取消：execute 提交大基数 join → 3s 后 CancelFlightInfo → 断言 CANCELLED。 */
-  private static void cancel(FlightSqlClient sql) throws InterruptedException {
+  private static void cancel(FlightSqlClient sql, CredentialCallOption credential)
+      throws InterruptedException {
     long t0 = System.nanoTime();
     FlightInfo info = sql.execute(
-        "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id");
+        "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id", credential);
     System.out.printf("[java-cancel] queryId=%s... submitted%n",
         new String(info.getAppMetadata()).substring(0, 8));
     Thread.sleep(3_000);
-    CancelFlightInfoResult result = sql.cancelFlightInfo(new CancelFlightInfoRequest(info));
+    CancelFlightInfoResult result =
+        sql.cancelFlightInfo(new CancelFlightInfoRequest(info), credential);
     CancelStatus status = result.getStatus();
     System.out.printf("[java-cancel] CancelStatus=%s%n", status);
     if (status != CancelStatus.CANCELLED) {

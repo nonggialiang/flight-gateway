@@ -88,30 +88,19 @@ def command_descriptor(sql):
 # ---------------- 客户端 ----------------
 
 class Client:
-    """FlightClient + Basic token（grpcio 双消息握手：username、password → bearer）。"""
+    """FlightClient + auth2 Bearer（网关 auth2-only，FgBearerTokenAuthenticator 签发）。
+    pyarrow 的 authenticate_basic_token 返回 (authorization, Bearer <token>) 头对，
+    需自行经 FlightCallOptions 附到每个调用；grpcio 直打（PollFlightInfo）同用此头。
+    历史：曾走 auth1 Handshake（BasicAuth 载荷 → auth-token-bin 头）——arrow-java 的
+    Handshake RPC 只经 auth1 ServerAuthHandler，与 JDBC 驱动所需的 auth2 互斥，
+    网关已统一 auth2（见 FgFlightService）。"""
 
     def __init__(self):
-        import grpc
         self.fc = fl.FlightClient(GW)
-        ch = grpc.insecure_channel("localhost:32010")
-        hs = ch.stream_stream(
-            "/arrow.flight.protocol.FlightService/Handshake",
-            request_serializer=lambda b: b,
-            response_deserializer=lambda b: b)
-
-        def gen():
-            # HandshakeRequest{payload=2} = Flight.BasicAuth{username=2, password=3}（单条）
-            basic_auth = f_string(2, USER) + f_string(3, PASSWORD)
-            yield f_bytes(2, basic_auth)
-
-        token = None
-        for resp in hs(gen()):
-            for fno, w, v in walk(resp):
-                if fno == 2:
-                    token = v
-        assert token, "handshake returned no token"
-        # arrow-java auth1：二进制头 Auth-Token-bin（非 authorization Bearer）
-        self.headers = [(b"auth-token-bin", token)]
+        self.token = self.fc.authenticate_basic_token(USER, PASSWORD)
+        assert self.token[0] == b"authorization" and self.token[1].startswith(b"Bearer "), \
+            f"unexpected token header: {self.token!r}"
+        self.headers = [self.token]
         self.opts = fl.FlightCallOptions(headers=self.headers, timeout=600)
 
     def get_flight_info(self, descr):
@@ -148,9 +137,8 @@ def poll_flight_info(c, sql, expect_rows, max_polls=90):
     import grpc
 
     ch = grpc.insecure_channel("localhost:32010")
-    # 复用 Client 握手拿到的 token（auth-token-bin 二进制头）
-    token = c.headers[0][1]
-    md = (("auth-token-bin", token),)
+    # auth2：复用 Client 的 Authorization Basic 头
+    md = ((c.headers[0][0].decode(), c.headers[0][1].decode()),)
 
     # 2) PollFlightInfo：请求体直接是 FlightDescriptor{descriptor_type=1:CMD(2), command=2:Any}
     any_msg = f_string(1, TYPE_QUERY) + f_bytes(2, f_string(1, sql))
@@ -220,7 +208,7 @@ def poll_terminal(c, sql, max_polls=90):
     """轮询至终态，返回 (endpoints_raw_bytes, records, qid)。"""
     import grpc
     ch = grpc.insecure_channel("localhost:32010")
-    md = (("auth-token-bin", c.headers[0][1]),)
+    md = ((c.headers[0][0].decode(), c.headers[0][1].decode()),)
     any_msg = f_string(1, TYPE_QUERY) + f_bytes(2, f_string(1, sql))
     descriptor = varint((1 << 3) | 0) + varint(2) + f_bytes(2, any_msg)
     poll = ch.unary_unary("/arrow.flight.protocol.FlightService/PollFlightInfo",

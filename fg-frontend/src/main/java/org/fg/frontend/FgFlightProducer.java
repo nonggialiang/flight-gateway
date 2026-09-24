@@ -81,21 +81,27 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       FlightProducer.CallContext context,
       FlightDescriptor descriptor) {
     try {
-      String sql = command.getQuery();
-      QueryOrchestrator.Registration reg =
-          orchestrator.register(sessionRef(context), user(context), sql, negotiateMode());
-      OperationRow row = reg.row();
-      return flightInfo(
-          schemaOf(row),
-          descriptor,
-          List.of(endpoints.streamTicketEndpoint(row)),
-          -1L,
-          -1L,
-          false,
-          row.queryId());
+      return registerAndQuickReturn(command.getQuery(), context, descriptor);
     } catch (Exception e) {
       throw internal("Register failed: " + e.getMessage());
     }
+  }
+
+  /** 注册 + 触发 + 快返 STREAM 票（statement 与 prepared 垫片共用）。 */
+  private FlightInfo registerAndQuickReturn(
+      String sql, FlightProducer.CallContext context, FlightDescriptor descriptor)
+      throws Exception {
+    QueryOrchestrator.Registration reg =
+        orchestrator.register(sessionRef(context), user(context), sql, negotiateMode());
+    OperationRow row = reg.row();
+    return flightInfo(
+        schemaOf(row),
+        descriptor,
+        List.of(endpoints.streamTicketEndpoint(row)),
+        -1L,
+        -1L,
+        false,
+        row.queryId());
   }
 
   // ------------------------------------------------------------- PollFlightInfo（主链路）
@@ -159,15 +165,156 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     }
   }
 
+  // ------------------------------------------------------------- GetSchema（JDBC prepare 期需要）
+
+  @Override
+  public org.apache.arrow.flight.SchemaResult getSchema(
+      FlightProducer.CallContext context, FlightDescriptor descriptor) {
+    try {
+      Any any = Any.parseFrom(descriptor.getCommand());
+      String sql = null;
+      if (any.is(FlightSql.CommandStatementQuery.class)) {
+        sql = any.unpack(FlightSql.CommandStatementQuery.class).getQuery();
+      } else if (any.is(FlightSql.CommandPreparedStatementQuery.class)) {
+        sql = any.unpack(FlightSql.CommandPreparedStatementQuery.class)
+            .getPreparedStatementHandle().toStringUtf8();
+      }
+      if (sql != null) {
+        // 注册路径会经 AnalyzePlan 回填 schema（getSchema 不另起触发语义，幂等 fingerprint）
+        return new org.apache.arrow.flight.SchemaResult(
+            registerAndQuickReturn(sql, context, descriptor).getSchema());
+      }
+    } catch (Exception e) {
+      throw invalid("Malformed descriptor: " + e.getMessage());
+    }
+    return super.getSchema(context, descriptor);
+  }
+
   // ------------------------------------------------------------- DoGet（relay）
 
   @Override
   public void getStream(
       FlightProducer.CallContext context, Ticket ticket,
       FlightProducer.ServerStreamListener listener) {
-    // ticket 为 HMAC 信封（STREAM/PART），不经 FlightSql 命令路由；
+    // FlightSql 命令票（Any 打包，如 SqlInfo）走 producer 类型化路由；HMAC 信封票走 relay
+    try {
+      Any any = Any.parseFrom(ticket.getBytes());
+      if (any.getTypeUrl().startsWith("type.googleapis.com/arrow.flight.protocol.sql.")) {
+        super.getStream(context, ticket, listener);
+        return;
+      }
+    } catch (Exception e) {
+      // 非 protobuf 票 → HMAC 信封
+    }
     // relay 阻塞等待只在有界 relay-executor（设计 §4.1）
     relayExecutor.execute(() -> relay.relay(context.peerIdentity(), ticket, listener));
+  }
+
+  // ------------------- SqlInfo（JDBC DatabaseMetaData 最小面，设计 7.4；SqlInfoBuilder 照 Dremio 范式）
+
+  @Override
+  public FlightInfo getFlightInfoSqlInfo(
+      FlightSql.CommandGetSqlInfo command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    return new FlightInfo(
+        org.apache.arrow.flight.sql.FlightSqlProducer.Schemas.GET_SQL_INFO_SCHEMA,
+        descriptor,
+        List.of(new FlightEndpoint(new Ticket(Any.pack(command).toByteArray()))),
+        -1,
+        -1);
+  }
+
+  @Override
+  public void getStreamSqlInfo(
+      FlightSql.CommandGetSqlInfo command,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    new org.apache.arrow.flight.sql.SqlInfoBuilder()
+        .withFlightSqlServerName("Flight Gateway")
+        .withFlightSqlServerVersion("0.1.0")
+        .withFlightSqlServerReadOnly(true) // M1 仅查询；事务/更新不支持
+        .send(command.getInfoList(), listener);
+  }
+
+  // ------------------- PreparedStatement（JDBC 兼容垫片；真 prepare + 参数绑定归 M3）：
+  // JDBC 驱动的 executeQuery 走 CreatePreparedStatement action → CommandPreparedStatementQuery，
+  // 而非裸 CommandStatementQuery。垫片语义：handle 即 SQL 明文（无绑定），execute 与
+  // statement 路径完全一致。
+
+  @Override
+  public void createPreparedStatement(
+      FlightSql.ActionCreatePreparedStatementRequest request,
+      FlightProducer.CallContext context,
+      FlightProducer.StreamListener<org.apache.arrow.flight.Result> listener) {
+    try {
+      // 注册+触发（execute 时幂等命中在途/终态行），等 AnalyzePlan 回填真实 dataset_schema
+      // （驱动据其判定 StatementType；空 schema 会被当作 update）
+      OperationRow row =
+          orchestrator
+              .register(sessionRef(context), user(context), request.getQuery(), negotiateMode())
+              .row();
+      byte[] schema = orchestrator.waitForSchema(row.queryId());
+      FlightSql.ActionCreatePreparedStatementResult.Builder result =
+          FlightSql.ActionCreatePreparedStatementResult.newBuilder()
+              .setPreparedStatementHandle(
+                  com.google.protobuf.ByteString.copyFromUtf8(request.getQuery()));
+      if (schema != null) {
+        result.setDatasetSchema(com.google.protobuf.ByteString.copyFrom(schema));
+      }
+      // Result body = Any{ActionCreatePreparedStatementResult}（驱动端 Any.unpack 约定）
+      listener.onNext(
+          new org.apache.arrow.flight.Result(Any.pack(result.build()).toByteArray()));
+      listener.onCompleted();
+    } catch (Exception e) {
+      listener.onError(internal("Prepare failed: " + e.getMessage()));
+    }
+  }
+
+  @Override
+  public void closePreparedStatement(
+      FlightSql.ActionClosePreparedStatementRequest request,
+      FlightProducer.CallContext context,
+      FlightProducer.StreamListener<org.apache.arrow.flight.Result> listener) {
+    listener.onCompleted(); // 垫片无服务端状态
+  }
+
+  @Override
+  public FlightInfo getFlightInfoPreparedStatement(
+      FlightSql.CommandPreparedStatementQuery command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    try {
+      return registerAndQuickReturn(
+          command.getPreparedStatementHandle().toStringUtf8(), context, descriptor);
+    } catch (Exception e) {
+      throw internal("Register failed: " + e.getMessage());
+    }
+  }
+
+  /** JDBC 驱动 executeQuery 前必 DoPut 参数批（零参数亦然）——垫片消费并 ack，不落绑定。 */
+  @Override
+  public Runnable acceptPutPreparedStatementQuery(
+      FlightSql.CommandPreparedStatementQuery command,
+      FlightProducer.CallContext context,
+      org.apache.arrow.flight.FlightStream flightStream,
+      FlightProducer.StreamListener<org.apache.arrow.flight.PutResult> ackStream) {
+    return () -> {
+      ackStream.onNext(org.apache.arrow.flight.PutResult.empty()); // 驱动需读到至少一条 ack
+      ackStream.onCompleted();
+    };
+  }
+
+  @Override
+  public Runnable acceptPutPreparedStatementUpdate(
+      FlightSql.CommandPreparedStatementUpdate command,
+      FlightProducer.CallContext context,
+      org.apache.arrow.flight.FlightStream flightStream,
+      FlightProducer.StreamListener<org.apache.arrow.flight.PutResult> ackStream) {
+    return () -> {
+      ackStream.onNext(org.apache.arrow.flight.PutResult.empty()); // 驱动需读到至少一条 ack
+      ackStream.onCompleted();
+    };
   }
 
   // ------------------------------------------------------------- 取消 / 续期

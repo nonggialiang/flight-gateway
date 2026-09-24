@@ -58,9 +58,12 @@ public final class FgFlightService implements Service {
     Location listenLocation = Location.forGrpcInsecure("0.0.0.0", port);
     FlightServer.Builder builder =
         FlightServer.builder(allocator, listenLocation, producer)
-            .authHandler(
-                new org.apache.arrow.flight.auth.BasicServerAuthHandler(
-                    new FgBasicAuthValidator(config)));
+            // auth2-only（Authorization: Basic/Bearer 头，design F1）：
+            // arrow-java 的 Handshake RPC 只走 auth1 ServerAuthHandler（FlightService#handshake
+            // → ServerAuthWrapper.wrapHandshake(authHandler,...)），双栈并存不可能（Dremio 亦
+            // if/else 单选）；而 JDBC 驱动只说 auth2 → 统一 auth2。Bearer 优先/Basic 回退/签
+            // 发 token 见 FgBearerTokenAuthenticator（DremioBearerTokenAuthenticator 范式）。
+            .headerAuthenticator(new FgBearerTokenAuthenticator(config));
     if (config.getBoolean(GatewayConfig.FLIGHT_TLS_ENABLED)) {
       // M3：KeyStore→PEM（照 Dremio SSLConfigurator 范式）；M1 开发态默认关闭
       throw new IllegalStateException(
