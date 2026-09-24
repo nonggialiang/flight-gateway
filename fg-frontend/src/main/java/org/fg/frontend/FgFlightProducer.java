@@ -191,20 +191,17 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
               new FlightProducer.StreamListener<CancelStatus>() {
                 @Override
                 public void onNext(CancelStatus status) {
-                  java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
-                  int number =
-                      org.apache.arrow.flight.impl.Flight.CancelStatus
-                          .valueOf("CANCEL_STATUS_" + status.name())
-                          .getNumber();
-                  while (true) {
-                    int bb = number & 0x7F;
-                    number >>>= 7;
-                    b.write(bb | (number == 0 ? 0 : 0x80));
-                    if (number == 0) {
-                      break;
-                    }
-                  }
-                  listener.onNext(new org.apache.arrow.flight.Result(b.toByteArray()));
+                  // Result body 必须是规范消息 CancelFlightInfoResult{status=1}；
+                  // 此前手写裸 varint（0x01）被规范客户端（arrow-java FlightSqlClient）
+                  // 以 invalid tag 拒绝——python 用例的 raw[0] 兜底掩盖了这一偏差
+                  listener.onNext(
+                      new org.apache.arrow.flight.Result(
+                          org.apache.arrow.flight.impl.Flight.CancelFlightInfoResult.newBuilder()
+                              .setStatus(
+                                  org.apache.arrow.flight.impl.Flight.CancelStatus.valueOf(
+                                      "CANCEL_STATUS_" + status.name()))
+                              .build()
+                              .toByteArray()));
                 }
 
                 @Override
