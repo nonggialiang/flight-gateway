@@ -579,6 +579,16 @@ fg.control.event.lag / fg.flight.session.active / fg.allocator.allocated_bytes{c
 | D15 | **endpoint 模式不可混发**（endpoints=分片拼接语义，混发=数据翻倍） | mode（HTTPS/RELAY）注册时协商（header/session option）落行，最终 FlightInfo 按行构造 |
 | D16 | 客户端标准支持矩阵 | pyarrow/ADBC/JDBC 对 PollFlightInfo、https Location、RenewFlightEndpoint 的支持度 = PoC ⑥，决定默认 mode 与 GetFlightInfo 兼容路径权重；**另验 endpoints 消费行为**（是否遍历全部分片 endpoint 拼接——只取首个的非合规客户端需 `fg.result.relay.single-stream` 兜底） |
 
+**⑥ 实测矩阵（M1 e2e，arrow 19.0.0 线）**：
+
+| 客户端 | PollFlightInfo | https presigned Location | endpoints 遍历 | 在 FG 上的实际路径 |
+|---|---|---|---|---|
+| pyarrow 25（wire 层手工客户端） | 有（grpcio 直打） | 有（HTTP GET + `ipc.open_stream`） | 有 | poll 主链路（双 mode 均可） |
+| arrow-java `FlightSqlClient` 19 | **无客户端 API** | **无**（`getStream(Ticket)` 仅 gRPC；locations 仅作 gRPC 备地址重连，票须非空） | 有 | 恒走 legacy GetFlightInfo → STREAM 票 → relay |
+| `flight-sql-jdbc-driver` 19（Avatica/Calcite 基座） | 无（同上） | **无**（反编译 `ArrowFlightSqlClientHandler.getStreams`：locations 空走绑定通道、非空按 Location 建 gRPC FlightClient 重发 DoGet——无 HTTP GET presign 路径） | 有（`FlightEndpointDataQueue` 逐 endpoint） | 恒走 legacy GetFlightInfo → STREAM 票 → relay，**与 endpoint.mode 无关**（https 模式回归 PASS 仅证 relay 路径 mode 无关性） |
+
+推论：① 默认 mode=relay 对 JDBC 系客户端是唯一可用路径（https 模式对其既无收益也无破坏——它们根本到不了 presign 分支）；② RenewFlightEndpoint 仅 https 模式有意义，而能到达该分支的客户端（pyarrow/ADBC）恰好是支持它的；③ `single-stream` 兜底针对的"只取首个 endpoint"行为在 arrow 19 线三客户端均未出现（均遍历）。
+
 ---
 
 ## 7. 配置项清单（节选）
