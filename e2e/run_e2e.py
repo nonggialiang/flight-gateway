@@ -381,11 +381,25 @@ def backpressure_timeout(c):
     return qid
 
 
+def legacy_long_wait(c):
+    """STREAM 票 DoGet 等待预算与 fg.poll.max-wait 解耦（= fg.query.timeout）：
+    网关须以 -Dfg.poll.max-wait=2s 启动——旧实现（DoGet 同 poll 预算）在查询 >2s 时
+    DoGet 报 UNAVAILABLE；新实现 STREAM 票挂满查询全程直至终态。"""
+    t0 = time.time()
+    legacy_get_flight_info(
+        c,
+        "SELECT id % 1000 AS k, count(*) AS cnt FROM range(50000000) GROUP BY id % 1000",
+        1000)
+    print(f"[legacy-long] DoGet held {time.time() - t0:.1f}s under poll.max-wait=2s: PASS")
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "legacy"
     c = client()
     if which == "legacy":
         legacy_get_flight_info(c, "SELECT id, id * 2 AS dbl, concat('v-', cast(id as STRING)) AS s FROM range(1000)", 1000)
+    elif which == "legacy-long":
+        legacy_long_wait(c)
     elif which == "poll":
         poll_flight_info(c, "SELECT id FROM range(1000)", 1000)
     elif which == "poll-multi":

@@ -486,7 +486,9 @@ SPI 不变，切换是 Kit 内政；§4.4.1-4.4.3（薄壳/sink/Connect client�
 
 ### 4.7 Relay（兼容模式）
 
-- `getStream(ticket)` → 验签 → 查行（在途则等待，同 poll 语义）→ 读 manifest：
+- `getStream(ticket)` → 验签 → 查行（在途则等待，等待预算按票 kind 分策略）→ 读 manifest：
+  - 等待预算：`STREAM`（legacy 快返票，可能查询仍在途且客户端无 poll 循环可退避）= `fg.query.timeout`（D9 唯一护栏，挂满查询全程）；`PART`（poll 终态票，铸造时行已终态）= 零等待，见 RUNNING 即快速 UNAVAILABLE 暴露异常态
+  - 长等待带取消感知（`listener.isCancelled`）：客户端断流后在一个 `fg.poll.db.interval` 内释放有界 relay 池线程（600s 预算下废弃流不得占满池）
   - `kind=STREAM`：依序 open 全部 part，单流顺序中继
   - `kind=PART`：只 open manifest 中该 partIndex 的 part
   → `ArrowStreamReader` 逐 batch → `putNextWhenClientReady()`（Dremio 背压策略：`isReady` 不满足则 wait，超时 `fg.relay.client.readiness.timeout` 默认 50s fail）

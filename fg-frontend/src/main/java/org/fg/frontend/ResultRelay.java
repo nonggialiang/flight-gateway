@@ -66,11 +66,23 @@ final class ResultRelay {
       return;
     }
 
-    // 在途则等待，同 poll 语义
+    // 在途等待，预算按票 kind 分策略（D15/设计 §4.7）：
+    //   STREAM（legacy GetFlightInfo 快返票）——票可能在查询 RUNNING 时就到 DoGet，且 legacy
+    //     客户端没有 poll 循环可退避，等待预算 = fg.query.timeout（D9 唯一护栏），挂满查询全程；
+    //   PART（poll 终态票）——铸造时行已 CAS 终态（单向），到达 DoGet 时必然 COMPLETED，
+    //     零等待；若见 RUNNING 即异常态，快速 UNAVAILABLE 暴露而非长等掩盖。
+    // 长等待传入 listener::isCancelled：客户端断流后在一个 fg.poll.db.interval 内释放
+    // 有界 relay 池线程（否则 600s 预算下废弃流会占满池）。
+    Duration waitBudget =
+        t.kind() == TicketKind.STREAM
+            ? Duration.ofMillis(config.getDurationMs("fg.query.timeout"))
+            : Duration.ZERO;
     QueryOrchestrator.PollOutcome outcome;
     try {
-      outcome = orchestrator.poll(
-          t.queryId(), Duration.ofMillis(config.getDurationMs("fg.poll.max-wait")));
+      outcome = orchestrator.poll(t.queryId(), waitBudget, listener::isCancelled);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return; // 客户端已断流，流已死，无需回写
     } catch (Exception e) {
       listener.error(CallStatus.INTERNAL.withDescription("Poll failed: " + e.getMessage()).toRuntimeException());
       return;

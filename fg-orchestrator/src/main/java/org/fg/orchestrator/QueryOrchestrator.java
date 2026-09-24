@@ -209,8 +209,21 @@ public class QueryOrchestrator implements Service {
    * （客户端续 poll）。
    */
   public PollOutcome poll(String queryId, Duration maxWait) throws Exception {
+    return poll(queryId, maxWait, () -> false);
+  }
+
+  /**
+   * 带取消感知的 poll：cancelled 为 true（如 DoGet 客户端断流）时立即以 InterruptedException
+   * 退出，释放有界 relay 池线程；每轮 DB 轮询间隙检查一次（粒度 fg.poll.db.interval）。
+   */
+  public PollOutcome poll(
+      String queryId, Duration maxWait, java.util.function.BooleanSupplier cancelled)
+      throws Exception {
     long deadline = System.nanoTime() + maxWait.toNanos();
     while (true) {
+      if (cancelled.getAsBoolean()) {
+        throw new InterruptedException("Poll caller cancelled: " + queryId);
+      }
       Optional<OperationRow> rowOpt = dao.get(queryId);
       if (rowOpt.isEmpty()) {
         throw new IllegalArgumentException("Unknown query: " + queryId);
