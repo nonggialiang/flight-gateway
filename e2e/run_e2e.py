@@ -353,6 +353,34 @@ def part_retry(c):
     print("[retry] ALL PASS")
     return qid
 
+def backpressure_timeout(c):
+    """慢消费背压（Dremio putNextWhenClientReady 语义）：网关须以
+    -Dfg.relay.client.readiness.timeout=2s 启动。part(~64MB) > gRPC 流控/BDP 窗口(~16MB)
+    → 4s/chunk 慢消费下服务端 isReady 阻塞、2s 超时 fail，流提前中止而非静态缓冲吞掉。
+    全程约 9 分钟（客户端需先排空 ~16MB 在途窗口才进入稳态阻塞）。"""
+    t0 = time.time()
+    endpoints, records, qid = poll_terminal(c, "SELECT id FROM range(8000000)")
+    print(f"[bp] endpoints={len(endpoints)} totalRecords={records}")
+    ticket, _ = parse_endpoint(endpoints[0])
+    assert ticket is not None, "relay PART ticket expected"
+    reader = c.do_get(fl.Ticket(ticket))
+    rows, err = 0, None
+    try:
+        for chunk in reader:
+            data = getattr(chunk, "data", None) or chunk
+            rows += data.num_rows
+            time.sleep(4.0)
+    except Exception as e:
+        err = e
+        print(f"[bp] stream error after {rows} rows, t={time.time()-t0:.0f}s: {e}")
+    assert err is not None, f"expected backpressure timeout error, got clean EOF rows={rows}"
+    msg = str(err)
+    assert "not ready" in msg or "backpressure" in msg or "Relay failed" in msg, f"unexpected error: {msg}"
+    assert rows < 8_000_000, "stream must abort early, not deliver everything"
+    print(f"[bp] aborted at rows={rows} (~{rows * 8 // 1024 // 1024}MB in flight drained): PASS")
+    return qid
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "legacy"
     c = client()
@@ -368,6 +396,8 @@ if __name__ == "__main__":
         https_order_by(c)
     elif which == "retry":
         part_retry(c)
+    elif which == "backpressure":
+        backpressure_timeout(c)
     elif which == "cancel":
         cancel_inflight(c, "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")
     else:
