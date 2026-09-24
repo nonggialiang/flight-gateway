@@ -586,8 +586,9 @@ fg.control.event.lag / fg.flight.session.active / fg.allocator.allocated_bytes{c
 | pyarrow 25（wire 层手工客户端） | 有（grpcio 直打） | 有（HTTP GET + `ipc.open_stream`） | 有 | poll 主链路（双 mode 均可） |
 | arrow-java `FlightSqlClient` 19 | **无客户端 API** | **无**（`getStream(Ticket)` 仅 gRPC；locations 仅作 gRPC 备地址重连，票须非空） | 有 | 恒走 legacy GetFlightInfo → STREAM 票 → relay |
 | `flight-sql-jdbc-driver` 19（Avatica/Calcite 基座） | 无（同上） | **无**（反编译 `ArrowFlightSqlClientHandler.getStreams`：locations 空走绑定通道、非空按 Location 建 gRPC FlightClient 重发 DoGet——无 HTTP GET presign 路径） | 有（`FlightEndpointDataQueue` 逐 endpoint） | 恒走 legacy GetFlightInfo → STREAM 票 → relay，**与 endpoint.mode 无关**（https 模式回归 PASS 仅证 relay 路径 mode 无关性） |
+| ADBC 1.12（`adbc_driver_flightsql`，C++ 驱动） | **未使用**（wire 观测：GetFlightInfo + STREAM 票 DoGet，无 PollFlightInfo 调用） | 未到达（同 JDBC：恒走 legacy → relay；https 模式 PASS 且服务端有 Relay complete 佐证） | 有 | legacy GetFlightInfo → STREAM 票 → relay；**独有贡献：逐 endpoint 校验宣告 schema 与流 schema 一致性**——抓出 FG 宣告 schema（AnalyzePlan）与物化 schema（sink）nullable 不一致 bug（已修：`MaterializationPlanner.toArrowSchema` 透传 nullable） |
 
-推论：① 默认 mode=relay 对 JDBC 系客户端是唯一可用路径（https 模式对其既无收益也无破坏——它们根本到不了 presign 分支）；② RenewFlightEndpoint 仅 https 模式有意义，而能到达该分支的客户端（pyarrow/ADBC）恰好是支持它的；③ `single-stream` 兜底针对的"只取首个 endpoint"行为在 arrow 19 线三客户端均未出现（均遍历）。
+推论：① 默认 mode=relay 对 JDBC/ADBC/FlightSqlClient 系客户端是唯一可用路径（它们不走 PollFlightInfo，https 模式对其既无收益也无破坏——根本到不了 presign 分支）；② **presign 分支（PollFlightInfo 终态票 + RenewFlightEndpoint）当前仅 pyarrow 线可达**，https 模式的目标用户是自研/未来的 poll 客户端；③ `single-stream` 兜底针对的"只取首个 endpoint"行为在实测四客户端均未出现（均遍历）。
 
 ---
 

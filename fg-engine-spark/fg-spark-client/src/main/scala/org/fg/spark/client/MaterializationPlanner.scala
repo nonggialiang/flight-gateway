@@ -104,7 +104,12 @@ object MaterializationPlanner {
         i += 1
       }
       seen += name
-      fields.add(new Field(name, FieldType.nullable(toArrowType(f.getDataType)), null))
+      // 空值标志须透传 Spark Connect AnalyzePlan 的 nullable：sink 落盘 schema 带真实可空性，
+      // 宣告 schema 与物化 schema 不一致会被严格客户端拒绝（ADBC 逐 endpoint 校验）
+      val fieldType =
+        if (f.getNullable) FieldType.nullable(toArrowType(f.getDataType))
+        else FieldType.notNullable(toArrowType(f.getDataType))
+      fields.add(new Field(name, fieldType, null))
     }
     new ArrowSchema(fields)
   }

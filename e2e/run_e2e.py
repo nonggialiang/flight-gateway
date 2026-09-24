@@ -381,6 +381,21 @@ def legacy_long_wait(c):
     print(f"[legacy-long] DoGet held {time.time() - t0:.1f}s under poll.max-wait=2s: PASS")
 
 
+def adbc_query(c, sql, expect_rows):
+    """ADBC（adbc_driver_flightsql 1.x，C++ 驱动，dbapi）——⑥ 矩阵第四路客户端。
+    支持度判据在服务端 gateway.log：有 Relay complete = relay 路径（DoGet）；
+    https 模式下无 Relay complete 而行数正确 = PollFlightInfo + presigned HTTP GET。"""
+    import adbc_driver_flightsql.dbapi as dbapi
+    t0 = time.time()
+    with dbapi.connect(uri="grpc://localhost:32010",
+                       db_kwargs={"username": USER, "password": PASSWORD}) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            table = cur.fetch_arrow_table()
+    assert table.num_rows == expect_rows, f"rows {table.num_rows} != {expect_rows}"
+    print(f"[adbc] rows={table.num_rows} cols={table.column_names} ({time.time() - t0:.1f}s): PASS")
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "legacy"
     c = client()
@@ -400,6 +415,8 @@ if __name__ == "__main__":
         part_retry(c)
     elif which == "backpressure":
         backpressure_timeout(c)
+    elif which == "adbc":
+        adbc_query(c, "SELECT id, id * 2 AS dbl FROM range(1000)", 1000)
     elif which == "cancel":
         cancel_inflight(c, "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")
     else:
