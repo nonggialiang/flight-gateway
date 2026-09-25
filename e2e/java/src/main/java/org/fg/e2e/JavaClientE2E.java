@@ -5,10 +5,12 @@ import org.apache.arrow.flight.CancelFlightInfoRequest;
 import org.apache.arrow.flight.CancelFlightInfoResult;
 import org.apache.arrow.flight.CancelStatus;
 import org.apache.arrow.flight.FlightClient;
+import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.PollInfo;
 import org.apache.arrow.flight.grpc.CredentialCallOption;
 import org.apache.arrow.flight.sql.FlightSqlClient;
 import org.apache.arrow.memory.BufferAllocator;
@@ -50,6 +52,7 @@ public final class JavaClientE2E {
               "SELECT id % 1000 AS k, count(*) AS cnt FROM range(20000000) GROUP BY id % 1000",
               1000, "[java-legacy-long]");
           case "cancel" -> cancel(sql, credential);
+          case "poll" -> poll(client, sql, credential);
           case "prepare" -> {
             // 复刻 JDBC 驱动路径（驱动即 shade 的 FlightSqlClient.prepare/execute）
             try (FlightSqlClient.PreparedStatement ps = sql.prepare(
@@ -116,6 +119,34 @@ public final class JavaClientE2E {
       throw new AssertionError("expected CANCELLED, got " + status);
     }
     System.out.printf("[java-cancel] PASS (%.1fs)%n", elapsedSec(t0));
+  }
+
+  /**
+   * Java 原生 poll 链路（⑥ 矩阵原语线）：{@code FlightClient.pollInfo}——FlightSqlClient
+   * 未封装 poll 语义（全部 execute 走 getInfo），此用例直用原语驱动 FG 主链路：
+   * 首 poll 注册+触发快返 → 轮询至终态（descriptor unset）→ 逐 endpoint 取数。
+   */
+  private static void poll(FlightClient client, FlightSqlClient sql,
+      CredentialCallOption credential) throws InterruptedException {
+    long t0 = System.nanoTime();
+    byte[] command = com.google.protobuf.Any.pack(
+            org.apache.arrow.flight.sql.impl.FlightSql.CommandStatementQuery.newBuilder()
+                .setQuery("SELECT id, id * 2 AS dbl FROM range(1000)").build())
+        .toByteArray();
+    FlightDescriptor descriptor = FlightDescriptor.command(command);
+    PollInfo info = null;
+    for (int i = 0; i < 90; i++) {
+      info = client.pollInfo(descriptor, credential);
+      if (info.getFlightDescriptor().isEmpty()) { // 终态：flight_descriptor unset
+        System.out.printf("[java-poll] terminal after %d polls%n", i + 1);
+        break;
+      }
+      Thread.sleep(1000);
+    }
+    if (info == null || !info.getFlightDescriptor().isEmpty()) {
+      throw new AssertionError("not terminal in time");
+    }
+    streamAll(sql, credential, info.getFlightInfo(), 1000, "[java-poll]", t0);
   }
 
   private static double elapsedSec(long t0) {
