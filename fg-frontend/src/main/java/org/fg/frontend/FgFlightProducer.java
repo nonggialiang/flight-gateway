@@ -36,12 +36,17 @@ import org.fg.orchestrator.store.OperationRow;
  */
 final class FgFlightProducer extends NoOpFlightSqlProducer {
 
+  /** cookie 会话 middleware 注册键（ServerSessionMiddleware，per-connection 主通道）。 */
+  static final org.apache.arrow.flight.FlightServerMiddleware.Key<
+          org.apache.arrow.flight.ServerSessionMiddleware>
+      SESSION_MIDDLEWARE_KEY = org.apache.arrow.flight.FlightServerMiddleware.Key.of("fg-session");
+
   private final QueryOrchestrator orchestrator;
   private final EndpointsAssembler endpoints;
   private final ResultRelay relay;
   private final GatewayConfig config;
   private final ExecutorService relayExecutor;
-  /** peerIdentity(token) → 会话（M1 简化：每用户一会话；cookie 双轨 M3） */
+  /** peerIdentity(user) → user 直通缓存（identity 即用户名；会话语义见 sessionRef） */
   private final Map<String, String> sessions = new ConcurrentHashMap<>();
 
   FgFlightProducer(
@@ -467,7 +472,23 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   }
 
   private String sessionRef(FlightProducer.CallContext context) {
-    // M1：会话引用=identity（token）；fingerprint 语义=同 token 同 SQL
+    // per-connection 会话（原 M3 "cookie 双轨" 提前到 M1.5）：一个客户端连接 =
+    // 一个 fg 会话 = 一个 Connect session = 引擎侧一个 SparkSession。三级解析：
+    //   ① cookie 会话（JDBC/ADBC 等带 cookie jar 的客户端；arrow_flight_session_id
+    //     由 ServerSessionMiddleware 绑定，SetSessionOptions 等类型化入口触发）；
+    //   ② Authorization 头派生（无 cookie 客户端兜底：Bearer token 每连接一次握手、
+    //     连接内稳定；Basic 直发退化场景同值稳定）——sha256 前缀，凭证材料不落库；
+    //   ③ peerIdentity 兜底（auth2-only 下必带 Authorization 头，理论不可达）。
+    // fingerprint 幂等语义随之变为"同连接同 SQL 不重复执行"（跨连接本就不该共享）。
+    org.apache.arrow.flight.ServerSessionMiddleware session =
+        context.getMiddleware(SESSION_MIDDLEWARE_KEY);
+    if (session != null && session.hasSession()) {
+      return session.getSession().id;
+    }
+    AuthHeaderMiddleware auth = context.getMiddleware(AuthHeaderMiddleware.KEY);
+    if (auth != null && auth.authorization() != null && !auth.authorization().isBlank()) {
+      return "auth-" + QueryOrchestrator.sha256(auth.authorization()).substring(0, 16);
+    }
     return context.peerIdentity();
   }
 

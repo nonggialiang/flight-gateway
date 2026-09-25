@@ -1,9 +1,11 @@
 package org.fg.frontend;
 
 import java.time.Duration;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.apache.arrow.flight.FlightServer;
 import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.ServerSessionMiddleware;
 import org.apache.arrow.memory.BufferAllocator;
 import org.fg.common.config.GatewayConfig;
 import org.fg.common.service.Service;
@@ -60,6 +62,16 @@ public final class FgFlightService implements Service {
         FlightServer.builder(allocator, listenLocation, producer)
             // D15 header 协商：捕获 x-fg-endpoint-mode（https|relay），注册时落行
             .middleware(EndpointModeMiddleware.KEY, new EndpointModeMiddleware.Factory())
+            // per-connection 会话主通道（原 M3 "cookie 双轨" 提前）：arrow 官方 cookie 会话
+            // （arrow_flight_session_id），JDBC/ADBC 客户端内建 cookie jar 即粘住。会话在
+            // SetSessionOptions 等类型化入口经 getSession() 惰性绑定；普通 RPC 不主动建会话
+            // （无 cookie jar 的客户端每个 RPC 都会新建会话，反致 sessionRef 漂移）。
+            .middleware(
+                FgFlightProducer.SESSION_MIDDLEWARE_KEY,
+                new ServerSessionMiddleware.Factory(() -> UUID.randomUUID().toString()))
+            // per-connection 会话兜底通道：捕获 Authorization 头（Bearer token 每连接一次
+            // 握手、连接内稳定），无 cookie 客户端（pyarrow 等）据此派生按连接 sessionRef
+            .middleware(AuthHeaderMiddleware.KEY, new AuthHeaderMiddleware.Factory())
             // auth2-only（Authorization: Basic/Bearer 头，design F1）：
             // arrow-java 的 Handshake RPC 只走 auth1 ServerAuthHandler（FlightService#handshake
             // → ServerAuthWrapper.wrapHandshake(authHandler,...)），双栈并存不可能（Dremio 亦
