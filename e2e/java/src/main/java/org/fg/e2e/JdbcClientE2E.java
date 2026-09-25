@@ -16,8 +16,8 @@ import java.util.concurrent.TimeUnit;
  * DoGet 内联等待）、{@link Statement#cancel()}（→ CancelFlightInfo）。
  *
  * <p>用法：{@code java -cp target/fg-e2e-java-0.1.0-SNAPSHOT.jar org.fg.e2e.JdbcClientE2E
- * {legacy|legacy-long|metadata|cancel|cancel-poll|mode}}（网关默认 relay 模式；cancel-poll 需
- * {@code -Dfg.poll.max-wait=2s}；用例间 TRUNCATE fg_operation）。
+ * {legacy|legacy-long|metadata|cancel|cancel-poll|mode|types|prepare|update}}（网关默认
+ * relay 模式；cancel-poll 需 {@code -Dfg.poll.max-wait=2s}；用例间 TRUNCATE fg_operation）。
  */
 public final class JdbcClientE2E {
 
@@ -38,6 +38,9 @@ public final class JdbcClientE2E {
             1000, "[jdbc-legacy-long]");
         case "metadata" -> metadata(conn);
         case "mode" -> modeUrl(props);
+        case "types" -> types(conn);
+        case "prepare" -> prepare(conn);
+        case "update" -> update(conn);
         case "cancel" -> cancel(conn);
         case "cancel-poll" -> cancelPoll(conn);
         default -> throw new IllegalArgumentException("unknown case " + which);
@@ -83,6 +86,143 @@ public final class JdbcClientE2E {
       }
     }
     System.out.printf("[jdbc-mode] PASS (%.1fs)%n", elapsedSec(t0));
+  }
+
+  /**
+   * 类型化取数 accessors（此前用例只数行数从未读值——JDBC 类型映射 bug 恰藏于此）：
+   * bigint/double/string/decimal/null/timestamp 六列，逐行逐列断言 getXxx 值、
+   * {@link ResultSet#wasNull()}、{@link java.sql.ResultSetMetaData}（列数+列名），并顺带
+   * {@link Statement#setFetchSize(int)}（BI 常用，验证不破坏流式取数）。
+   *
+   * <p>timestamp 列已知怪癖（2026-09-25 实测，D16 记录）：线上是 timestamp[us, tz=UTC]
+   * 且 instant 精确（pyarrow 直读 part 文件实证），但上游 arrow JDBC 驱动 accessor 是
+   * 墙钟语义——{@code Timestamp.valueOf(UTC 墙钟)} 按 JVM 本地时区重解释，zoned 向量再
+   * 经 calendar 偏移调整一次 → UTC+8 客户端读出 epoch 偏 -16h（双重偏移）。FG/引擎/网关
+   * 无责；故此处断言行间 delta（恒 86,400,000ms）而非绝对 epoch，绝对值仅打印留痕。
+   */
+  private static void types(Connection conn) throws Exception {
+    long t0 = System.nanoTime();
+    try (Statement st = conn.createStatement()) {
+      st.setFetchSize(128);
+      try (ResultSet rs = st.executeQuery(
+          "SELECT id AS c_bigint, id * 1.5 AS c_double,"
+              + " concat('v-', cast(id AS STRING)) AS c_str,"
+              + " CAST(id AS DECIMAL(10,2)) AS c_dec,"
+              + " CAST(NULL AS BIGINT) AS c_null,"
+              + " CAST(id * 86400 AS TIMESTAMP) AS c_ts"
+              + " FROM range(3) ORDER BY id")) {
+        java.sql.ResultSetMetaData md = rs.getMetaData();
+        if (md.getColumnCount() != 6) {
+          throw new AssertionError("[jdbc-types] columns " + md.getColumnCount() + " != 6");
+        }
+        String[] labels = {"c_bigint", "c_double", "c_str", "c_dec", "c_null", "c_ts"};
+        for (int i = 0; i < labels.length; i++) {
+          if (!labels[i].equalsIgnoreCase(md.getColumnLabel(i + 1))) {
+            throw new AssertionError("[jdbc-types] label[" + i + "]="
+                + md.getColumnLabel(i + 1) + " != " + labels[i]);
+          }
+        }
+        long rows = 0;
+        long prevTsEpoch = Long.MIN_VALUE;
+        while (rs.next()) {
+          long id = rows;
+          if (rs.getLong(1) != id) {
+            throw new AssertionError("[jdbc-types] row " + id + " getLong=" + rs.getLong(1));
+          }
+          if (Math.abs(rs.getDouble(2) - id * 1.5) > 1e-9) {
+            throw new AssertionError("[jdbc-types] row " + id + " getDouble=" + rs.getDouble(2));
+          }
+          if (!("v-" + id).equals(rs.getString(3))) {
+            throw new AssertionError("[jdbc-types] row " + id + " getString=" + rs.getString(3));
+          }
+          if (rs.getBigDecimal(4).compareTo(java.math.BigDecimal.valueOf(id).setScale(2)) != 0) {
+            throw new AssertionError("[jdbc-types] row " + id + " dec=" + rs.getBigDecimal(4));
+          }
+          rs.getLong(5);
+          if (!rs.wasNull()) {
+            throw new AssertionError("[jdbc-types] row " + id + " null col wasNull=false");
+          }
+          long tsEpoch = rs.getTimestamp(6).getTime();
+          System.out.printf("[jdbc-types] row %d ts epoch=%d (driver 墙钟语义，绝对值含时区偏移)%n",
+              id, tsEpoch);
+          if (prevTsEpoch != Long.MIN_VALUE && tsEpoch - prevTsEpoch != 86_400_000L) {
+            throw new AssertionError("[jdbc-types] row " + id + " ts delta="
+                + (tsEpoch - prevTsEpoch) + " != 86400000");
+          }
+          prevTsEpoch = tsEpoch;
+          rows++;
+        }
+        if (rows != 3) {
+          throw new AssertionError("[jdbc-types] rows " + rows + " != 3");
+        }
+      }
+    }
+    System.out.printf("[jdbc-types] PASS (%.1fs)%n", elapsedSec(t0));
+  }
+
+  /**
+   * 显式 {@link java.sql.PreparedStatement} 双面：
+   *
+   * <ul>
+   *   <li>正例：prepareStatement + executeQuery 走真 prepared 线（CreatePreparedStatement
+   *       垫片 → DoPut 参数批 ack → CommandPreparedStatementQuery），与 legacy 的
+   *       Avatica 内部 prepare 等价但显式；
+   *   <li>负例：{@code ?} 占位——M1 垫片无参数绑定（M3），prepare 的 plan-only
+   *       AnalyzePlan 对未解析占位符即刻失败（fail-fast，SQLException 而非挂起/错读）。
+   * </ul>
+   */
+  private static void prepare(Connection conn) throws Exception {
+    long t0 = System.nanoTime();
+    try (java.sql.PreparedStatement ps =
+        conn.prepareStatement("SELECT id, id * 7 AS sept FROM range(1000)")) {
+      try (ResultSet rs = ps.executeQuery()) {
+        long total = 0;
+        while (rs.next()) {
+          total++;
+        }
+        if (total != 1000) {
+          throw new AssertionError("[jdbc-prepare] rows " + total + " != 1000");
+        }
+      }
+    }
+    try {
+      java.sql.PreparedStatement bad =
+          conn.prepareStatement("SELECT id FROM range(10) WHERE id > ?");
+      try (ResultSet ignored = bad.executeQuery()) {
+        throw new AssertionError("[jdbc-prepare] ? 占位未按预期失败");
+      } catch (SQLException e) {
+        System.out.printf("[jdbc-prepare] ?-execute SQLException: %s%n", firstLine(e.getMessage()));
+      } finally {
+        bad.close();
+      }
+    } catch (SQLException e) {
+      System.out.printf("[jdbc-prepare] ?-prepare SQLException: %s%n", firstLine(e.getMessage()));
+    }
+    System.out.printf("[jdbc-prepare] PASS (%.1fs)%n", elapsedSec(t0));
+  }
+
+  /**
+   * DML 负面（网关 SqlInfo 声明 read-only）：INSERT 走到 prepare 的 plan-only AnalyzePlan
+   * 即刻失败（TABLE_OR_VIEW_NOT_FOUND fail-fast）——断言干净 SQLException 错误面，
+   * 无挂起、无半状态行（外部判据 fg_operation count 不增）。
+   */
+  private static void update(Connection conn) throws Exception {
+    long t0 = System.nanoTime();
+    try (Statement st = conn.createStatement()) {
+      st.executeUpdate("INSERT INTO nowhere VALUES (1)");
+      throw new AssertionError("[jdbc-update] DML 未按预期失败");
+    } catch (SQLException e) {
+      System.out.printf("[jdbc-update] SQLException: %s%n", firstLine(e.getMessage()));
+    }
+    System.out.printf("[jdbc-update] PASS (%.1fs)%n", elapsedSec(t0));
+  }
+
+  private static String firstLine(String message) {
+    if (message == null) {
+      return "(null)";
+    }
+    int nl = message.indexOf('\n');
+    return nl > 0 ? message.substring(0, nl) : message;
   }
 
   /** 触发 CommandGetSqlInfo（FgSqlInfoProvider 最小面）。 */
