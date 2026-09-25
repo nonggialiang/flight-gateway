@@ -172,29 +172,36 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     }
   }
 
-  // ------------------------------------------------------------- GetSchema（JDBC prepare 期需要）
+  // ------------------------------------------------------------- GetSchema（plan-only，不触发执行）
 
   @Override
   public org.apache.arrow.flight.SchemaResult getSchema(
       FlightProducer.CallContext context, FlightDescriptor descriptor) {
+    String sql;
     try {
       Any any = Any.parseFrom(descriptor.getCommand());
-      String sql = null;
       if (any.is(FlightSql.CommandStatementQuery.class)) {
         sql = any.unpack(FlightSql.CommandStatementQuery.class).getQuery();
       } else if (any.is(FlightSql.CommandPreparedStatementQuery.class)) {
         sql = any.unpack(FlightSql.CommandPreparedStatementQuery.class)
             .getPreparedStatementHandle().toStringUtf8();
-      }
-      if (sql != null) {
-        // 注册路径会经 AnalyzePlan 回填 schema（getSchema 不另起触发语义，幂等 fingerprint）
-        return new org.apache.arrow.flight.SchemaResult(
-            registerAndQuickReturn(sql, context, descriptor).getSchema());
+      } else {
+        return super.getSchema(context, descriptor);
       }
     } catch (Exception e) {
       throw invalid("Malformed descriptor: " + e.getMessage());
     }
-    return super.getSchema(context, descriptor);
+    // Flight SQL 语义 GetSchema = plan-only：AnalyzePlan 直取 schema，不注册、不触发执行
+    try {
+      byte[] schema =
+          orchestrator.analyzeSchema(sessionRef(context), user(context), sql);
+      return new org.apache.arrow.flight.SchemaResult(
+          schema == null ? new Schema(List.of()) : SchemaSerde.deserialize(schema));
+    } catch (FlightRuntimeException e) {
+      throw e;
+    } catch (Exception e) {
+      throw internal("AnalyzePlan failed: " + e.getMessage());
+    }
   }
 
   // ------------------------------------------------------------- DoGet（relay）
@@ -247,7 +254,8 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   // ------------------- PreparedStatement（JDBC 兼容垫片；真 prepare + 参数绑定归 M3）：
   // JDBC 驱动的 executeQuery 走 CreatePreparedStatement action → CommandPreparedStatementQuery，
   // 而非裸 CommandStatementQuery。垫片语义：handle 即 SQL 明文（无绑定），execute 与
-  // statement 路径完全一致。
+  // statement 路径完全一致。prepare 本身 plan-only（AnalyzePlan 直取 dataset_schema，不注册、
+  // 不触发），执行延迟到首个 GetFlightInfo/PollFlightInfo（lazy trigger）。
 
   @Override
   public void createPreparedStatement(
@@ -255,13 +263,10 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       FlightProducer.CallContext context,
       FlightProducer.StreamListener<org.apache.arrow.flight.Result> listener) {
     try {
-      // 注册+触发（execute 时幂等命中在途/终态行），等 AnalyzePlan 回填真实 dataset_schema
-      // （驱动据其判定 StatementType；空 schema 会被当作 update）
-      OperationRow row =
-          orchestrator
-              .register(sessionRef(context), user(context), request.getQuery(), negotiateMode())
-              .row();
-      byte[] schema = orchestrator.waitForSchema(row.queryId());
+      // plan-only：dataset_schema 直接来自 AnalyzePlan（驱动据其判定 StatementType；
+      // 空 schema 会被当作 update）。AnalyzePlan 失败（如语法错误）即 prepare 失败。
+      byte[] schema =
+          orchestrator.analyzeSchema(sessionRef(context), user(context), request.getQuery());
       FlightSql.ActionCreatePreparedStatementResult.Builder result =
           FlightSql.ActionCreatePreparedStatementResult.newBuilder()
               .setPreparedStatementHandle(

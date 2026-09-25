@@ -121,27 +121,16 @@ public class QueryOrchestrator implements Service {
   }
 
   /**
-   * 等待 AnalyzePlan 回填 schema（JDBC prepare 期需真实 dataset_schema 判定 StatementType）。
-   * 触发已在 register 发生；AnalyzePlan 失败/超时返回 null（空 schema）。
+   * 纯 AnalyzePlan 取 schema（GetSchema / CreatePreparedStatement 用）：不建 OperationRow、
+   * 不触发执行——Flight SQL 语义上这两个 RPC 是 plan-only。非查询语句（无 STRUCT 结果）
+   * 返回 null。失败/超时直接抛出，由调用方决定错误面。
    */
-  public byte[] waitForSchema(String queryId) {
-    long deadline =
-        System.nanoTime()
-            + TimeUnit.MILLISECONDS.toNanos(config.getDurationMs("fg.query.prepare.timeout"));
-    try {
-      while (System.nanoTime() < deadline) {
-        OperationRow row = dao.get(queryId).orElse(null);
-        if (row == null || row.schemaBytes() != null) {
-          return row == null ? null : row.schemaBytes();
-        }
-        TimeUnit.MILLISECONDS.sleep(100);
-      }
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-    } catch (java.sql.SQLException e) {
-      logger.warn("Schema wait read failed for {}: {}", queryId, e.toString());
-    }
-    return null;
+  public byte[] analyzeSchema(String sessionRef, String user, String sql) throws Exception {
+    Duration prepareTimeout = Duration.ofMillis(config.getDurationMs("fg.query.prepare.timeout"));
+    // engine session 缓存策略与 triggerExecution 同款，后续按需增强
+    EngineSession session = engine.openSession(new GatewaySession(sessionRef, user, Map.of()));
+    Schema schema = engine.analyzeSchema(session, sql, prepareTimeout);
+    return schema == null ? null : SchemaSerde.serialize(schema);
   }
 
   /** AnalyzePlan（有界）→ 异步提交（提交即 detach，首响应回调落 operationId）。 */

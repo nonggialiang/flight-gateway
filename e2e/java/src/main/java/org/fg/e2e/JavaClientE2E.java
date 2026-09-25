@@ -1,6 +1,7 @@
 package org.fg.e2e;
 
 import java.util.concurrent.TimeUnit;
+import com.google.protobuf.Any;
 import org.apache.arrow.flight.CancelFlightInfoRequest;
 import org.apache.arrow.flight.CancelFlightInfoResult;
 import org.apache.arrow.flight.CancelStatus;
@@ -13,9 +14,11 @@ import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.PollInfo;
 import org.apache.arrow.flight.grpc.CredentialCallOption;
 import org.apache.arrow.flight.sql.FlightSqlClient;
+import org.apache.arrow.flight.sql.impl.FlightSql;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
  * FG M1 e2e（Java 侧）：arrow-java 官方 {@link FlightSqlClient}（JDBC 驱动同源实现）。
@@ -28,9 +31,10 @@ import org.apache.arrow.vector.ipc.ArrowReader;
  * HTTP GET presigned URL）。presign 用例即验证该完整链路（需 https 模式网关）。
  *
  * <p>用法：{@code java -jar target/fg-e2e-java-0.1.0-SNAPSHOT.jar
- * {legacy|legacy-long|cancel|poll|prepare|presign}}
+ * {legacy|legacy-long|cancel|poll|prepare|presign|schema-only}}
  * （legacy/legacy-long/prepare/cancel 默认 relay 模式；presign 需
- * {@code -Dfg.result.endpoint.mode=https}；各用例间 TRUNCATE fg_operation 防 fingerprint 冲突）
+ * {@code -Dfg.result.endpoint.mode=https}；schema-only 后断言 fg_operation 0 行；
+ * 各用例间 TRUNCATE fg_operation 防 fingerprint 冲突）
  */
 public final class JavaClientE2E {
 
@@ -69,6 +73,7 @@ public final class JavaClientE2E {
             }
           }
           case "presign" -> presign(sql, credential);
+          case "schema-only" -> schemaOnly(sql, credential);
           default -> throw new IllegalArgumentException("unknown case " + which);
         }
       }
@@ -108,6 +113,38 @@ public final class JavaClientE2E {
       throw new AssertionError(tag + " rows " + total + " != " + expected);
     }
     System.out.printf("%s PASS (%.1fs)%n", tag, elapsedSec(t0));
+  }
+
+  /**
+   * plan-only schema 验证（方案 A）：GetSchema 与 CreatePreparedStatement 都只走 AnalyzePlan，
+   * 不建 fg_operation 行、不触发执行（外部断言：TRUNCATE 后跑本用例，{@code fg_operation}
+   * 应 0 行），且两路 schema 非空、一致。
+   */
+  private static void schemaOnly(FlightSqlClient sql, CredentialCallOption credential)
+      throws Exception {
+    long t0 = System.nanoTime();
+    String query = "SELECT id, id * 2 AS dbl FROM range(1000)";
+    FlightDescriptor descriptor = FlightDescriptor.command(Any.pack(
+        FlightSql.CommandStatementQuery.newBuilder().setQuery(query).build()).toByteArray());
+    Schema viaGetSchema = sql.getSchema(descriptor, credential).getSchema();
+    if (viaGetSchema == null || viaGetSchema.getFields().isEmpty()) {
+      throw new AssertionError("getSchema returned empty schema");
+    }
+    FlightSqlClient.PreparedStatement ps = sql.prepare(query, credential);
+    try {
+      Schema viaPrepare = ps.getResultSetSchema();
+      if (viaPrepare == null || viaPrepare.getFields().isEmpty()) {
+        throw new AssertionError("prepare dataset_schema empty");
+      }
+      if (!viaGetSchema.toString().equals(viaPrepare.toString())) {
+        throw new AssertionError(
+            "getSchema/prepare schema mismatch:\n" + viaGetSchema + "\n" + viaPrepare);
+      }
+    } finally {
+      ps.close(credential); // auth2 逐 RPC 验头（与驱动 close(getOptions()) 一致）
+    }
+    System.out.printf("[java-schema-only] PASS getSchema fields=%d (%.1fs)%n",
+        viaGetSchema.getFields().size(), elapsedSec(t0));
   }
 
   /**

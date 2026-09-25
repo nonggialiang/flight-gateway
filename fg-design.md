@@ -168,7 +168,7 @@ flight-gateway/
 | 需求 | 说明 |
 |---|---|
 | 认证 | **auth2-only**（`Authorization: Basic/Bearer` 头，Bearer 优先→Basic 回退→签发 token，`FgBearerTokenAuthenticator`，Dremio BearerTokenAuthenticator 范式）：arrow-java 的 Handshake RPC 只经 auth1 ServerAuthHandler、与 JDBC 驱动（仅 auth2）互斥，双栈不可能——auth1（BasicAuth 载荷 + auth-token-bin）已弃用。TLS 默认开启 |
-| 命令/RPC | **PollFlightInfo**（主链路：注册+触发+轮询）、**GetFlightInfo**（旧客户端兼容路径，同语义快返）、**CancelFlightInfo**（标准取消，携 FlightInfo）、**RenewFlightEndpoint**（标准续期，presign 延期）、`CommandStatementQuery`、`CreatePreparedStatement/ClosePreparedStatement`（M1 为 JDBC 兼容垫片：handle=SQL 明文、DoPut 参数批仅 ack、prepare 期回填真实 dataset_schema——真参数绑定归 M3）、`CommandGetSqlInfo`（SqlInfoBuilder 最小面）、session actions |
+| 命令/RPC | **PollFlightInfo**（主链路：注册+触发+轮询）、**GetFlightInfo**（旧客户端兼容路径，同语义快返）、**CancelFlightInfo**（标准取消，携 FlightInfo）、**RenewFlightEndpoint**（标准续期，presign 延期）、`CommandStatementQuery`、`GetSchema`（**plan-only**：orchestrator.analyzeSchema 直取 AnalyzePlan 结果，不建 fg_operation 行、不触发执行——Flight SQL 语义"schema as if executed"；失败即 RPC 失败，不再竞态返回空 schema）、`CreatePreparedStatement/ClosePreparedStatement`（M1 为 JDBC 兼容垫片：handle=SQL 明文、DoPut 参数批仅 ack、**prepare 同为 plan-only**——dataset_schema 直取 AnalyzePlan（驱动 StatementType 判定依据），AnalyzePlan 失败（如语法错误）即 prepare 失败；执行延迟到首个 GetFlightInfo/PollFlightInfo 触发，代价是 prepare→execute 的物化 overlap 没有了（jdbc-legacy 2.3s→4.1s）——真参数绑定归 M3）、`CommandGetSqlInfo`（SqlInfoBuilder 最小面）、session actions |
 | 元数据 | **v1 完整实现目录族**（Flight SQL JDBC 兼容）：SqlInfo / Catalogs / DbSchemas / Tables / TableTypes / XdbcTypeInfo 映射引擎 catalog，支持 JDBC pattern（`%`/`_`）过滤与分页 ticket；主外键/CrossReference 返回空结果集（见 §4.8） |
 | 会话 | header/cookie 关联（仿 Dremio `ServerCookieMiddleware`），gateway 会话 ↔ 引擎会话一一映射 |
 
