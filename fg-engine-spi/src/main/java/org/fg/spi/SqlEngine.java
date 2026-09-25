@@ -40,6 +40,15 @@ public interface SqlEngine extends AutoCloseable {
   CompletableFuture<EngineExecutionHandle> submit(
       EngineSession session, String sql, MaterializationSpec spec, SubmitListener listener);
 
+  /**
+   * 命令执行（D17/D18，非 SELECT：SET/SHOW/DESCRIBE/EXPLAIN/USE/DDL/DML）：无物化、结果
+   * 小、网关持流至终态。返回的 future 在命令终态时完成（COMPLETED 携带 schema+IPC 结果；
+   * FAILED/CANCELLED 携带 error）。复用 {@link SubmitListener#onHandle} 捕获引擎
+   * operationId（cancel 链同 submit：setOperationId + interrupt）。
+   */
+  CompletableFuture<CommandOutcome> executeCommand(
+      EngineSession session, String sql, SubmitListener listener);
+
   /** attach 挂执行流；返回终态快速结果。 */
   CompletableFuture<ExecutionOutcome> attach(EngineSession session, EngineExecutionHandle handle);
 

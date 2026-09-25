@@ -90,6 +90,20 @@ object MaterializationPlanner {
       .build()
   }
 
+  /** 命令执行请求（D17）：Plan.root = SQL 关系（同 analyzePlanRequest 的 relation），
+   * 无 WriteOperation（命令不物化）、无 ReattachOptions（网关持流至终态，无 reattach 需求）。 */
+  def commandPlanRequest(user: String, sessionId: String, sqlText: String): ExecutePlanRequest = {
+    val plan = Plan.newBuilder()
+      .setRoot(Relation.newBuilder().setSql(SQL.newBuilder().setQuery(sqlText)))
+      .build()
+    ExecutePlanRequest.newBuilder()
+      .setSessionId(sessionId)
+      .setUserContext(UserContext.newBuilder().setUserId(user))
+      .setClientType("fg-gateway")
+      .setPlan(plan)
+      .build()
+  }
+
   // ---------------------------------------------------------------- schema 转换
 
   /** proto DataType(Struct) → Arrow Schema。列名去重（H1：快返 schema 与 manifest 一致语义）。 */

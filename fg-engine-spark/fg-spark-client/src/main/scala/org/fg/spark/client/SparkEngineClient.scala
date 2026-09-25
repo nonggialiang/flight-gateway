@@ -105,6 +105,151 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
     future
   }
 
+  // ------------------------------------------------------------- 命令执行（D17/D18）
+
+  /**
+   * 命令执行（非 SELECT）：无物化、结果小、持流至终态（流终即权威事实，无 UNKNOWN）。
+   *
+   * <p>请求为 Plan.root=SQL 关系（无 WriteOperation/无 ReattachOptions，见
+   * {@link MaterializationPlanner#commandPlanRequest}）——Spark 把 SET/SHOW/DESCRIBE/
+   * EXPLAIN/USE/DDL/DML 当普通 DataFrame 执行：schema 消息 + arrow_batch 消息 + 流结束。
+   * 响应重组为完整 Arrow IPC stream bytes（schema message 先写、逐批 writeBatch）内联
+   * 返还编排层。守卫：{@code fg.command.timeout}（自管超时，无 gRPC deadline）与
+   * {@code fg.command.result.max-bytes}（累计 batch 字节熔断），二者到点 cancel 流 + FAILED。
+   *
+   * <p>注意：result_complete 只在 reattachable 执行下发（ExecuteThreadRunner 按此门控），
+   * 本路径非 reattachable——完成信号以 onCompleted 为准，result_complete 仅置位记录。
+   */
+  override def executeCommand(
+      session: EngineSession,
+      sql: String,
+      listener: SqlEngine.SubmitListener): CompletableFuture[CommandOutcome] = {
+    val s = session.asInstanceOf[SparkEngineSession]
+    val request = MaterializationPlanner.commandPlanRequest(s.user, s.gatewaySessionId, sql)
+    val future = new CompletableFuture[CommandOutcome]()
+    val capture = new CancelCapture
+    val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
+      ch => SparkConnectServiceGrpc.newStub(ch),
+      s.user, s.gatewaySessionId, capture)
+
+    val timeoutMs = config.getDurationMs("fg.command.timeout")
+    val maxBytes = config.getLong("fg.command.result.max-bytes")
+
+    // 单命令生命周期内的累积器：独立 RootAllocator（终态必 close 释放）+ 输出 IPC 流
+    val allocator = new org.apache.arrow.memory.RootAllocator(Long.MaxValue)
+    val ipcOut = new java.io.ByteArrayOutputStream()
+    var root: org.apache.arrow.vector.VectorSchemaRoot = null
+    var writer: org.apache.arrow.vector.ipc.ArrowStreamWriter = null
+    var schema: Schema = null // 首个 STRUCT schema；命令无结果集时合成 [ok BOOLEAN]
+    var handleSeen = false
+    var resultComplete = false
+    var totalBatchBytes = 0L
+
+    def closeResources(): Unit = synchronized {
+      try { if (writer != null) writer.close() }
+      catch { case _: Throwable => }
+      try { if (root != null) root.close() }
+      catch { case _: Throwable => }
+      try { allocator.close() }
+      catch { case _: Throwable => }
+    }
+
+    def fail(message: String): Unit = {
+      capture.cancel("fg: command failed: " + message)
+      closeResources()
+      future.complete(CommandOutcome.failed(message))
+    }
+
+    // 自管超时（无 gRPC deadline：deadline 会把长命令一刀切且无法区分超时/引擎错）
+    val timeoutTask = SparkEngineClient.commandTimeoutScheduler.schedule(
+      new Runnable {
+        override def run(): Unit = fail(s"command timeout after ${timeoutMs}ms")
+      },
+      timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+
+    async.executePlan(request, new StreamObserver[ExecutePlanResponse] {
+      override def onNext(value: ExecutePlanResponse): Unit = synchronized {
+        val opId = value.getOperationId
+        if (!handleSeen && opId != null && !opId.isEmpty) {
+          handleSeen = true
+          try listener.onHandle(new EngineExecutionHandle("spark", opId))
+          catch { case _: Throwable => } // 回调异常不阻断流消费
+        }
+        val dt = value.getSchema
+        if (schema == null && dt != null && dt.getKindCase == DataType.KindCase.STRUCT) {
+          schema = MaterializationPlanner.toArrowSchema(dt.getStruct)
+        }
+        if (value.hasArrowBatch) {
+          val data = value.getArrowBatch.getData
+          totalBatchBytes += data.size()
+          if (totalBatchBytes > maxBytes) {
+            fail(s"command result exceeds fg.command.result.max-bytes ($maxBytes): $totalBatchBytes")
+            return
+          }
+          if (schema == null) {
+            schema = SparkEngineClient.okSchema // 无 STRUCT 的零行命令（如多数 DDL）
+          }
+          if (root == null) {
+            root = org.apache.arrow.vector.VectorSchemaRoot.create(schema, allocator)
+            writer = new org.apache.arrow.vector.ipc.ArrowStreamWriter(root, null, ipcOut)
+            writer.start() // IPC 流先写 schema message
+          }
+          // arrow_batch.data 是无 schema 的 batch message：readMessage → 反序列化 body → 装载
+          val in = new java.io.ByteArrayInputStream(data.toByteArray)
+          val ch = new org.apache.arrow.vector.ipc.ReadChannel(java.nio.channels.Channels.newChannel(in))
+          val meta = org.apache.arrow.vector.ipc.message.MessageSerializer.readMessage(ch)
+          if (meta != null) {
+            val body = org.apache.arrow.vector.ipc.message.MessageSerializer
+              .readMessageBody(ch, meta.getMessageBodyLength, allocator)
+            val batch = org.apache.arrow.vector.ipc.message.MessageSerializer
+              .deserializeRecordBatch(meta.getMessage, body)
+            try new org.apache.arrow.vector.VectorLoader(root).load(batch)
+            finally batch.close()
+            writer.writeBatch()
+          }
+        }
+        if (value.hasResultComplete) {
+          resultComplete = true // 非 reattachable 不下发；仅置位记录（见方法 javadoc）
+        }
+      }
+
+      override def onError(t: Throwable): Unit = {
+        timeoutTask.cancel(false)
+        closeResources()
+        val code = t match {
+          case e: io.grpc.StatusRuntimeException => e.getStatus.getCode
+          case _ => io.grpc.Status.Code.UNKNOWN
+        }
+        if (code == io.grpc.Status.Code.CANCELLED) {
+          future.complete(CommandOutcome.cancelled()) // 自家 timeout 熔断已先完成 future，此处幂等落空
+        } else {
+          future.complete(CommandOutcome.failed(s"command stream error: $t"))
+        }
+      }
+
+      override def onCompleted(): Unit = {
+        timeoutTask.cancel(false)
+        try {
+          val finalSchema = if (schema != null) schema else SparkEngineClient.okSchema
+          if (root == null) {
+            // 零批次命令：仍交付非空 schema 的空 IPC 流（Dremio 式客户端兼容）
+            root = org.apache.arrow.vector.VectorSchemaRoot.create(finalSchema, allocator)
+            writer = new org.apache.arrow.vector.ipc.ArrowStreamWriter(root, null, ipcOut)
+            writer.start()
+          }
+          writer.close() // EOS
+          val schemaBytes = SparkEngineClient.serializeSchema(finalSchema)
+          future.complete(CommandOutcome.completed(schemaBytes, ipcOut.toByteArray))
+        } catch {
+          case e: Throwable => future.complete(CommandOutcome.failed(s"command result assembly failed: $e"))
+        } finally {
+          closeResources()
+        }
+      }
+    })
+    future
+  }
+
   // ------------------------------------------------------------- attach
 
   override def attach(
@@ -194,6 +339,33 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
     override def listColumns(
         database: String,
         table: String): java.util.List[EngineCatalog.EngineColumn] = java.util.List.of()
+  }
+}
+
+private[client] object SparkEngineClient {
+
+  /** 命令超时守护线程（daemon 单线程：命令并发低，到点任务只做 cancel+complete）。 */
+  private lazy val commandTimeoutScheduler =
+    java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r => {
+      val t = new Thread(r, "fg-cmd-timeout")
+      t.setDaemon(true)
+      t
+    })
+
+  /** 无结果集命令的合成 schema：[ok BOOLEAN]（D17/D18，与网关 CommandSchemas 的 DDL/USE 同形）。 */
+  val okSchema: Schema = new Schema(
+    java.util.List.of(new org.apache.arrow.vector.types.pojo.Field(
+      "ok",
+      org.apache.arrow.vector.types.pojo.FieldType.nullable(
+        new org.apache.arrow.vector.types.pojo.ArrowType.Bool()),
+      null)))
+
+  /** schema message 序列化——与网关 SchemaSerde.serialize 同 API 同字节。 */
+  def serializeSchema(schema: Schema): Array[Byte] = {
+    val out = new java.io.ByteArrayOutputStream()
+    val channel = new org.apache.arrow.vector.ipc.WriteChannel(java.nio.channels.Channels.newChannel(out))
+    org.apache.arrow.vector.ipc.message.MessageSerializer.serialize(channel, schema)
+    out.toByteArray
   }
 }
 

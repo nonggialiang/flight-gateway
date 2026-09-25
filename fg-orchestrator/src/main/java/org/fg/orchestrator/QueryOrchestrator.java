@@ -17,10 +17,12 @@ import java.util.concurrent.TimeUnit;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.fg.common.config.GatewayConfig;
 import org.fg.common.service.Service;
+import org.fg.common.sql.StatementClassifier;
 import org.fg.orchestrator.store.OperationRow;
 import org.fg.orchestrator.store.OperationStoreDao;
 import org.fg.result.manifest.ResultManifest;
 import org.fg.result.store.ObjectStoreService;
+import org.fg.spi.CommandOutcome;
 import org.fg.spi.EngineExecutionHandle;
 import org.fg.spi.EngineSession;
 import org.fg.spi.ExecutionOutcome;
@@ -94,7 +96,9 @@ public class QueryOrchestrator implements Service {
   // ------------------------------------------------------------- 注册 + 触发
 
   /**
-   * 首 poll / GetFlightInfo：幂等注册 +（新查询）触发执行。
+   * 首 poll / GetFlightInfo：先分类（D17：分类必须先于 AnalyzePlan——SET/DDL 不可分析），
+   * QUERY 走幂等注册主链路；非 SELECT（SET/SHOW/DESCRIBE/EXPLAIN/USE/DDL/DML）走
+   * {@link #registerCommand}（豁免指纹幂等 D19，结果内联交付 D18）。
    *
    * <p><b>行带 schema 出生</b>：先按指纹查行，miss 才<b>同步</b> AnalyzePlan（有界 prepare
    * timeout），成功后携带 schema_bytes 幂等 INSERT——"行一出现 schema 即在"，消费方（快返
@@ -105,6 +109,11 @@ public class QueryOrchestrator implements Service {
    */
   public Registration register(String sessionRef, String user, String sql, OperationRow.Mode mode)
       throws Exception {
+    StatementClassifier.Kind stmtKind = StatementClassifier.classify(sql);
+    if (stmtKind != StatementClassifier.Kind.QUERY) {
+      return registerCommand(sessionRef, user, sql, mode, stmtKind);
+    }
+
     String sqlHash = sha256(sql);
     OperationRow existing = dao.getByFingerprint(sessionRef, sqlHash).orElse(null);
     if (existing != null) {
@@ -136,6 +145,102 @@ public class QueryOrchestrator implements Service {
       triggerExecution(stored);
     }
     return new Registration(stored, isNew);
+  }
+
+  /**
+   * 命令注册（D17/D18/D19）：新 queryId + 普通插入（豁免指纹去重，每次执行都是新行）；
+   * schema=analyzable ? inline AnalyzePlan : CommandSchemas 静态宣告（ analyzable 命令
+   * AnalyzePlan 失败仍 fail-fast 不落行；AnalyzePlan 无 STRUCT 时回退静态/ok 合成）。
+   * resultKeyPrefix 置空串（无物化对象）；随即 triggerCommand 持流执行。
+   */
+  private Registration registerCommand(
+      String sessionRef, String user, String sql, OperationRow.Mode mode,
+      StatementClassifier.Kind stmtKind) throws Exception {
+    byte[] schemaBytes;
+    Schema declared = null;
+    if (StatementClassifier.analyzable(stmtKind)) {
+      Duration prepareTimeout = Duration.ofMillis(config.getDurationMs("fg.query.prepare.timeout"));
+      EngineSession session = engine.openSession(new GatewaySession(sessionRef, user, Map.of()));
+      declared = engine.analyzeSchema(session, sql, prepareTimeout);
+    }
+    if (declared == null) {
+      declared = CommandSchemas.staticSchema(stmtKind);
+      if (declared == null) {
+        declared = CommandSchemas.staticSchema(StatementClassifier.Kind.DDL); // [ok BOOLEAN] 兜底
+      }
+    }
+    schemaBytes = SchemaSerde.serialize(declared);
+
+    String queryId = QueryIdHolder.newQueryId();
+    OperationRow row =
+        new OperationRow()
+            .queryId(queryId)
+            .sessionRef(sessionRef)
+            .sqlHash(sha256(sql)) // 仍存指纹（排查/展示用），不再参与唯一约束
+            .user(user)
+            .sqlText(sql)
+            .resultKeyPrefix("") // 命令无物化对象
+            .mode(mode)
+            .kind(OperationRow.Kind.COMMAND)
+            .schemaBytes(schemaBytes)
+            .engineRef(engine.type());
+    OperationRow stored = dao.insertCommand(row);
+    triggerCommand(stored);
+    return new Registration(stored, true);
+  }
+
+  /**
+   * 命令执行触发（controlExecutor）：executeCommand 持流至终态（网关侧无 UNKNOWN）——
+   * COMPLETED 用实际 schemaBytes + 内联结果 CAS 落行（覆盖静态宣告，D18 风险③：Spark
+   * INSERT 实际 schema 可能比静态宣告宽）；FAILED/CANCELLED 走 casFail/casCancel。
+   */
+  private void triggerCommand(OperationRow row) {
+    controlExecutor.submit(
+        () -> {
+          try {
+            EngineSession session = openEngineSession(row);
+            CompletableFuture<CommandOutcome> executed =
+                engine.executeCommand(
+                    session,
+                    row.sqlText(),
+                    handle -> {
+                      try {
+                        dao.setOperationId(row.queryId(), handle.encode());
+                      } catch (Exception e) {
+                        logger.error("Failed to persist operationId for {}", row.queryId(), e);
+                      }
+                    });
+            executed.whenComplete(
+                (outcome, err) -> {
+                  try {
+                    if (err != null) {
+                      dao.casFail(row.queryId(), "command submit failed: " + err);
+                      return;
+                    }
+                    switch (outcome.status()) {
+                      case COMPLETED ->
+                          dao.casCompleteCommand(
+                              row.queryId(), outcome.schemaBytes(), outcome.resultIpcBytes());
+                      case FAILED ->
+                          dao.casFail(
+                              row.queryId(),
+                              outcome.error() == null ? "command failed" : outcome.error());
+                      case CANCELLED -> dao.casCancel(row.queryId());
+                      default -> dao.casFail(row.queryId(), "unknown command outcome");
+                    }
+                  } catch (Exception e) {
+                    logger.error("Failed to finalize command {}", row.queryId(), e);
+                  }
+                });
+          } catch (Exception e) {
+            logger.error("Command trigger failed for {}", row.queryId(), e);
+            try {
+              dao.casFail(row.queryId(), "command trigger failed: " + e);
+            } catch (Exception e2) {
+              logger.error("Failed to mark {} failed", row.queryId(), e2);
+            }
+          }
+        });
   }
 
   /**
@@ -277,6 +382,10 @@ public class QueryOrchestrator implements Service {
   }
 
   private PollOutcome terminalOutcome(OperationRow row) {
+    if (row.kind() == OperationRow.Kind.COMMAND) {
+      // D18：命令结果内联行内（command_result），无 manifest——跳过 readManifest
+      return new PollOutcome(true, row, null);
+    }
     if (row.status() == OperationRow.Status.COMPLETED) {
       try {
         ResultManifest manifest = objects.readManifest(row.resultKeyPrefix());
@@ -291,6 +400,9 @@ public class QueryOrchestrator implements Service {
 
   /** attach 租约仲裁 + 挂流。赢家：流终→CAS 迁移；UNKNOWN→manifest 对账。 */
   private void maybeAttach(OperationRow row) {
+    if (row.kind() == OperationRow.Kind.COMMAND) {
+      return; // D18：命令由触发实例持流至终态，无 attach 语义（也无 manifest 可对账）
+    }
     if (row.connectOperationId() == null) {
       return; // 触发尚未捕获 operationId（提交在途）
     }
@@ -364,6 +476,9 @@ public class QueryOrchestrator implements Service {
       if (rowOpt.isEmpty() || rowOpt.get().status().terminal()) {
         return false;
       }
+      if (rowOpt.get().kind() == OperationRow.Kind.COMMAND) {
+        return false; // 命令无 manifest；孤儿行由 QueryTimeoutSweeper 在 fg.query.timeout 兜底 FAILED
+      }
       OperationRow row = rowOpt.get();
       if (!objects.manifestExists(row.resultKeyPrefix())) {
         return false;
@@ -422,7 +537,7 @@ public class QueryOrchestrator implements Service {
 
   // ------------------------------------------------------------- helpers
 
-  static String sha256(String s) {
+  public static String sha256(String s) {
     try {
       MessageDigest digest = MessageDigest.getInstance("SHA-256");
       return HexFormat.of().formatHex(digest.digest(s.getBytes(StandardCharsets.UTF_8)));
