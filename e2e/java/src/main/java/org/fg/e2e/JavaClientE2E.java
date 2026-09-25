@@ -15,6 +15,7 @@ import org.apache.arrow.flight.grpc.CredentialCallOption;
 import org.apache.arrow.flight.sql.FlightSqlClient;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.ipc.ArrowReader;
 
 /**
  * FG M1 e2e（Java 侧）：arrow-java 官方 {@link FlightSqlClient}（JDBC 驱动同源实现）。
@@ -22,12 +23,14 @@ import org.apache.arrow.memory.RootAllocator;
  * <p>定位：与 e2e/run_e2e.py（wire 层手工客户端）互补——验证规范 Java 客户端的行为面：
  * Basic 握手、GetFlightInfo 快返 → DoGet 等待、endpoints 遍历、CancelFlightInfo。
  *
- * <p>注意 arrow-java 客户端无 PollFlightInfo API——JDBC 系客户端完全依赖 GetFlightInfo
- * 语义（快返 STREAM 票 + DoGet 内联等待），legacy-long 用例即验证 STREAM 票等待预算
- * （= fg.query.timeout）对此类客户端的必要性。
+ * <p>fg-p1（19.0.0-fg-p1，本地 patch）：execute 全链路改 PollFlightInfo（UNIMPLEMENTED 回退
+ * GetFlightInfo），并新增 {@link FlightSqlClient#openEndpoint}（空票 + http(s) location →
+ * HTTP GET presigned URL）。presign 用例即验证该完整链路（需 https 模式网关）。
  *
- * <p>用法：{@code java -jar target/fg-e2e-java-0.1.0-SNAPSHOT.jar {legacy|legacy-long|cancel}}
- * （网关需默认 relay 模式；各用例间 TRUNCATE fg_operation 防 fingerprint 冲突）
+ * <p>用法：{@code java -jar target/fg-e2e-java-0.1.0-SNAPSHOT.jar
+ * {legacy|legacy-long|cancel|poll|prepare|presign}}
+ * （legacy/legacy-long/prepare/cancel 默认 relay 模式；presign 需
+ * {@code -Dfg.result.endpoint.mode=https}；各用例间 TRUNCATE fg_operation 防 fingerprint 冲突）
  */
 public final class JavaClientE2E {
 
@@ -51,16 +54,21 @@ public final class JavaClientE2E {
           case "legacy-long" -> readAll(sql, credential,
               "SELECT id % 1000 AS k, count(*) AS cnt FROM range(20000000) GROUP BY id % 1000",
               1000, "[java-legacy-long]");
-          case "cancel" -> cancel(sql, credential);
+          case "cancel" -> cancel(client, sql, credential);
           case "poll" -> poll(client, sql, credential);
           case "prepare" -> {
-            // 复刻 JDBC 驱动路径（驱动即 shade 的 FlightSqlClient.prepare/execute）
-            try (FlightSqlClient.PreparedStatement ps = sql.prepare(
-                "SELECT id, id * 2 AS dbl FROM range(1000)", credential)) {
+            // 复刻 JDBC 驱动路径（驱动即 shade 的 FlightSqlClient.prepare/execute；
+            // close 必须携 credential——auth2 网关逐 RPC 验头，与驱动 close(getOptions()) 一致）
+            FlightSqlClient.PreparedStatement ps = sql.prepare(
+                "SELECT id, id * 2 AS dbl FROM range(1000)", credential);
+            try {
               FlightInfo info = ps.execute(credential);
               streamAll(sql, credential, info, 1000, "[java-prepare]");
+            } finally {
+              ps.close(credential);
             }
           }
+          case "presign" -> presign(sql, credential);
           default -> throw new IllegalArgumentException("unknown case " + which);
         }
       }
@@ -102,12 +110,20 @@ public final class JavaClientE2E {
     System.out.printf("%s PASS (%.1fs)%n", tag, elapsedSec(t0));
   }
 
-  /** 在途取消：execute 提交大基数 join → 3s 后 CancelFlightInfo → 断言 CANCELLED。 */
-  private static void cancel(FlightSqlClient sql, CredentialCallOption credential)
-      throws InterruptedException {
+  /**
+   * 在途取消：fg-p1 后 {@code sql.execute} 阻塞轮询至终态（本查询 ~10-60s 完成于首 poll 的
+   * 服务端长等待内，poll 凭证到手已过晚），故与 python cancel 用例同构——GetFlightInfo
+   * 快返（仍为 legacy 快返路径）取取消凭证 → 3s 后 CancelFlightInfo → 断言 CANCELLED。
+   */
+  private static void cancel(FlightClient client, FlightSqlClient sql,
+      CredentialCallOption credential) throws InterruptedException {
     long t0 = System.nanoTime();
-    FlightInfo info = sql.execute(
-        "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id", credential);
+    byte[] command = com.google.protobuf.Any.pack(
+            org.apache.arrow.flight.sql.impl.FlightSql.CommandStatementQuery.newBuilder()
+                .setQuery("SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")
+                .build())
+        .toByteArray();
+    FlightInfo info = client.getInfo(FlightDescriptor.command(command), credential);
     System.out.printf("[java-cancel] queryId=%s... submitted%n",
         new String(info.getAppMetadata()).substring(0, 8));
     Thread.sleep(3_000);
@@ -122,9 +138,48 @@ public final class JavaClientE2E {
   }
 
   /**
-   * Java 原生 poll 链路（⑥ 矩阵原语线）：{@code FlightClient.pollInfo}——FlightSqlClient
-   * 未封装 poll 语义（全部 execute 走 getInfo），此用例直用原语驱动 FG 主链路：
-   * 首 poll 注册+触发快返 → 轮询至终态（descriptor unset）→ 逐 endpoint 取数。
+   * fg-p1 presign 完整链路（需 https 模式网关）：{@code sql.execute}（patched=poll）轮询至
+   * 终态 → 断言 endpoints 空票 + http(s) location（presigned URL）→ 逐 endpoint
+   * {@code sql.openEndpoint} HTTP GET 逐批计行，断言 1000。等价 python https 用例的 Java 侧。
+   */
+  private static void presign(FlightSqlClient sql, CredentialCallOption credential)
+      throws Exception {
+    long t0 = System.nanoTime();
+    FlightInfo info = sql.execute("SELECT id, id * 2 AS dbl FROM range(1000)", credential);
+    String qid = info.getAppMetadata() == null
+        ? "?" : new String(info.getAppMetadata());
+    System.out.printf("[java-presign] endpoints=%d queryId=%s...%n",
+        info.getEndpoints().size(), qid.substring(0, Math.min(8, qid.length())));
+    long total = 0;
+    for (FlightEndpoint ep : info.getEndpoints()) {
+      if (ep.getTicket().getBytes().length != 0) {
+        throw new AssertionError("presigned endpoint must carry EMPTY ticket: " + ep);
+      }
+      if (ep.getLocations().isEmpty()) {
+        throw new AssertionError("presigned endpoint must carry location: " + ep);
+      }
+      String scheme = ep.getLocations().get(0).getUri().getScheme();
+      if (!("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))) {
+        throw new AssertionError("presigned endpoint location must be http(s): " + ep);
+      }
+      try (ArrowReader reader = sql.openEndpoint(ep, credential)) {
+        while (reader.loadNextBatch()) {
+          total += reader.getVectorSchemaRoot().getRowCount();
+        }
+      } catch (Exception e) {
+        throw new IllegalStateException("openEndpoint failed at " + total + " rows", e);
+      }
+    }
+    if (total != 1000) {
+      throw new AssertionError("[java-presign] rows " + total + " != 1000");
+    }
+    System.out.printf("[java-presign] PASS (%.1fs)%n", elapsedSec(t0));
+  }
+
+  /**
+   * Java 原生 poll 链路（⑥ 矩阵原语线）：{@code FlightClient.pollInfo} 原语直驱（fg-p1 前
+   * FlightSqlClient 未封装 poll 语义时的唯一路径，保留作原语对照）：首 poll 注册+触发快返
+   * → 轮询至终态（descriptor unset）→ 逐 endpoint 取数。
    */
   private static void poll(FlightClient client, FlightSqlClient sql,
       CredentialCallOption credential) throws InterruptedException {

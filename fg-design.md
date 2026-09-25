@@ -590,6 +590,15 @@ fg.control.event.lag / fg.flight.session.active / fg.allocator.allocated_bytes{c
 
 推论：① 默认 mode=relay 对 JDBC/ADBC/FlightSqlClient 系客户端是唯一可用路径（它们不走 PollFlightInfo，https 模式对其既无收益也无破坏——根本到不了 presign 分支）；② **presign 分支（PollFlightInfo 终态票 + RenewFlightEndpoint）仅具备 poll 能力的客户端可达**——pyarrow 手工线、Java `FlightClient.pollInfo` 原语线（e2e 已覆盖）；③ `single-stream` 兜底针对的"只取首个 endpoint"行为在实测四客户端均未出现（均遍历）。
 
+**⑥ 补记：arrow-java 客户端 fg-p1 patch（19.0.0-fg-p1，本地分支 `fg-19.0.0-presign` ← v19.0.0，未上游）**——上表 FlightSqlClient/JDBC 两行的能力缺口由该 patch 消除，经 patch 后二者均可直达 presign 分支：
+
+- **flight-core**：`FlightClient.getAllocator()`（暴露 client 级 allocator，供 endpoint 读取器复用）。
+- **flight-sql**：① `FlightSqlClient.openEndpoint(FlightEndpoint, CallOption...)`——空票 + http(s) location → HTTP GET（共享 `java.net.http.HttpClient`，禁系统代理、followRedirects、connect 30s，非 200 抛 FlightRuntimeException）→ `ArrowStreamReader`；其余 → gRPC `getStream` 包 `FlightStreamReaderAdapter`（per-batch VectorUnloader/VectorLoader 拷贝至 ArrowReader 面）。② execute poll 化：`execute(String)` 与 `PreparedStatement.execute`（驱动 executeQuery 链即后者）先 `pollInfo`，UNIMPLEMENTED 回退 `getInfo`（vanilla 服务器行为与 19.0.0 一致）；轮询退避 100ms→1s，总预算 10min。
+- **flight-sql-jdbc-core**：`EndpointStream` 接口统一 endpoint 消费（`GrpcEndpointStream` 直通 FlightStream / `ReaderEndpointStream` 包 ArrowReader，cancel=no-op）；`getStreams` 在 reuse-connection 判别前插入 presign 分支（空票 + http(s) → `openEndpoint`）；queue/resultset 机械改型，驱动 jar 重建即 shade。
+- **FG 配套（本仓库）**：`FgFlightProducer.pollFlightInfo` 补 `CommandPreparedStatementQuery` 分支（垫片 handle 即 SQL）——否则 patched 驱动的 poll 必 UNIMPLEMENTED 回退 relay，到不了 presign；e2e java 通道 pin `19.0.0-fg-p1`，新增 `JavaClientE2E presign` 用例（execute=poll → 断言空票 + http(s) location → `openEndpoint` 计行 1000）。
+- **上游拆分建议**：① `getAllocator` + `openEndpoint`（消费侧增强，通用价值独立成立）；② execute poll 化（语义变更，需社区对 UNIMPLEMENTED 回退与轮询参数的共识）。
+- **残留边界**：① 客户端 cancel 在 poll 阻塞期受限——Avatica `st.cancel()` 于结果集建立前是 no-op（JDBC cancel 用例 killer 循环重试、结果集出现后生效即 PASS）；FlightSqlClient 系取消凭证取 GetFlightInfo 快返 info（短查询会完成于首 poll 的服务端长等待内，poll 凭证到手已过晚）；② HTTP 取数路径需 JVM `--add-opens java.base/java.nio` 等（arrow-memory 反射 DirectByteBuffer，与 arrow 系部署惯例一致，网关/引擎同款 flags）；③ ADBC 未 patch（维持 legacy 路径）；④ e2e prepare 用例 close 须携 credential（auth2 逐 RPC 验头，与驱动 `close(getOptions())` 一致）。
+
 ---
 
 ## 7. 配置项清单（节选）

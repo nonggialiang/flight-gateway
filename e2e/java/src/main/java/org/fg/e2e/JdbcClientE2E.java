@@ -68,22 +68,35 @@ public final class JdbcClientE2E {
     System.out.println("[jdbc-meta] PASS");
   }
 
-  /** 在途取消：executeQuery 快返 → rs.next() 挂在 DoGet 等待 → 3s 后 st.cancel() → CancelFlightInfo。 */
+  /**
+   * 在途取消（fg-p1 poll 链路下）：executeQuery 阻塞在 PreparedStatement.execute 的 poll
+   * 轮询直至物化完成（此阶段 Avatica cancel 是 no-op——openResultSet 尚未建立），随后
+   * rs.next() 进入取数；killer 线程循环 st.cancel()（结果集出现后即生效——Avatica 层
+   * 抛 "Statement canceled"）。未取消时全量 50M 行远超阈值即可判失败。
+   */
   private static void cancel(Connection conn) throws Exception {
     long t0 = System.nanoTime();
     try (Statement st = conn.createStatement()) {
+      final boolean[] done = {false};
       Thread killer = new Thread(() -> {
         try {
-          Thread.sleep(3_000);
-          st.cancel();
+          // 覆盖 poll 阻塞期（no-op）与取数期（生效）；每秒重试直至用例结束
+          for (int i = 0; !done[0] && i < 600; i++) {
+            Thread.sleep(1_000);
+            try {
+              st.cancel();
+            } catch (SQLException ignored) {
+              // statement 可能已关闭
+            }
+          }
         } catch (Exception ignored) {
-          // statement 可能已关闭
+          // 线程中断等
         }
       });
       killer.start();
       long total = 0;
       try (ResultSet rs = st.executeQuery(
-          "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")) {
+          "SELECT a.id FROM range(50000000) a JOIN range(10) b ON a.id % 10 = b.id")) {
         while (rs.next()) {
           total++;
         }
@@ -93,6 +106,7 @@ public final class JdbcClientE2E {
             elapsedSec(t0), e.getMessage());
         total = -1; // 取消到达的预期路径
       }
+      done[0] = true;
       killer.join();
       if (total > 1_000_000) {
         throw new AssertionError("cancel not effective: " + total + " rows streamed");

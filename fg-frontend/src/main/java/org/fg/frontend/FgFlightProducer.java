@@ -111,12 +111,19 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       FlightProducer.CallContext context, FlightDescriptor descriptor) {
     try {
       Any any = Any.parseFrom(descriptor.getCommand());
-      if (!any.is(FlightSql.CommandStatementQuery.class)) {
+      // CommandPreparedStatementQuery 同 getFlightInfoPreparedStatement 垫片：handle 即 SQL 明文。
+      // patched JDBC（PreparedStatement.execute 走 PollFlightInfo）依赖此分支，否则 UNIMPLEMENTED
+      // 触发客户端回退 GetFlightInfo → 永远到不了 presign 终态。
+      String sql = null;
+      if (any.is(FlightSql.CommandStatementQuery.class)) {
+        sql = any.unpack(FlightSql.CommandStatementQuery.class).getQuery();
+      } else if (any.is(FlightSql.CommandPreparedStatementQuery.class)) {
+        sql = any.unpack(FlightSql.CommandPreparedStatementQuery.class)
+            .getPreparedStatementHandle().toStringUtf8();
+      }
+      if (sql == null) {
         return super.pollFlightInfo(context, descriptor);
       }
-      FlightSql.CommandStatementQuery command =
-          any.unpack(FlightSql.CommandStatementQuery.class);
-      String sql = command.getQuery();
 
       // ① 幂等注册 + 触发（首个 poll 触发；后续 poll 同 fingerprint 命中在途/终态行）
       QueryOrchestrator.Registration reg =
