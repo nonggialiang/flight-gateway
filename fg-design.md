@@ -576,7 +576,7 @@ fg.control.event.lag / fg.flight.session.active / fg.allocator.allocated_bytes{c
 | D12 | 行→Arrow 攒批在 executor（DSv2 行接口） | 攒批大小受 `fg.result.batch.max.records` 控制；CPU 成本随 task 并行摊开，可接受 |
 | D13 | relay ticket 自描述+签名（H5 + v0.16 双 kind） | HMAC 信封 `{kind=STREAM|PART, bucket, resultKeyPrefix, queryId, user, issuedAt[, partIndex]}`（manifest 路径直推）；STREAM=查询级（快返路径唯一选项），PART=分片级（最终 poll 铸 N 张）；防伪造、重启免疫；密钥轮换失效与 TTL 对齐 |
 | D14 | **DB 作业表（新依赖）** | 执行状态/operationId/mode/attach 租约落库：跨实例 poll/cancel、重启存活、幂等首 poll（指纹唯一键）、attach 仲裁（条件 UPDATE）；行迁移由租约持有者驱动，滞后时 manifest 对账兜底；跨实例等待 = 长轮询内有界查行（索引单行）——**MinIO notification 退役** |
-| D15 | **endpoint 模式不可混发**（endpoints=分片拼接语义，混发=数据翻倍） | mode（HTTPS/RELAY）注册时协商（header/session option）落行，最终 FlightInfo 按行构造 |
+| D15 | **endpoint 模式不可混发**（endpoints=分片拼接语义，混发=数据翻倍） | mode（HTTPS/RELAY）注册时协商落行，最终 FlightInfo 按行构造。协商序：客户端请求头 `x-fg-endpoint-mode`（`https\|relay`，大小写不敏感；经 `EndpointModeMiddleware` 每 RPC 捕获，producer 注册时读取）→ 未携带/非法回退 `fg.result.endpoint.mode`（默认 relay）。落行后同指纹 RPC 不再受头变化影响（"注册时协商"）。session option 通道（SetSessionOptions）归 M3。e2e 三通道回归：`JavaClientE2E mode-header`（`HeaderCallOption`）、`JdbcClientE2E mode`（非内建连接属性 URL 参数经 `toCallOption()` 透传）、`run_e2e.py adbc-mode`（`adbc.flight.sql.rpc.call_header.<name>` 连接选项；另 ADBC uri 须用 `127.0.0.1`——其内置 gRPC resolver 对 localhost 走 IPv6 探测，macOS 上多耗 ~20s） |
 | D16 | 客户端标准支持矩阵 | pyarrow/ADBC/JDBC 对 PollFlightInfo、https Location、RenewFlightEndpoint 的支持度 = PoC ⑥，决定默认 mode 与 GetFlightInfo 兼容路径权重；**另验 endpoints 消费行为**（是否遍历全部分片 endpoint 拼接——只取首个的非合规客户端需 `fg.result.relay.single-stream` 兜底） |
 
 **⑥ 实测矩阵（M1 e2e，arrow 19.0.0 线）**：
@@ -616,7 +616,7 @@ fg.control.event.lag / fg.flight.session.active / fg.allocator.allocated_bytes{c
 | `fg.query.timeout` | 600s | 查询护栏（唯一护栏；无字节熔断） |
 | `fg.poll.max-wait` | 60s | 单次 poll 长等待上限（到点返回未完成，客户端续 poll） |
 | `fg.poll.db.interval` | 2s | 跨实例长等待的查行间隔（索引单行查询） |
-| `fg.result.endpoint.mode` | relay | HTTPS/RELAY；可被客户端 header/session option 覆盖（注册时落行，D15） |
+| `fg.result.endpoint.mode` | relay | HTTPS/RELAY 服务端默认；可被客户端请求头 `x-fg-endpoint-mode`（https\|relay）按注册覆盖（落行，D15；session option 归 M3） |
 | `fg.query.reconcile.window` | 60s | 断流对账窗口（Reattach 重试 + manifest 检查的总预算） |
 | `fg.result.batch.max.records` | 16384 | 透传 `spark.sql.execution.arrow.maxRecordsPerBatch` |
 | `fg.result.partitions` | 未设置 | 最终 part 数（=endpoint 数）：未设置=自然分区；1=单对象(coalesce)；K=精确 K part(repartition) |

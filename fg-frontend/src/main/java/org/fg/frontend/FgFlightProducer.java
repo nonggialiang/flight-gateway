@@ -87,17 +87,21 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     }
   }
 
-  /** 注册 + 触发 + 快返 STREAM 票（statement 与 prepared 垫片共用）。 */
+  /**
+   * 注册 + 触发 + 快返 STREAM 票（statement 与 prepared 垫片共用）。票可即刻给（DoGet 反正
+   * 要等）；宣告 schema 随行出生（register 同步 AnalyzePlan，AnalyzePlan 失败即注册失败）——
+   * 严格客户端（ADBC）逐 endpoint 校验宣告 schema 与流 schema 一致，空 schema 会直接拒收。
+   */
   private FlightInfo registerAndQuickReturn(
       String sql, FlightProducer.CallContext context, FlightDescriptor descriptor)
       throws Exception {
     QueryOrchestrator.Registration reg =
-        orchestrator.register(sessionRef(context), user(context), sql, negotiateMode());
+        orchestrator.register(sessionRef(context), user(context), sql, negotiateMode(context));
     OperationRow row = reg.row();
     return flightInfo(
-        schemaOf(row),
+        schemaOf(row.schemaBytes()),
         descriptor,
-        List.of(endpoints.streamTicketEndpoint(row)),
+        List.of(endpoints.streamEndpoint(row)),
         -1L,
         -1L,
         false,
@@ -127,7 +131,7 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
 
       // ① 幂等注册 + 触发（首个 poll 触发；后续 poll 同 fingerprint 命中在途/终态行）
       QueryOrchestrator.Registration reg =
-          orchestrator.register(sessionRef(context), user(context), sql, negotiateMode());
+          orchestrator.register(sessionRef(context), user(context), sql, negotiateMode(context));
       OperationRow row = reg.row();
 
       // ②…长等待（fg.poll.max-wait 到点返回未完成，客户端续 poll）
@@ -136,8 +140,9 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
               row.queryId(), Duration.ofMillis(config.getDurationMs("fg.poll.max-wait")));
 
       if (!outcome.done()) {
+        // not-done PollOutcome.row 按契约为 null；schema 取 register 行（行带 schema 出生）
         FlightInfo info =
-            flightInfo(schemaOf(outcome.row()), descriptor, List.of(), -1L, -1L, false,
+            flightInfo(schemaOf(row), descriptor, List.of(), -1L, -1L, false,
                 row.queryId());
         return new PollInfo(info, descriptor, null, null); // descriptor set → 继续轮询
       }
@@ -440,60 +445,19 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       RenewFlightEndpointRequest request,
       FlightProducer.CallContext context,
       FlightProducer.StreamListener<FlightEndpoint> listener) {
+    // 票形分派：空票 = presign 形态（按 location 重签），HMAC 信封 = relay 形态（重铸 issuedAt）。
+    // endpoint/ticket 构造统一收敛在 EndpointsAssembler——续期与首发共用同一套构造器。
+    FlightEndpoint expired = request.getFlightEndpoint();
     try {
-      FlightEndpoint endpoint = request.getFlightEndpoint();
-      byte[] ticketBytes = endpoint.getTicket().getBytes();
-      if (ticketBytes.length == 0) {
-        // https：从 location 的对象路径重签 presign
-        String uri =
-            endpoint.getLocations().isEmpty()
-                ? null
-                : endpoint.getLocations().get(0).getUri().toString();
-        if (uri == null) {
-          listener.onError(invalid("No location"));
-          return;
-        }
-        int ttl = (int) (config.getDurationMs("fg.result.presign.ttl") / 1000);
-        String newUrl =
-            org.fg.result.store.ObjectStores.fromConfig(config)
-                .presignGet(objectKeyFromUrl(uri), ttl);
-        listener.onNext(
-            new FlightEndpoint(
-                new Ticket(new byte[0]),
-                java.time.Instant.now().plusSeconds(ttl),
-                new org.apache.arrow.flight.Location(java.net.URI.create(newUrl))));
-      } else {
-        // relay：重铸同字段新票（新 issuedAt）
-        String encoded = new String(ticketBytes, StandardCharsets.UTF_8);
-        org.fg.result.ticket.RelayTicket old =
-            endpoints.codec().decode(encoded, user(context));
-        org.fg.result.ticket.RelayTicket fresh =
-            new org.fg.result.ticket.RelayTicket(
-                old.kind(),
-                old.bucket(),
-                old.resultKeyPrefix(),
-                old.queryId(),
-                old.user(),
-                System.currentTimeMillis() / 1000,
-                old.partIndex());
-        listener.onNext(
-            new FlightEndpoint(
-                new Ticket(
-                    endpoints.codec().encode(fresh).getBytes(StandardCharsets.UTF_8)),
-                org.apache.arrow.flight.Location.reuseConnection()));
-      }
+      FlightEndpoint renewed =
+          expired.getTicket().getBytes().length == 0
+              ? endpoints.renewedPresignedEndpoint(expired)
+              : endpoints.renewedRelayEndpoint(expired, user(context));
+      listener.onNext(renewed);
       listener.onCompleted();
     } catch (Exception e) {
       listener.onError(invalid("Renew failed: " + e.getMessage()));
     }
-  }
-
-  private static String objectKeyFromUrl(String presignedUrl) {
-    java.net.URI u = java.net.URI.create(presignedUrl);
-    // path 形如 /{bucket}/{key}...（bucket 后为 key）
-    String path = u.getPath();
-    int secondSlash = path.indexOf('/', 1);
-    return secondSlash > 0 ? path.substring(secondSlash + 1) : path.substring(1);
   }
 
   // ------------------------------------------------------------- helpers
@@ -507,14 +471,33 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     return context.peerIdentity();
   }
 
-  private OperationRow.Mode negotiateMode() {
-    // M1：mode 由服务端配置决定（D15 的 header/session option 协商接 M3 认证强化时引入）
+  /**
+   * D15 endpoint 模式协商（注册时生效、随即落行，后续同指纹 RPC 按行构造不再受头影响）：
+   * 客户端请求头 {@code x-fg-endpoint-mode}（{@code https|relay}，大小写不敏感，经
+   * {@link EndpointModeMiddleware} 捕获）优先；未携带/非法值回退服务端配置
+   * {@code fg.result.endpoint.mode}（默认 relay）。session option 通道归 M3。
+   */
+  private OperationRow.Mode negotiateMode(FlightProducer.CallContext context) {
+    EndpointModeMiddleware negotiated = context.getMiddleware(EndpointModeMiddleware.KEY);
+    if (negotiated != null && negotiated.requestedMode() != null) {
+      String requested = negotiated.requestedMode().trim();
+      for (OperationRow.Mode mode : OperationRow.Mode.values()) {
+        if (mode.name().equalsIgnoreCase(requested)) {
+          return mode;
+        }
+      }
+      // 非法值不阻断：回退配置默认
+    }
     return OperationRow.Mode.parse(config.getString("fg.result.endpoint.mode"));
   }
 
   private Schema schemaOf(OperationRow row) {
+    return schemaOf(row.schemaBytes());
+  }
+
+  private Schema schemaOf(byte[] schemaBytes) {
     try {
-      Schema schema = SchemaSerde.deserialize(row.schemaBytes());
+      Schema schema = SchemaSerde.deserialize(schemaBytes);
       if (schema != null) {
         return schema;
       }
@@ -532,12 +515,14 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       long bytes,
       boolean ordered,
       String queryId) {
+    // 注意 arrow-java FlightInfo 构造器参数序是 (bytes, records)——bytes 在前
+    // （曾按 (records, bytes) 传入导致两个数上线起一直互换：total_records 报字节数）
     return new FlightInfo(
         schema,
         descriptor,
         endpoints0,
-        records,
         bytes,
+        records,
         ordered,
         new IpcOption(),
         queryId.getBytes(StandardCharsets.UTF_8));

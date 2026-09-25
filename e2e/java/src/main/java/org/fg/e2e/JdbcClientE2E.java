@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit;
  * DoGet 内联等待）、{@link Statement#cancel()}（→ CancelFlightInfo）。
  *
  * <p>用法：{@code java -cp target/fg-e2e-java-0.1.0-SNAPSHOT.jar org.fg.e2e.JdbcClientE2E
- * {legacy|legacy-long|metadata|cancel|cancel-poll}}（网关默认 relay 模式；cancel-poll 需
+ * {legacy|legacy-long|metadata|cancel|cancel-poll|mode}}（网关默认 relay 模式；cancel-poll 需
  * {@code -Dfg.poll.max-wait=2s}；用例间 TRUNCATE fg_operation）。
  */
 public final class JdbcClientE2E {
@@ -37,6 +37,7 @@ public final class JdbcClientE2E {
             "SELECT id % 1000 AS k, count(*) AS cnt FROM range(20000000) GROUP BY id % 1000",
             1000, "[jdbc-legacy-long]");
         case "metadata" -> metadata(conn);
+        case "mode" -> modeUrl(props);
         case "cancel" -> cancel(conn);
         case "cancel-poll" -> cancelPoll(conn);
         default -> throw new IllegalArgumentException("unknown case " + which);
@@ -58,6 +59,30 @@ public final class JdbcClientE2E {
       }
       System.out.printf("%s PASS (%.1fs)%n", tag, elapsedSec(t0));
     }
+  }
+
+  /**
+   * D15 mode 协商（JDBC 通道）：非内建连接属性经驱动 {@code toCallOption()} 透传为 RPC 头
+   * （URL 参数与 Properties 等价，均汇入 Avatica ConnectionConfig）→ 网关按头以 https 模式
+   * 落行（fg_operation.mode=HTTPS，终态 endpoints=presigned URL，驱动走 openEndpoint HTTP
+   * 取数）。SQL 与 legacy 案例区分：fingerprint 幂等（user+sql）下同 SQL 复用在册行
+   * （mode 首注册落行，在册行优先）。
+   */
+  private static void modeUrl(Properties props) throws Exception {
+    long t0 = System.nanoTime();
+    String url = URL + "&x-fg-endpoint-mode=https";
+    try (Connection conn = DriverManager.getConnection(url, props);
+        Statement st = conn.createStatement();
+        ResultSet rs = st.executeQuery("SELECT id, id * 5 AS quint FROM range(1000)")) {
+      long total = 0;
+      while (rs.next()) {
+        total++;
+      }
+      if (total != 1000) {
+        throw new AssertionError("[jdbc-mode] rows " + total + " != 1000");
+      }
+    }
+    System.out.printf("[jdbc-mode] PASS (%.1fs)%n", elapsedSec(t0));
   }
 
   /** 触发 CommandGetSqlInfo（FgSqlInfoProvider 最小面）。 */

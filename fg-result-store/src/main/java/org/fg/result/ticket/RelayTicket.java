@@ -26,4 +26,13 @@ public record RelayTicket(
   public String manifestObjectKey() {
     return resultKeyPrefix + "/manifest.json";
   }
+
+  /**
+   * 同字段重铸、仅换签发时刻（RenewFlightEndpoint 续期用）：kind/partIndex 原样保留——STREAM
+   * 续期仍是 STREAM，PART 续期仍是同号分片；TTL 自新 issuedAt 重新起算（由编码时的 codec 校验）。
+   */
+  public RelayTicket withIssuedAt(long newIssuedAtEpochSec) {
+    return new RelayTicket(
+        kind, bucket, resultKeyPrefix, queryId, user, newIssuedAtEpochSec, partIndex);
+  }
 }

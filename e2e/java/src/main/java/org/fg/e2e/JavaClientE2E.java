@@ -31,10 +31,10 @@ import org.apache.arrow.vector.types.pojo.Schema;
  * HTTP GET presigned URL）。presign 用例即验证该完整链路（需 https 模式网关）。
  *
  * <p>用法：{@code java -jar target/fg-e2e-java-0.1.0-SNAPSHOT.jar
- * {legacy|legacy-long|cancel|poll|prepare|presign|schema-only}}
+ * {legacy|legacy-long|cancel|poll|prepare|presign|schema-only|mode-header}}
  * （legacy/legacy-long/prepare/cancel 默认 relay 模式；presign 需
- * {@code -Dfg.result.endpoint.mode=https}；schema-only 后断言 fg_operation 0 行；
- * 各用例间 TRUNCATE fg_operation 防 fingerprint 冲突）
+ * {@code -Dfg.result.endpoint.mode=https}；mode-header 在默认 relay 网关上以请求头翻转为
+ * https；schema-only 后断言 fg_operation 0 行；各用例间 TRUNCATE fg_operation 防 fingerprint 冲突）
  */
 public final class JavaClientE2E {
 
@@ -74,6 +74,7 @@ public final class JavaClientE2E {
           }
           case "presign" -> presign(sql, credential);
           case "schema-only" -> schemaOnly(sql, credential);
+          case "mode-header" -> modeHeader(sql, credential);
           default -> throw new IllegalArgumentException("unknown case " + which);
         }
       }
@@ -211,6 +212,45 @@ public final class JavaClientE2E {
       throw new AssertionError("[java-presign] rows " + total + " != 1000");
     }
     System.out.printf("[java-presign] PASS (%.1fs)%n", elapsedSec(t0));
+  }
+
+  /**
+   * D15 header 模式协商验证（网关保持默认 relay）：同一 SQL 携请求头
+   * {@code x-fg-endpoint-mode: https} 执行（patched=poll）→ 注册落行 mode=HTTPS → 终态
+   * endpoints 必为空票 + http(s) location（presigned URL）→ {@code openEndpoint} 计行 1000。
+   * 与 presign 用例的差别：网关配置不动，模式翻转完全由客户端头驱动。
+   */
+  private static void modeHeader(FlightSqlClient sql, CredentialCallOption credential)
+      throws Exception {
+    long t0 = System.nanoTime();
+    org.apache.arrow.flight.FlightCallHeaders headers =
+        new org.apache.arrow.flight.FlightCallHeaders();
+    headers.insert("x-fg-endpoint-mode", "https");
+    org.apache.arrow.flight.HeaderCallOption modeHeader =
+        new org.apache.arrow.flight.HeaderCallOption(headers);
+    // SQL 与 legacy 案例区分开：fingerprint 幂等（user+sql）下同 SQL 复用在册行，
+    // legacy 已以 RELAY 落行 → header 不再协商（mode 首注册落行，在册行优先）
+    FlightInfo info = sql.execute(
+        "SELECT id, id * 3 AS triple FROM range(1000)", credential, modeHeader);
+    long total = 0;
+    for (FlightEndpoint ep : info.getEndpoints()) {
+      if (ep.getTicket().getBytes().length != 0
+          || ep.getLocations().isEmpty()
+          || !("http".equalsIgnoreCase(ep.getLocations().get(0).getUri().getScheme())
+              || "https".equalsIgnoreCase(ep.getLocations().get(0).getUri().getScheme()))) {
+        throw new AssertionError("expected presigned endpoint via mode header, got: " + ep);
+      }
+      try (ArrowReader reader = sql.openEndpoint(ep, credential, modeHeader)) {
+        while (reader.loadNextBatch()) {
+          total += reader.getVectorSchemaRoot().getRowCount();
+        }
+      }
+    }
+    if (total != 1000) {
+      throw new AssertionError("[java-mode-header] rows " + total + " != 1000");
+    }
+    System.out.printf("[java-mode-header] PASS endpoints=%d (%.1fs)%n",
+        info.getEndpoints().size(), elapsedSec(t0));
   }
 
   /**

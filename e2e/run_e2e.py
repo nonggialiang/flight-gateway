@@ -132,8 +132,15 @@ def legacy_get_flight_info(c, sql, expect_rows):
     print("[legacy] PASS")
     return qid
 
-def poll_flight_info(c, sql, expect_rows, max_polls=90):
-    """pyarrow FlightClient 无 poll API → grpcio 直打 FlightService/PollFlightInfo。"""
+def poll_flight_info(c, sql, expect_rows, max_polls=90,
+                     min_pending=0, check_pending_schema=False, fetch_data=True):
+    """pyarrow FlightClient 无 poll API → grpcio 直打 FlightService/PollFlightInfo。
+
+    min_pending>0 断言至少经历 N 次 not-done 响应（pending 路径回归——短查询在首个
+    poll 的 max-wait 内终态时永远踩不到该分支）；check_pending_schema 断言 pending
+    响应的 FlightInfo 宣告非空 schema（行带 schema 出生：register 同步 AnalyzePlan）；
+    fetch_data=False 跳过 DoGet 取数、以 FlightInfo.total_records 断言行数（重物化
+    轻回流的 pending 用例用）。"""
     import grpc
 
     ch = grpc.insecure_channel("localhost:32010")
@@ -148,17 +155,27 @@ def poll_flight_info(c, sql, expect_rows, max_polls=90):
     poll = ch.unary_unary("/arrow.flight.protocol.FlightService/PollFlightInfo",
                           request_serializer=lambda x: x, response_deserializer=lambda x: x)
     info_bytes = None
+    pending = 0
     for i in range(max_polls):
         raw = poll(descriptor, metadata=md)
         fields = {f: v for f, w, v in walk(raw) if w == 2}
         fields_all = [f for f, w, v in walk(raw)]
         if 2 not in fields_all:  # flight_descriptor unset → 终态
             info_bytes = fields[1]
-            print(f"[poll] terminal after {i + 1} polls")
+            print(f"[poll] terminal after {i + 1} polls (pending x{pending})")
             break
+        pending += 1
+        if check_pending_schema:
+            # FlightInfo{schema=2}：pending 也必须宣告真实 schema（空 schema 会被严格
+            # 客户端拒收，且曾因 not-done 分支取错行而 NPE/为空）
+            schema_b = next(
+                (v2 for f2, w2, v2 in walk(fields[1]) if f2 == 2 and w2 == 2), b"")
+            assert len(schema_b) > 0, f"pending#{pending} advertised empty schema"
         print(f"[poll {i}] pending")
         time.sleep(1)
     assert info_bytes, "not terminal in time"
+    assert pending >= min_pending, (
+        f"pending x{pending} < {min_pending}：查询未跨过 max-wait，pending 路径未被覆盖")
 
     endpoints, records, qid = [], None, "?"
     for fno, w, v in walk(info_bytes):
@@ -169,6 +186,10 @@ def poll_flight_info(c, sql, expect_rows, max_polls=90):
         elif fno == 7 and w == 2:
             qid = v.decode()
     print(f"[poll] endpoints={len(endpoints)} totalRecords={records} queryId={qid[:8]}...")
+    if not fetch_data:
+        assert records == expect_rows, f"totalRecords {records} != {expect_rows}"
+        print("[poll] PASS（未取数，以 total_records 断言）")
+        return qid
 
     # 3) 取 endpoints 的票（FlightEndpoint{ticket=1{data=1}}）逐分片 DoGet
     total = 0
@@ -381,19 +402,36 @@ def legacy_long_wait(c):
     print(f"[legacy-long] DoGet held {time.time() - t0:.1f}s under poll.max-wait=2s: PASS")
 
 
-def adbc_query(c, sql, expect_rows):
+def adbc_query(c, sql, expect_rows, tag="adbc", extra_db_kwargs=None):
     """ADBC（adbc_driver_flightsql 1.x，C++ 驱动，dbapi）——⑥ 矩阵第四路客户端。
-    支持度判据在服务端 gateway.log：有 Relay complete = relay 路径（DoGet）；
-    https 模式下无 Relay complete 而行数正确 = PollFlightInfo + presigned HTTP GET。"""
+    支持度判据在服务端：gateway.log 有 Relay complete = relay 路径（DoGet）；https 模式下
+    无 Relay complete 而行数正确 = PollFlightInfo + presigned HTTP GET；mode 落行见
+    fg_operation.mode。extra_db_kwargs 注入连接选项（D15 头协商等）。"""
     import adbc_driver_flightsql.dbapi as dbapi
     t0 = time.time()
-    with dbapi.connect(uri="grpc://localhost:32010",
-                       db_kwargs={"username": USER, "password": PASSWORD}) as conn:
+    # 127.0.0.1 而非 localhost：ADBC 内置 gRPC 的 macOS name resolver 对 localhost
+    # 走 IPv6(::1) 探测，而网关 0.0.0.0 仅 IPv4 → 每次连接多耗 ~20s（pyarrow/grpcio 无此问题）
+    kwargs = {"username": USER, "password": PASSWORD}
+    kwargs.update(extra_db_kwargs or {})
+    with dbapi.connect(uri="grpc://127.0.0.1:32010", db_kwargs=kwargs) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
             table = cur.fetch_arrow_table()
     assert table.num_rows == expect_rows, f"rows {table.num_rows} != {expect_rows}"
-    print(f"[adbc] rows={table.num_rows} cols={table.column_names} ({time.time() - t0:.1f}s): PASS")
+    print(f"[{tag}] rows={table.num_rows} cols={table.column_names} ({time.time() - t0:.1f}s): PASS")
+
+
+def syntax_error(c):
+    """fail-fast 注册（行带 schema 出生）：语法错误在首个执行 RPC 即失败（引擎
+    PARSE_SYNTAX_ERROR 透出）且不落 fg_operation 行（行数判据外部：psql count=0）——
+    "宁可注册失败，不空宣告/不留半状态行"。"""
+    t0 = time.time()
+    try:
+        legacy_get_flight_info(c, "SELEC broken FROM range(10)", 0)
+        raise AssertionError("语法错误未 fail-fast（执行链路意外成功）")
+    except Exception as e:
+        assert "PARSE_SYNTAX_ERROR" in str(e), f"意外错误面: {type(e).__name__}: {e}"
+    print(f"[syntax-error] PASS ({time.time() - t0:.1f}s，错误即刻浮出)")
 
 
 if __name__ == "__main__":
@@ -405,6 +443,20 @@ if __name__ == "__main__":
         legacy_long_wait(c)
     elif which == "poll":
         poll_flight_info(c, "SELECT id FROM range(1000)", 1000)
+    elif which == "poll-pending":
+        # pending（not-done）路径回归：与 cancel-poll 同款 -Dfg.poll.max-wait=2s 网关 +
+        # 物化 >2s 的查询。恒慢的只有"物理物化"（sink 写不可被优化器折叠；count(*) 类
+        # 会被代数折叠、聚合/纯计算随引擎热度从 2s 掉到 0.5s）→ 200M 物化 ~4s，且不取数
+        # （fetch_data=False，以 total_records 断言，避免 relay 全量回流）。SQL 与 cancel
+        # 家族区分开（指纹幂等）。断言 ≥1 次 pending 且 pending 响应宣告非空 schema。
+        # 2026-09-25 教训：现有短查询用例全部在首个 poll 内终态，not-done 分支 NPE 逃逸整天
+        poll_flight_info(
+            c,
+            "SELECT a.id FROM range(200000000) a JOIN range(100) b ON a.id % 100 = b.id",
+            200000000, min_pending=1, check_pending_schema=True,
+            fetch_data=False, max_polls=30)
+    elif which == "syntax-error":
+        syntax_error(c)
     elif which == "poll-multi":
         poll_flight_info(c, "SELECT id FROM range(5000) ORDER BY id", 5000)
     elif which == "https":
@@ -417,7 +469,15 @@ if __name__ == "__main__":
         backpressure_timeout(c)
     elif which == "adbc":
         adbc_query(c, "SELECT id, id * 2 AS dbl FROM range(1000)", 1000)
+    elif which == "adbc-mode":
+        # D15：https 模式经 ADBC 连接选项注入 RPC 头（adbc.flight.sql.rpc.call_header.<name>）。
+        # SQL 与 adbc 案例区分：fingerprint 幂等（user+sql）下同 SQL 复用在册行（mode 首注册落行）
+        adbc_query(c, "SELECT id, id * 4 AS quad FROM range(1000)", 1000, tag="adbc-mode",
+                   extra_db_kwargs={"adbc.flight.sql.rpc.call_header.x-fg-endpoint-mode": "https"})
     elif which == "cancel":
+        # ⚠ cancel 家族（py cancel / java cancel / jdbc cancel 与 cancel-poll）共用
+        # 400M join 指纹（同 fg 用户）——用例间必须 TRUNCATE fg_operation，否则命中
+        # 上一例的终态行（如 CANCELLED）得到假结果；另勿并行跑（local[2] 引擎会饱和）
         cancel_inflight(c, "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")
     else:
         raise SystemExit(f"unknown case {which}")

@@ -58,6 +58,8 @@ public final class FgFlightService implements Service {
     Location listenLocation = Location.forGrpcInsecure("0.0.0.0", port);
     FlightServer.Builder builder =
         FlightServer.builder(allocator, listenLocation, producer)
+            // D15 header 协商：捕获 x-fg-endpoint-mode（https|relay），注册时落行
+            .middleware(EndpointModeMiddleware.KEY, new EndpointModeMiddleware.Factory())
             // auth2-only（Authorization: Basic/Bearer 头，design F1）：
             // arrow-java 的 Handshake RPC 只走 auth1 ServerAuthHandler（FlightService#handshake
             // → ServerAuthWrapper.wrapHandshake(authHandler,...)），双栈并存不可能（Dremio 亦

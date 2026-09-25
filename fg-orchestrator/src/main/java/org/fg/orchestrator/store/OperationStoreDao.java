@@ -39,12 +39,17 @@ public class OperationStoreDao implements Service {
   @Override
   public void close() {}
 
-  /** 幂等 INSERT；返回落库后的行（已存在时返回既有行）。 */
+  /**
+   * 幂等 INSERT；返回落库后的行（已存在时返回既有行）。schema_bytes 随行写入——
+   * "行一出现 schema 即在"（调用方 register 在 INSERT 前同步 AnalyzePlan），消费方
+   * 无需等待回填。
+   */
   public OperationRow insertOrGet(OperationRow row) throws SQLException {
     String insert =
         "INSERT INTO fg_operation (query_id, session_ref, sql_hash, user_name, sql_text,"
-            + " result_key_prefix, mode, ordered, status, engine_ref, created_at, updated_at)"
-            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, now(), now())"
+            + " result_key_prefix, mode, ordered, schema_bytes, status, engine_ref,"
+            + " created_at, updated_at)"
+            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, now(), now())"
             + " ON CONFLICT (session_ref, sql_hash) DO NOTHING";
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps = c.prepareStatement(insert)) {
@@ -56,7 +61,8 @@ public class OperationStoreDao implements Service {
       ps.setString(6, row.resultKeyPrefix());
       ps.setString(7, row.mode().name());
       ps.setBoolean(8, row.ordered());
-      ps.setString(9, row.engineRef());
+      ps.setBytes(9, row.schemaBytes());
+      ps.setString(10, row.engineRef());
       if (ps.executeUpdate() == 1) {
         return row.status(OperationRow.Status.RUNNING);
       }

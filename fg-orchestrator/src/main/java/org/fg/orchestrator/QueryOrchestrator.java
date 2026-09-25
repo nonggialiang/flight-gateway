@@ -34,8 +34,8 @@ import org.slf4j.LoggerFactory;
  * 查询编排层（design §4.2/F2）。
  *
  * <ul>
- *   <li>首个 poll/GetFlightInfo = 注册 + 触发（lazy）：幂等 INSERT → AnalyzePlan（有界）→ 异步
- *       提交（提交即 detach）；
+ *   <li>首个 poll/GetFlightInfo = 注册 + 触发（lazy）：指纹查行 miss → 同步 AnalyzePlan（有界，
+ *       行带 schema 出生）→ 幂等 INSERT → 异步提交（提交即 detach）；
  *   <li>后续 poll = 长等待：attach 租约仲裁，赢家 Reattach 挂执行流、输家有界查行；
  *       fg.poll.max-wait 到点返回未完成；
  *   <li>取消：Interrupt（不要求 attach）+ CAS 行迁移（"B 下杀手 A 收尸"）；
@@ -93,14 +93,31 @@ public class QueryOrchestrator implements Service {
 
   // ------------------------------------------------------------- 注册 + 触发
 
-  /** 首 poll / GetFlightInfo：幂等注册 +（新查询）触发执行 + schema/ordered 回填。 */
+  /**
+   * 首 poll / GetFlightInfo：幂等注册 +（新查询）触发执行。
+   *
+   * <p><b>行带 schema 出生</b>：先按指纹查行，miss 才<b>同步</b> AnalyzePlan（有界 prepare
+   * timeout），成功后携带 schema_bytes 幂等 INSERT——"行一出现 schema 即在"，消费方（快返
+   * FlightInfo 宣告 schema、终态 endpoints 构造）无需等待/回填。AnalyzePlan 失败（语法错误
+   * 等）即注册失败且<b>不落行</b>（fail-fast，无半状态泄漏；语义与 plan-only prepare 一致）。
+   * 并发同指纹：双双 miss → 双双分析（重复分析可接受）→ ON CONFLICT 单赢家触发，输家读回
+   * 的在册行同样带 schema。
+   */
   public Registration register(String sessionRef, String user, String sql, OperationRow.Mode mode)
       throws Exception {
     String sqlHash = sha256(sql);
+    OperationRow existing = dao.getByFingerprint(sessionRef, sqlHash).orElse(null);
+    if (existing != null) {
+      return new Registration(existing, false);
+    }
+
+    Duration prepareTimeout = Duration.ofMillis(config.getDurationMs("fg.query.prepare.timeout"));
+    EngineSession session = engine.openSession(new GatewaySession(sessionRef, user, Map.of()));
+    Schema schema = engine.analyzeSchema(session, sql, prepareTimeout);
+
     String queryId = QueryIdHolder.newQueryId();
     String resultKeyPrefix =
         config.getString("fg.result.prefix") + "/" + engine.type() + "/" + user + "/" + queryId;
-
     OperationRow row =
         new OperationRow()
             .queryId(queryId)
@@ -110,6 +127,7 @@ public class QueryOrchestrator implements Service {
             .sqlText(sql)
             .resultKeyPrefix(resultKeyPrefix)
             .mode(mode)
+            .schemaBytes(schema == null ? null : SchemaSerde.serialize(schema))
             .engineRef(engine.type());
     OperationRow stored = dao.insertOrGet(row);
     boolean isNew = stored.queryId().equals(queryId);
@@ -133,22 +151,15 @@ public class QueryOrchestrator implements Service {
     return schema == null ? null : SchemaSerde.serialize(schema);
   }
 
-  /** AnalyzePlan（有界）→ 异步提交（提交即 detach，首响应回调落 operationId）。 */
+  /**
+   * 异步提交（提交即 detach，首响应回调落 operationId）。schema 已随行出生（register 同步
+   * AnalyzePlan），此处只做排序检测 + 物化规划 + 提交。
+   */
   private void triggerExecution(OperationRow row) {
     controlExecutor.submit(() -> {
       try {
         EngineSession session = openEngineSession(row);
         try {
-          // AnalyzePlan：schema + 顶层排序检测（H4），有界 prepare timeout，失败不阻断触发
-          try {
-            Duration prepareTimeout = Duration.ofMillis(config.getDurationMs("fg.query.prepare.timeout"));
-            Schema schema = engine.analyzeSchema(session, row.sqlText(), prepareTimeout);
-            if (schema != null) {
-              dao.setSchema(row.queryId(), SchemaSerde.serialize(schema));
-            }
-          } catch (Exception e) {
-            logger.warn("AnalyzePlan failed for {} (trigger proceeds): {}", row.queryId(), e.toString());
-          }
           try {
             boolean ordered = engine.isOrderSensitive(session, row.sqlText());
             dao.setOrdered(row.queryId(), ordered);
@@ -255,7 +266,12 @@ public class QueryOrchestrator implements Service {
         }
         return new PollOutcome(false, null, null);
       }
-      long sleep = Math.min(remaining, config.getDurationMs("fg.poll.db.interval"));
+      // 单位统一到毫秒再取小（曾纳秒/毫秒错配：min 几乎恒取 interval → 固定睡一个
+      // interval、max-wait 被 overshoot 一整个 interval，醒来先查终态常直接终态返回）
+      long sleep =
+          Math.min(
+              TimeUnit.NANOSECONDS.toMillis(remaining),
+              config.getDurationMs("fg.poll.db.interval"));
       TimeUnit.MILLISECONDS.sleep(sleep);
     }
   }
