@@ -16,7 +16,8 @@ import java.util.concurrent.TimeUnit;
  * DoGet 内联等待）、{@link Statement#cancel()}（→ CancelFlightInfo）。
  *
  * <p>用法：{@code java -cp target/fg-e2e-java-0.1.0-SNAPSHOT.jar org.fg.e2e.JdbcClientE2E
- * {legacy|legacy-long|metadata|cancel}}（网关默认 relay 模式；用例间 TRUNCATE fg_operation）。
+ * {legacy|legacy-long|metadata|cancel|cancel-poll}}（网关默认 relay 模式；cancel-poll 需
+ * {@code -Dfg.poll.max-wait=2s}；用例间 TRUNCATE fg_operation）。
  */
 public final class JdbcClientE2E {
 
@@ -37,6 +38,7 @@ public final class JdbcClientE2E {
             1000, "[jdbc-legacy-long]");
         case "metadata" -> metadata(conn);
         case "cancel" -> cancel(conn);
+        case "cancel-poll" -> cancelPoll(conn);
         default -> throw new IllegalArgumentException("unknown case " + which);
       }
     }
@@ -112,6 +114,54 @@ public final class JdbcClientE2E {
         throw new AssertionError("cancel not effective: " + total + " rows streamed");
       }
       System.out.println("[jdbc-cancel] PASS");
+    }
+  }
+
+  /**
+   * 方案②验证（poll 阻塞期取消 → CancelFlightInfo）：fg-p1-patch② 给驱动接线了
+   * Statement.cancel() → CancelFlightInfo——首 poll 返回时凭证（FlightInfo.appMetadata=queryId）
+   * 经 listener 存入 statement，阻塞轮询期间的 st.cancel() 即触发服务端取消，随后 poll 收到
+   * CANCELLED 以 SQLException 浮出。需 {@code -Dfg.poll.max-wait=2s} 网关（缩短首 poll 服务端
+   * 等待，凭证 ~2s 即可达）；400M join 物化远超 3s，保证取消落在 poll 阻塞期（早于任何取数）。
+   */
+  private static void cancelPoll(Connection conn) throws Exception {
+    long t0 = System.nanoTime();
+    try (Statement st = conn.createStatement()) {
+      final boolean[] done = {false};
+      Thread killer = new Thread(() -> {
+        try {
+          for (int i = 0; !done[0] && i < 600; i++) {
+            Thread.sleep(1_000);
+            try {
+              st.cancel();
+            } catch (SQLException ignored) {
+              // statement 可能已关闭
+            }
+          }
+        } catch (Exception ignored) {
+          // 线程中断等
+        }
+      });
+      killer.start();
+      long total = 0;
+      try (ResultSet rs = st.executeQuery(
+          "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")) {
+        while (rs.next()) {
+          total++;
+        }
+        System.out.printf("[jdbc-cancel-poll] stream ended with %d rows (cancel landed late)%n", total);
+      } catch (SQLException e) {
+        System.out.printf("[jdbc-cancel-poll] SQLException after %.1fs: %s (cause: %s)%n",
+            elapsedSec(t0), e.getMessage(),
+            e.getCause() == null ? "none" : String.valueOf(e.getCause().getMessage()));
+        total = -1; // 取消到达的预期路径
+      }
+      done[0] = true;
+      killer.join();
+      if (total > 1_000_000) {
+        throw new AssertionError("cancel not effective: " + total + " rows streamed");
+      }
+      System.out.println("[jdbc-cancel-poll] PASS");
     }
   }
 
