@@ -1,5 +1,5 @@
--- fg_operation 作业表（design §4.2/D14）：执行状态/operationId/mode 落库，跨实例共享。
--- 量级 = 在途查询数（retention 清扫）。
+-- fg_operation 作业表（design §4.2/D14/D17/D18/D19）：执行状态/operationId/mode/kind 落库，
+-- 跨实例共享。量级 = 在途查询数（retention 清扫）。
 CREATE TABLE fg_operation (
   query_id               UUID PRIMARY KEY,
   session_ref            TEXT NOT NULL,
@@ -7,6 +7,11 @@ CREATE TABLE fg_operation (
   user_name              TEXT NOT NULL,
   sql_text               TEXT NOT NULL,
   result_key_prefix      TEXT NOT NULL,
+  -- D17 粗粒度 kind：QUERY（幂等注册+物化交付）| COMMAND（SET/SHOW/DESCRIBE/EXPLAIN/USE/DDL/DML，
+  -- 结果内联 command_result、豁免指纹幂等）
+  kind                   TEXT NOT NULL DEFAULT 'QUERY' CHECK (kind IN ('QUERY', 'COMMAND')),
+  -- D18 命令结果（Arrow IPC stream bytes，含 schema message；COMMAND 终态内联交付）
+  command_result         BYTEA,
   mode                   TEXT NOT NULL CHECK (mode IN ('HTTPS', 'RELAY')),
   ordered                BOOLEAN NOT NULL DEFAULT FALSE,
   schema_bytes           BYTEA,
@@ -18,11 +23,26 @@ CREATE TABLE fg_operation (
   error                  TEXT,
   terminal_at            TIMESTAMPTZ,
   created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-  -- 首 poll 幂等：唯一键 = 会话 + SQL 指纹（网络重试不重复执行）
-  CONSTRAINT fg_operation_fingerprint UNIQUE (session_ref, sql_hash)
+  updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 首 poll 幂等（D19）：唯一约束只作用于 kind='QUERY'——副作用语句（DML/DDL/SET/RESET/USE）
+-- 豁免指纹去重，每次执行都是新行（网络重试与幂等冲突时以"可重复执行"为先；只读命令
+-- 同例保持一致，避免 SHOW/DESCRIBE 命中陈旧行）。
+CREATE UNIQUE INDEX uq_fg_operation_query_fingerprint
+  ON fg_operation (session_ref, sql_hash) WHERE kind = 'QUERY';
 
 CREATE INDEX idx_fg_operation_status ON fg_operation (status);
 CREATE INDEX idx_fg_operation_terminal ON fg_operation (terminal_at);
 CREATE INDEX idx_fg_operation_created ON fg_operation (created_at);
+
+-- fg_session_option 会话选项表（design D20）：Flight SetSessionOptions 通道的持久层——
+-- SET 即时命令之外，选项经此表持久，openSession 时注入 GatewaySession.options、Spark kit
+-- 按差异重放到 Connect session。
+CREATE TABLE fg_session_option (
+  session_ref  TEXT NOT NULL,
+  key          TEXT NOT NULL,
+  value        TEXT NOT NULL,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_ref, key)
+);

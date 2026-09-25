@@ -43,14 +43,18 @@ public class OperationStoreDao implements Service {
    * 幂等 INSERT；返回落库后的行（已存在时返回既有行）。schema_bytes 随行写入——
    * "行一出现 schema 即在"（调用方 register 在 INSERT 前同步 AnalyzePlan），消费方
    * 无需等待回填。
+   *
+   * <p>冲突推断按部分唯一索引（D19）：{@code ON CONFLICT (session_ref, sql_hash) WHERE
+   * kind='QUERY'}——只对 QUERY 幂等；与 V1 的部分索引定义必须同提交（否则推断失败，QUERY
+   * 注册即报 "no unique or exclusion constraint matching the ON CONFLICT specification"）。
    */
   public OperationRow insertOrGet(OperationRow row) throws SQLException {
     String insert =
         "INSERT INTO fg_operation (query_id, session_ref, sql_hash, user_name, sql_text,"
-            + " result_key_prefix, mode, ordered, schema_bytes, status, engine_ref,"
+            + " result_key_prefix, kind, mode, ordered, schema_bytes, status, engine_ref,"
             + " created_at, updated_at)"
-            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, now(), now())"
-            + " ON CONFLICT (session_ref, sql_hash) DO NOTHING";
+            + " VALUES (?, ?, ?, ?, ?, ?, 'QUERY', ?, ?, ?, 'RUNNING', ?, now(), now())"
+            + " ON CONFLICT (session_ref, sql_hash) WHERE kind = 'QUERY' DO NOTHING";
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps = c.prepareStatement(insert)) {
       ps.setObject(1, UUID.fromString(row.queryId()));
@@ -71,15 +75,61 @@ public class OperationStoreDao implements Service {
     }
   }
 
+  /**
+   * COMMAND 行插入（D18）：普通 INSERT、无冲突子句——命令豁免指纹幂等（D19），每次执行
+   * 都是新行（新 queryId）。schema_bytes 用静态宣告（或 analyzable inline）schema 随行
+   * 写入，终态由 {@link #casCompleteCommand} 以实际 schema+结果覆盖。
+   */
+  public OperationRow insertCommand(OperationRow row) throws SQLException {
+    String insert =
+        "INSERT INTO fg_operation (query_id, session_ref, sql_hash, user_name, sql_text,"
+            + " result_key_prefix, kind, mode, ordered, schema_bytes, status, engine_ref,"
+            + " created_at, updated_at)"
+            + " VALUES (?, ?, ?, ?, ?, ?, 'COMMAND', ?, ?, ?, 'RUNNING', ?, now(), now())";
+    try (Connection c = dataSource.getConnection();
+        PreparedStatement ps = c.prepareStatement(insert)) {
+      ps.setObject(1, UUID.fromString(row.queryId()));
+      ps.setString(2, row.sessionRef());
+      ps.setString(3, row.sqlHash());
+      ps.setString(4, row.user());
+      ps.setString(5, row.sqlText());
+      ps.setString(6, row.resultKeyPrefix());
+      ps.setString(7, row.mode().name());
+      ps.setBoolean(8, row.ordered());
+      ps.setBytes(9, row.schemaBytes());
+      ps.setString(10, row.engineRef());
+      ps.executeUpdate();
+      return row.status(OperationRow.Status.RUNNING);
+    }
+  }
+
+  /**
+   * CAS 命令完成（D18）：RUNNING→COMPLETED，落实际 schema（覆盖静态宣告）+ 内联结果
+   * （Arrow IPC stream bytes）。
+   */
+  public boolean casCompleteCommand(String queryId, byte[] schemaBytes, byte[] resultBytes)
+      throws SQLException {
+    return update(
+        "UPDATE fg_operation SET status = 'COMPLETED', schema_bytes = ?, command_result = ?,"
+            + " terminal_at = now(), updated_at = now(), attach_owner = NULL, attach_lease_until = NULL"
+            + " WHERE query_id = ? AND status = 'RUNNING'",
+        ps -> {
+          ps.setBytes(1, schemaBytes);
+          ps.setBytes(2, resultBytes);
+          ps.setObject(3, UUID.fromString(queryId));
+        });
+  }
+
   public Optional<OperationRow> get(String queryId) throws SQLException {
     return queryOne(
         "SELECT * FROM fg_operation WHERE query_id = ?", ps -> ps.setObject(1, UUID.fromString(queryId)));
   }
 
+  /** 指纹查找只看 QUERY 行（D19 防御：COMMAND 行不受唯一索引约束，同名指纹可多行）。 */
   public Optional<OperationRow> getByFingerprint(String sessionRef, String sqlHash)
       throws SQLException {
     return queryOne(
-        "SELECT * FROM fg_operation WHERE session_ref = ? AND sql_hash = ?",
+        "SELECT * FROM fg_operation WHERE session_ref = ? AND sql_hash = ? AND kind = 'QUERY'",
         ps -> {
           ps.setString(1, sessionRef);
           ps.setString(2, sqlHash);
@@ -243,6 +293,8 @@ public class OperationStoreDao implements Service {
         .user(rs.getString("user_name"))
         .sqlText(rs.getString("sql_text"))
         .resultKeyPrefix(rs.getString("result_key_prefix"))
+        .kind(OperationRow.Kind.parse(rs.getString("kind")))
+        .commandResult(rs.getBytes("command_result"))
         .mode(OperationRow.Mode.parse(rs.getString("mode")))
         .ordered(rs.getBoolean("ordered"))
         .schemaBytes(rs.getBytes("schema_bytes"))

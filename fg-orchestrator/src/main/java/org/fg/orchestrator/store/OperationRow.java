@@ -27,12 +27,28 @@ public final class OperationRow {
     }
   }
 
+  /**
+   * 粗粒度 kind（design D17）：QUERY = 幂等注册 + 物化交付主链路；COMMAND =
+   * SET/SHOW/DESCRIBE/EXPLAIN/USE/DDL/DML（细粒度见 StatementClassifier.Kind），结果内联
+   * command_result、豁免指纹幂等（D19）。默认 QUERY（既有构造点零改动）。
+   */
+  public enum Kind {
+    QUERY,
+    COMMAND;
+
+    public static Kind parse(String s) {
+      return valueOf(Objects.requireNonNull(s, "kind").toUpperCase());
+    }
+  }
+
   private String queryId;
   private String sessionRef;
   private String sqlHash;
   private String user;
   private String sqlText;
   private String resultKeyPrefix;
+  private Kind kind = Kind.QUERY;
+  private byte[] commandResult;
   private Mode mode;
   private boolean ordered;
   private byte[] schemaBytes;
@@ -97,6 +113,24 @@ public final class OperationRow {
 
   public OperationRow resultKeyPrefix(String resultKeyPrefix) {
     this.resultKeyPrefix = resultKeyPrefix;
+    return this;
+  }
+
+  public Kind kind() {
+    return kind;
+  }
+
+  public OperationRow kind(Kind kind) {
+    this.kind = kind;
+    return this;
+  }
+
+  public byte[] commandResult() {
+    return commandResult;
+  }
+
+  public OperationRow commandResult(byte[] commandResult) {
+    this.commandResult = commandResult;
     return this;
   }
 
@@ -224,6 +258,8 @@ public final class OperationRow {
         && Objects.equals(user, that.user)
         && Objects.equals(sqlText, that.sqlText)
         && Objects.equals(resultKeyPrefix, that.resultKeyPrefix)
+        && kind == that.kind
+        && Arrays.equals(commandResult, that.commandResult)
         && mode == that.mode
         && Arrays.equals(schemaBytes, that.schemaBytes)
         && status == that.status
@@ -239,9 +275,9 @@ public final class OperationRow {
 
   @Override
   public int hashCode() {
-    int result = Objects.hash(queryId, sessionRef, sqlHash, user, sqlText, resultKeyPrefix, mode,
-        ordered, status, connectOperationId, attachOwner, attachLeaseUntil, engineRef, error,
+    int result = Objects.hash(queryId, sessionRef, sqlHash, user, sqlText, resultKeyPrefix, kind,
+        mode, ordered, status, connectOperationId, attachOwner, attachLeaseUntil, engineRef, error,
         terminalAt, createdAt, updatedAt);
-    return 31 * result + Arrays.hashCode(schemaBytes);
+    return 31 * result + Arrays.hashCode(schemaBytes) + 31 * Arrays.hashCode(commandResult);
   }
 }

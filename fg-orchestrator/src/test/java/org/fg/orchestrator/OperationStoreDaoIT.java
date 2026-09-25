@@ -141,4 +141,51 @@ class OperationStoreDaoIT {
     assertThat(dao.tryAcquireAttachLease(row.queryId(), "owner-b", Duration.ofSeconds(60))).isTrue();
     assertThat(dao.clearAttach(row.queryId(), "owner-b")).isTrue();
   }
+
+  // ------------------------------------------------------------- D18/D19：COMMAND 行
+
+  private OperationRow newCommandRow(String sessionRef, String sql) {
+    return newRow(sessionRef, sql).kind(OperationRow.Kind.COMMAND);
+  }
+
+  @Test
+  void commandInsertIsNotFingerprintDeduped() throws Exception {
+    // D19 幂等豁免：同会话同 SQL 的 COMMAND 各自成行（新 queryId），不受 QUERY 部分唯一索引约束
+    OperationRow first = dao.insertCommand(newCommandRow("s-cmd", "INSERT INTO t SELECT 1"));
+    OperationRow second = dao.insertCommand(newCommandRow("s-cmd", "INSERT INTO t SELECT 1"));
+    assertThat(second.queryId()).isNotEqualTo(first.queryId());
+    assertThat(dao.get(first.queryId()).orElseThrow().kind()).isEqualTo(OperationRow.Kind.COMMAND);
+    assertThat(dao.get(second.queryId()).orElseThrow().kind()).isEqualTo(OperationRow.Kind.COMMAND);
+    // getByFingerprint 只看 QUERY（防御）：COMMAND 同名指纹不可见
+    assertThat(dao.getByFingerprint("s-cmd", QueryOrchestrator.sha256("INSERT INTO t SELECT 1")))
+        .isEmpty();
+  }
+
+  @Test
+  void queryAndCommandWithSameFingerprintCoexist() throws Exception {
+    String sql = "SET k = v";
+    OperationRow query = dao.insertOrGet(newRow("s-mixed", sql)); // kind 列默认 QUERY
+    OperationRow command = dao.insertCommand(newCommandRow("s-mixed", sql));
+    assertThat(query.kind()).isEqualTo(OperationRow.Kind.QUERY);
+    assertThat(command.kind()).isEqualTo(OperationRow.Kind.COMMAND);
+    // QUERY 幂等不受 COMMAND 行影响：同指纹再注册仍命中首行
+    OperationRow again = dao.insertOrGet(newRow("s-mixed", sql));
+    assertThat(again.queryId()).isEqualTo(query.queryId());
+  }
+
+  @Test
+  void casCompleteCommandLandsSchemaAndResult() throws Exception {
+    OperationRow row = dao.insertCommand(newCommandRow("s-cmd-res", "SHOW DATABASES"));
+    byte[] schema = new byte[] {1, 2, 3};
+    byte[] ipc = new byte[] {4, 5, 6, 7};
+    assertThat(dao.casCompleteCommand(row.queryId(), schema, ipc)).isTrue();
+    OperationRow done = dao.get(row.queryId()).orElseThrow();
+    assertThat(done.status()).isEqualTo(OperationRow.Status.COMPLETED);
+    assertThat(done.kind()).isEqualTo(OperationRow.Kind.COMMAND);
+    assertThat(done.schemaBytes()).containsExactly(schema);
+    assertThat(done.commandResult()).containsExactly(ipc);
+    // 终态后不可再迁移（CAS 单向）
+    assertThat(dao.casCompleteCommand(row.queryId(), schema, ipc)).isFalse();
+    assertThat(dao.casFail(row.queryId(), "late")).isFalse();
+  }
 }
