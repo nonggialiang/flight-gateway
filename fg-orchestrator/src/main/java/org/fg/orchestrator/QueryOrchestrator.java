@@ -184,9 +184,14 @@ public class QueryOrchestrator implements Service {
             .kind(OperationRow.Kind.COMMAND)
             .schemaBytes(schemaBytes)
             .engineRef(engine.type());
-    OperationRow stored = dao.insertCommand(row);
-    triggerCommand(stored);
-    return new Registration(stored, true);
+    OperationRow stored = dao.insertCommandOrGet(row);
+    boolean isNew = stored.queryId().equals(queryId);
+    // 在途幂等（D19 修正）：同 (session, sql) RUNNING 行已存在（PollFlightInfo 逐次
+    // register 的后续 poll）→ 复用，不重触发；终态后索引释放，新执行照常新行。
+    if (isNew) {
+      triggerCommand(stored);
+    }
+    return new Registration(stored, isNew);
   }
 
   /**

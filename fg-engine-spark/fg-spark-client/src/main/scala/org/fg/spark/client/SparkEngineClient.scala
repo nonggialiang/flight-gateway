@@ -169,47 +169,59 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
 
     async.executePlan(request, new StreamObserver[ExecutePlanResponse] {
       override def onNext(value: ExecutePlanResponse): Unit = synchronized {
-        val opId = value.getOperationId
-        if (!handleSeen && opId != null && !opId.isEmpty) {
-          handleSeen = true
-          try listener.onHandle(new EngineExecutionHandle("spark", opId))
-          catch { case _: Throwable => } // 回调异常不阻断流消费
-        }
-        val dt = value.getSchema
-        if (schema == null && dt != null && dt.getKindCase == DataType.KindCase.STRUCT) {
-          schema = MaterializationPlanner.toArrowSchema(dt.getStruct)
-        }
-        if (value.hasArrowBatch) {
-          val data = value.getArrowBatch.getData
-          totalBatchBytes += data.size()
-          if (totalBatchBytes > maxBytes) {
-            fail(s"command result exceeds fg.command.result.max-bytes ($maxBytes): $totalBatchBytes")
-            return
+        // 观察者绝不可抛：grpc-java 会因此 cancel 流并以 CANCELLED 回调 onError，
+        // 真实异常被吞（曾把 schema/batch 重组失败伪装成"Query was cancelled"）。
+        try {
+          val opId = value.getOperationId
+          if (!handleSeen && opId != null && !opId.isEmpty) {
+            handleSeen = true
+            try listener.onHandle(new EngineExecutionHandle("spark", opId))
+            catch { case _: Throwable => } // 回调异常不阻断流消费
           }
-          if (schema == null) {
-            schema = SparkEngineClient.okSchema // 无 STRUCT 的零行命令（如多数 DDL）
+          val dt = value.getSchema
+          // 零字段 STRUCT（DDL 类：spark.sql 的 DataFrame 无列）不采作交付 schema——
+          // 回退 [ok BOOLEAN] 合成（Dremio 式非空 schema 承诺，D18）
+          if (schema == null && dt != null && dt.getKindCase == DataType.KindCase.STRUCT
+              && !dt.getStruct.getFieldsList.isEmpty) {
+            schema = MaterializationPlanner.toArrowSchema(dt.getStruct)
           }
-          if (root == null) {
-            root = org.apache.arrow.vector.VectorSchemaRoot.create(schema, allocator)
-            writer = new org.apache.arrow.vector.ipc.ArrowStreamWriter(root, null, ipcOut)
-            writer.start() // IPC 流先写 schema message
+          if (value.hasArrowBatch) {
+            val data = value.getArrowBatch.getData
+            totalBatchBytes += data.size()
+            if (totalBatchBytes > maxBytes) {
+              fail(s"command result exceeds fg.command.result.max-bytes ($maxBytes): $totalBatchBytes")
+              return
+            }
+            if (root == null) {
+              root = org.apache.arrow.vector.VectorSchemaRoot.create(
+                if (schema != null) schema else SparkEngineClient.okSchema, allocator)
+              writer = new org.apache.arrow.vector.ipc.ArrowStreamWriter(root, null, ipcOut)
+              writer.start() // IPC 流先写 schema message
+            }
+            // arrow_batch.data 是完整单批 IPC stream（schema message + record batch + EOS，
+            // ArrowConverters.toBatchWithSchemaIterator 的产出形态）——按流读取后装载到输出
+            val reader = new org.apache.arrow.vector.ipc.ArrowStreamReader(
+              new java.io.ByteArrayInputStream(data.toByteArray), allocator)
+            try {
+              val src = reader.getVectorSchemaRoot
+              while (reader.loadNextBatch()) {
+                if (!src.getSchema.getFields.isEmpty) { // 0 字段批（DDL 类）恒 0 行，跳过
+                  val batch = new org.apache.arrow.vector.VectorUnloader(src).getRecordBatch()
+                  try new org.apache.arrow.vector.VectorLoader(root).load(batch)
+                  finally batch.close()
+                  writer.writeBatch()
+                }
+              }
+            } finally {
+              reader.close()
+            }
           }
-          // arrow_batch.data 是无 schema 的 batch message：readMessage → 反序列化 body → 装载
-          val in = new java.io.ByteArrayInputStream(data.toByteArray)
-          val ch = new org.apache.arrow.vector.ipc.ReadChannel(java.nio.channels.Channels.newChannel(in))
-          val meta = org.apache.arrow.vector.ipc.message.MessageSerializer.readMessage(ch)
-          if (meta != null) {
-            val body = org.apache.arrow.vector.ipc.message.MessageSerializer
-              .readMessageBody(ch, meta.getMessageBodyLength, allocator)
-            val batch = org.apache.arrow.vector.ipc.message.MessageSerializer
-              .deserializeRecordBatch(meta.getMessage, body)
-            try new org.apache.arrow.vector.VectorLoader(root).load(batch)
-            finally batch.close()
-            writer.writeBatch()
+          if (value.hasResultComplete) {
+            resultComplete = true // 非 reattachable 不下发；仅置位记录（见方法 javadoc）
           }
-        }
-        if (value.hasResultComplete) {
-          resultComplete = true // 非 reattachable 不下发；仅置位记录（见方法 javadoc）
+        } catch {
+          case e: Throwable =>
+            fail(s"command response processing failed: $e")
         }
       }
 

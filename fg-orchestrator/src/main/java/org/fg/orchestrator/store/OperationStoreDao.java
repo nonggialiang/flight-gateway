@@ -76,16 +76,21 @@ public class OperationStoreDao implements Service {
   }
 
   /**
-   * COMMAND 行插入（D18）：普通 INSERT、无冲突子句——命令豁免指纹幂等（D19），每次执行
-   * 都是新行（新 queryId）。schema_bytes 用静态宣告（或 analyzable inline）schema 随行
-   * 写入，终态由 {@link #casCompleteCommand} 以实际 schema+结果覆盖。
+   * COMMAND 行插入（D18/D19 修正）：在途幂等——PollFlightInfo 逐次 register，无在途约束
+   * 会令慢命令逐 poll 重复执行。冲突推断按部分唯一索引（V1 同提交）：
+   * {@code ON CONFLICT (session_ref, sql_hash) WHERE kind='COMMAND' AND status='RUNNING'}
+   * ——同 (session, sql) 同时至多一个在途命令，0 行即复用在途行；行终态后索引释放，
+   * 下次执行照常新行（指纹幂等豁免 D19 保留）。schema_bytes 用静态宣告（或 analyzable
+   * inline）schema 随行写入，终态由 {@link #casCompleteCommand} 以实际 schema+结果覆盖。
    */
-  public OperationRow insertCommand(OperationRow row) throws SQLException {
+  public OperationRow insertCommandOrGet(OperationRow row) throws SQLException {
     String insert =
         "INSERT INTO fg_operation (query_id, session_ref, sql_hash, user_name, sql_text,"
             + " result_key_prefix, kind, mode, ordered, schema_bytes, status, engine_ref,"
             + " created_at, updated_at)"
-            + " VALUES (?, ?, ?, ?, ?, ?, 'COMMAND', ?, ?, ?, 'RUNNING', ?, now(), now())";
+            + " VALUES (?, ?, ?, ?, ?, ?, 'COMMAND', ?, ?, ?, 'RUNNING', ?, now(), now())"
+            + " ON CONFLICT (session_ref, sql_hash) WHERE kind = 'COMMAND'"
+            + " AND status = 'RUNNING' DO NOTHING";
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps = c.prepareStatement(insert)) {
       ps.setObject(1, UUID.fromString(row.queryId()));
@@ -98,9 +103,25 @@ public class OperationStoreDao implements Service {
       ps.setBoolean(8, row.ordered());
       ps.setBytes(9, row.schemaBytes());
       ps.setString(10, row.engineRef());
-      ps.executeUpdate();
-      return row.status(OperationRow.Status.RUNNING);
+      if (ps.executeUpdate() == 1) {
+        return row.status(OperationRow.Status.RUNNING);
+      }
+      return getRunningCommand(row.sessionRef(), row.sqlHash())
+          .orElseThrow(
+              () -> new IllegalStateException("Command conflict but RUNNING row missing: " + row.queryId()));
     }
+  }
+
+  /** 在途 COMMAND 行查找（insertCommandOrGet 冲突路径用，D19 修正）。 */
+  public Optional<OperationRow> getRunningCommand(String sessionRef, String sqlHash)
+      throws SQLException {
+    return queryOne(
+        "SELECT * FROM fg_operation WHERE session_ref = ? AND sql_hash = ? AND kind = 'COMMAND'"
+            + " AND status = 'RUNNING'",
+        ps -> {
+          ps.setString(1, sessionRef);
+          ps.setString(2, sqlHash);
+        });
   }
 
   /**

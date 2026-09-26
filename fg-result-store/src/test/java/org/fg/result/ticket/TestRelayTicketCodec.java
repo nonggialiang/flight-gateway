@@ -32,6 +32,18 @@ class TestRelayTicketCodec {
   }
 
   @Test
+  void commandTicketRoundTrip() {
+    // D18：COMMAND 定位票——7 字段 HMAC 格式不变，kind=COMMAND、无 partIndex
+    RelayTicket ticket =
+        new RelayTicket(TicketKind.COMMAND, "bkt", "", "q9", "alice", NOW, null);
+    assertThat(codec.decode(codec.encode(ticket), "alice")).isEqualTo(ticket);
+    assertThat(codec.decode(codec.encode(ticket), "alice").kind()).isEqualTo(TicketKind.COMMAND);
+    assertThatThrownBy(
+            () -> new RelayTicket(TicketKind.COMMAND, "bkt", "", "q9", "alice", 1L, 2))
+        .isInstanceOf(IllegalArgumentException.class);
+  }
+
+  @Test
   void tamperedSignatureRejected() {
     RelayTicket ticket =
         new RelayTicket(TicketKind.STREAM, "bkt", "pfx", "q1", "alice", NOW, null);

@@ -23,6 +23,8 @@ import org.apache.arrow.flight.sql.impl.FlightSql;
 import org.apache.arrow.vector.ipc.message.IpcOption;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.fg.common.config.GatewayConfig;
+import org.fg.common.sql.StatementClassifier;
+import org.fg.orchestrator.CommandSchemas;
 import org.fg.orchestrator.QueryOrchestrator;
 import org.fg.orchestrator.SchemaSerde;
 import org.fg.orchestrator.store.OperationRow;
@@ -93,9 +95,10 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   }
 
   /**
-   * 注册 + 触发 + 快返 STREAM 票（statement 与 prepared 垫片共用）。票可即刻给（DoGet 反正
-   * 要等）；宣告 schema 随行出生（register 同步 AnalyzePlan，AnalyzePlan 失败即注册失败）——
-   * 严格客户端（ADBC）逐 endpoint 校验宣告 schema 与流 schema 一致，空 schema 会直接拒收。
+   * 注册 + 触发 + 快返票（statement 与 prepared 垫片共用）。票可即刻给（DoGet 反正要等）：
+   * QUERY→STREAM 票、COMMAND→COMMAND 定位票（D18，DoGet 挂等待后流行内结果）。宣告 schema
+   * 随行出生（register 同步 AnalyzePlan/静态宣告，失败即注册失败）——严格客户端（ADBC）逐
+   * endpoint 校验宣告 schema 与流 schema 一致，空 schema 会直接拒收。
    */
   private FlightInfo registerAndQuickReturn(
       String sql, FlightProducer.CallContext context, FlightDescriptor descriptor)
@@ -106,7 +109,10 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     return flightInfo(
         schemaOf(row.schemaBytes()),
         descriptor,
-        List.of(endpoints.streamEndpoint(row)),
+        List.of(
+            row.kind() == OperationRow.Kind.COMMAND
+                ? endpoints.commandEndpoint(row)
+                : endpoints.streamEndpoint(row)),
         -1L,
         -1L,
         false,
@@ -164,6 +170,19 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       }
 
       // 终态：一次性返回全部 endpoints（flight_descriptor unset → 终结；ordered 按行回填）
+      if (terminal.kind() == OperationRow.Kind.COMMAND) {
+        // D18：命令终态——单 COMMAND 定位票、无 manifest 计量（-1/-1，ordered 无意义）
+        FlightInfo cmdInfo =
+            flightInfo(
+                schemaOf(terminal),
+                descriptor,
+                List.of(endpoints.commandEndpoint(terminal)),
+                -1L,
+                -1L,
+                false,
+                terminal.queryId());
+        return new PollInfo(cmdInfo, null, null, null);
+      }
       List<FlightEndpoint> eps = endpoints.endpoints(terminal, outcome.manifest());
       FlightInfo info =
           flightInfo(
@@ -201,10 +220,10 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     } catch (Exception e) {
       throw invalid("Malformed descriptor: " + e.getMessage());
     }
-    // Flight SQL 语义 GetSchema = plan-only：AnalyzePlan 直取 schema，不注册、不触发执行
+    // Flight SQL 语义 GetSchema = plan-only：AnalyzePlan 直取 schema，不注册、不触发执行。
+    // D17：非 analyzable 命令（SET/RESET/USE/DML/DDL）不可分析——静态宣告 schema，不碰引擎
     try {
-      byte[] schema =
-          orchestrator.analyzeSchema(sessionRef(context), user(context), sql);
+      byte[] schema = analyzeOrStaticSchema(context, sql);
       return new org.apache.arrow.flight.SchemaResult(
           schema == null ? new Schema(List.of()) : SchemaSerde.deserialize(schema));
     } catch (FlightRuntimeException e) {
@@ -257,7 +276,11 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     new org.apache.arrow.flight.sql.SqlInfoBuilder()
         .withFlightSqlServerName("Flight Gateway")
         .withFlightSqlServerVersion("0.1.0")
-        .withFlightSqlServerReadOnly(true) // M1 仅查询；事务/更新不支持
+        // D17：非 SELECT 语句支持上线——服务端非只读，DDL 三能力全开（catalog 归引擎）
+        .withFlightSqlServerReadOnly(false)
+        .withSqlDdlCatalog(true)
+        .withSqlDdlSchema(true)
+        .withSqlDdlTable(true)
         .send(command.getInfoList(), listener);
   }
 
@@ -275,8 +298,8 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     try {
       // plan-only：dataset_schema 直接来自 AnalyzePlan（驱动据其判定 StatementType；
       // 空 schema 会被当作 update）。AnalyzePlan 失败（如语法错误）即 prepare 失败。
-      byte[] schema =
-          orchestrator.analyzeSchema(sessionRef(context), user(context), request.getQuery());
+      // D17：非 analyzable 命令用静态宣告 schema（驱动据此走 executeUpdate 分支）
+      byte[] schema = analyzeOrStaticSchema(context, request.getQuery());
       FlightSql.ActionCreatePreparedStatementResult.Builder result =
           FlightSql.ActionCreatePreparedStatementResult.newBuilder()
               .setPreparedStatementHandle(
@@ -466,6 +489,21 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   }
 
   // ------------------------------------------------------------- helpers
+
+  /**
+   * plan-only schema 解析（GetSchema / CreatePreparedStatement 共用）：analyzable 语句
+   * （QUERY/SHOW/DESCRIBE/EXPLAIN）走引擎 AnalyzePlan；其余（SET/RESET/USE/DML/DDL）不可
+   * 分析（D17）——CommandSchemas 静态宣告，不碰引擎。
+   */
+  private byte[] analyzeOrStaticSchema(FlightProducer.CallContext context, String sql)
+      throws Exception {
+    StatementClassifier.Kind kind = StatementClassifier.classify(sql);
+    if (!StatementClassifier.analyzable(kind)) {
+      Schema declared = CommandSchemas.staticSchema(kind);
+      return declared == null ? null : SchemaSerde.serialize(declared);
+    }
+    return orchestrator.analyzeSchema(sessionRef(context), user(context), sql);
+  }
 
   private String user(FlightProducer.CallContext context) {
     return sessions.computeIfAbsent(context.peerIdentity(), id -> context.peerIdentity());

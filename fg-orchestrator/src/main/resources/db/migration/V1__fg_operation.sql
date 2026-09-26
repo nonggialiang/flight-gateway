@@ -32,6 +32,15 @@ CREATE TABLE fg_operation (
 CREATE UNIQUE INDEX uq_fg_operation_query_fingerprint
   ON fg_operation (session_ref, sql_hash) WHERE kind = 'QUERY';
 
+-- 在途命令幂等（D19 修正）：PollFlightInfo 每次调用都会 register（无 handle 可辨"同一
+-- 次执行"），COMMAND 若完全无约束会逐 poll 重复执行（慢 DML 每 poll 一次 INSERT）。
+-- 唯一约束只作用于 RUNNING——同 (session, sql) 同时至多一个在途命令：poll 循环期间
+-- register 幂等复用在途行；行终态后索引即释放，下一次执行（显式重发/新 poll 循环）照常
+-- 新行（D19 豁免保留）。已知限制：命令恰在两次 poll 之间终态时，下一 poll 会重执行一次
+-- （边界竞争，非幂等 DML 场景以"至多一次在途"为限的权衡）。
+CREATE UNIQUE INDEX uq_fg_operation_command_inflight
+  ON fg_operation (session_ref, sql_hash) WHERE kind = 'COMMAND' AND status = 'RUNNING';
+
 CREATE INDEX idx_fg_operation_status ON fg_operation (status);
 CREATE INDEX idx_fg_operation_terminal ON fg_operation (terminal_at);
 CREATE INDEX idx_fg_operation_created ON fg_operation (created_at);

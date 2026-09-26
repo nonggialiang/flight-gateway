@@ -61,6 +61,10 @@ final class EndpointsAssembler {
    * PART endpoint（无序集合，客户端可乱序消费）。
    */
   List<FlightEndpoint> endpoints(OperationRow row, ResultManifest manifest) {
+    if (row.kind() == OperationRow.Kind.COMMAND) {
+      // D18：命令结果内联行内（无 manifest/part），恒单 COMMAND 定位票 endpoint
+      return List.of(commandEndpoint(row));
+    }
     if (row.mode() == OperationRow.Mode.HTTPS) {
       List<FlightEndpoint> out = new ArrayList<>();
       for (ResultManifest.Part part : manifest.parts()) {
@@ -85,6 +89,14 @@ final class EndpointsAssembler {
    */
   FlightEndpoint streamEndpoint(OperationRow row) {
     return relayEndpoint(TicketKind.STREAM, row, null);
+  }
+
+  /**
+   * COMMAND 定位 endpoint（D18）：非 SELECT 语句快返/终态共用——票只定位 queryId，
+   * DoGet 按行内 command_result 内联交付（与 mode 无关：命令不经对象存储，无 presign 形态）。
+   */
+  FlightEndpoint commandEndpoint(OperationRow row) {
+    return relayEndpoint(TicketKind.COMMAND, row, null);
   }
 
   /** RELAY PART endpoint：单分片票，分片 index 绑定票内（DoGet 据此定位单个 part 对象）。 */

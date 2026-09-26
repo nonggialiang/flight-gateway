@@ -18,8 +18,8 @@ public record RelayTicket(
     if (kind == TicketKind.PART && (partIndex == null || partIndex < 0)) {
       throw new IllegalArgumentException("PART ticket requires non-negative partIndex");
     }
-    if (kind == TicketKind.STREAM && partIndex != null) {
-      throw new IllegalArgumentException("STREAM ticket must not carry partIndex");
+    if ((kind == TicketKind.STREAM || kind == TicketKind.COMMAND) && partIndex != null) {
+      throw new IllegalArgumentException(kind + " ticket must not carry partIndex");
     }
   }
 

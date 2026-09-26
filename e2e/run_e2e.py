@@ -225,11 +225,14 @@ def parse_endpoint(epb):
     return ticket, locations
 
 
-def poll_terminal(c, sql, max_polls=90):
-    """轮询至终态，返回 (endpoints_raw_bytes, records, qid)。"""
+def poll_terminal(c, sql, max_polls=90, extra_headers=()):
+    """轮询至终态，返回 (endpoints_raw_bytes, records, qid)。
+
+    extra_headers：注册期协商头透传（D15 模式协商等），如
+    ("x-fg-endpoint-mode", "https")——https 用例自包含，无需网关特殊启动。"""
     import grpc
     ch = grpc.insecure_channel("localhost:32010")
-    md = ((c.headers[0][0].decode(), c.headers[0][1].decode()),)
+    md = ((c.headers[0][0].decode(), c.headers[0][1].decode()),) + tuple(extra_headers)
     any_msg = f_string(1, TYPE_QUERY) + f_bytes(2, f_string(1, sql))
     descriptor = varint((1 << 3) | 0) + varint(2) + f_bytes(2, any_msg)
     poll = ch.unary_unary("/arrow.flight.protocol.FlightService/PollFlightInfo",
@@ -255,10 +258,104 @@ def poll_terminal(c, sql, max_polls=90):
     return endpoints, records, qid
 
 
+# ---------------- 非 SELECT 命令（D17/D18：SET/SHOW/DESCRIBE/EXPLAIN/USE/DDL/DML） ----------------
+
+def command_run(c, sql, max_polls=90):
+    """命令通用通道：PollFlightInfo 至终态（单 COMMAND 定位票 endpoint）→ DoGet 行内结果。"""
+    endpoints, _, qid = poll_terminal(c, sql, max_polls)
+    assert len(endpoints) == 1, f"[cmd] 期望单 COMMAND endpoint，实得 {len(endpoints)}"
+    ticket, locations = parse_endpoint(endpoints[0])
+    assert ticket is not None and all(not u.startswith("http") for u in locations), \
+        "[cmd] COMMAND 定位票 + reuseConnection 期望"
+    table = c.do_get(fl.Ticket(ticket)).read_all()
+    print(f"[cmd] {sql[:64]} -> rows={table.num_rows} cols={table.column_names} queryId={qid[:8]}...")
+    return table
+
+
+def cmd_set(c):
+    t = command_run(c, "SET spark.sql.adaptive.enabled=true")
+    assert t.column_names == ["key", "value"], f"[set] cols={t.column_names}"
+    assert t.num_rows == 1, f"[set] rows={t.num_rows}"
+    d = t.to_pylist()[0]
+    assert d["key"] == "spark.sql.adaptive.enabled" and str(d["value"]).lower() == "true", d
+    print("[set] PASS")
+
+
+def cmd_show(c):
+    t = command_run(c, "SHOW DATABASES")
+    assert t.num_rows >= 1 and len(t.column_names) >= 1, f"[show-db] rows={t.num_rows}"
+    t2 = command_run(c, "SHOW TABLES")
+    # 零行结果仍须宣告非空 schema（Dremio 式客户端兼容）
+    assert len(t2.column_names) >= 1, f"[show-tables] 空 schema：{t2.column_names}"
+    print(f"[show] PASS（SHOW TABLES rows={t2.num_rows} schema={t2.column_names}）")
+
+
+def cmd_explain(c):
+    t = command_run(c, "EXPLAIN SELECT 1")
+    assert t.num_rows == 1 and len(t.column_names) >= 1, f"[explain] rows={t.num_rows}"
+    print("[explain] PASS")
+
+
+def cmd_describe(c):
+    # 无 USING 的 CREATE TABLE(col ...) 是 Hive 语法，in-memory catalog 拒收
+    #（NOT_SUPPORTED_COMMAND_WITHOUT_HIVE_SUPPORT）——用 datasource 表
+    command_run(c, "CREATE TABLE IF NOT EXISTS fg_e2e_describe_t (id BIGINT) USING PARQUET")
+    t = command_run(c, "DESCRIBE TABLE fg_e2e_describe_t")
+    assert t.num_rows >= 1, f"[describe] rows={t.num_rows}"
+    assert "id" in [r.get("col_name") for r in t.to_pylist()], t.to_pylist()
+    command_run(c, "DROP TABLE IF EXISTS fg_e2e_describe_t")
+    print("[describe] PASS")
+
+
+def cmd_ddl_dml(c):
+    command_run(c, "DROP TABLE IF EXISTS fg_e2e_t")
+    t = command_run(c, "CREATE TABLE fg_e2e_t (id BIGINT) USING PARQUET")
+    # DDL 交付合成 [ok] schema、0 行（Spark 对 DDL 无行产出；不伪造数据行）
+    assert t.column_names == ["ok"], \
+        f"[ddl] DDL 交付 [ok] 期望，实得 cols={t.column_names} rows={t.num_rows}"
+    t = command_run(c, "INSERT INTO fg_e2e_t SELECT id FROM range(10)")
+    # D18 风险③ pin 实际形状：SQL-text 路径 + V1 in-memory catalog 的 INSERT 无行产出
+    #（num_affected_rows 仅 V2 write path 有）——交付回退 [ok]/0 行；写效应由下方 count 证明。
+    # V2 catalog 接入后此处会变成 [num_affected_rows[,num_inserted_rows]] 1 行，故条件断言。
+    affected = {r[k] for r in t.to_pylist() for k in r if k and "affected" in k}
+    assert len(t.column_names) >= 1 and t.num_rows <= 1, \
+        f"[dml] 实得 cols={t.column_names} rows={t.num_rows} {t.to_pylist()}"
+    assert not affected or affected == {10}, f"[dml] affected={affected}"
+    print(f"[ddl-dml] INSERT 实际 schema={t.column_names} rows={t.num_rows}（终态以实际覆盖静态宣告）")
+    # 查询路径回归同一张表：poll 主链路取数
+    poll_flight_info(c, "SELECT count(*) AS n FROM fg_e2e_t", 1)
+    command_run(c, "DROP TABLE fg_e2e_t")
+    print("[ddl-dml] PASS")
+
+
+def cmd_ddl_dml_idem(c):
+    # 用独立表名：psql 行数断言按 sql_text 精确匹配，勿与 ddl-dml 案例共用 SQL 文本
+    # （用例间虽按 runbook TRUNCATE，此处自防御）
+    command_run(c, "DROP TABLE IF EXISTS fg_e2e_idem_t")
+    command_run(c, "CREATE TABLE fg_e2e_idem_t (id BIGINT) USING PARQUET")
+    sql = "INSERT INTO fg_e2e_idem_t SELECT id FROM range(10)"
+    for i in range(2):
+        t = command_run(c, sql)
+        # 同 ddl-dml：V1 INSERT 无行产出（[ok]/0 行）；幂等豁免断言看 op 行数，不看交付形状
+        assert len(t.column_names) >= 1 and t.num_rows <= 1, \
+            f"[idem] 第 {i + 1} 次 INSERT: cols={t.column_names} rows={t.num_rows}"
+    command_run(c, "DROP TABLE fg_e2e_idem_t")
+    # D19 幂等豁免实证：同会话同 SQL 的 COMMAND 各自成行（QUERY 才有指纹去重）
+    import subprocess
+    out = subprocess.run(
+        ["docker", "exec", "fg-pg", "psql", "-U", "fg", "-d", "flightgateway", "-tAc",
+         f"SELECT count(*) FROM fg_operation WHERE kind='COMMAND' AND sql_text='{sql}'"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "2", f"[idem] 幂等豁免断言失败：op 行数 {out} != 2"
+    print("[ddl-dml-idem] PASS（同 SQL 两次执行 = 2 行 COMMAND op）")
+
+
 def https_presign(c, sql, expect_rows, do_renew=False):
     import urllib.request
     import pyarrow.ipc
-    endpoints, records, qid = poll_terminal(c, sql)
+    # 自包含模式协商（D15）：注册期头 x-fg-endpoint-mode=https，无需网关以 https 默认启动
+    endpoints, records, qid = poll_terminal(
+        c, sql, extra_headers=(("x-fg-endpoint-mode", "https"),))
     total = 0
     first_ep = endpoints[0] if endpoints else None
     for epb in endpoints:
@@ -315,7 +412,9 @@ def https_order_by(c):
     """H4（https 侧）：ORDER BY → 写端 coalesce(1) 单 part → 终态恰 1 个 presigned endpoint，行序保持。"""
     import urllib.request
     import pyarrow.ipc
-    endpoints, records, qid = poll_terminal(c, "SELECT id FROM range(5000) ORDER BY id")
+    endpoints, records, qid = poll_terminal(
+        c, "SELECT id FROM range(5000) ORDER BY id",
+        extra_headers=(("x-fg-endpoint-mode", "https"),))
     assert len(endpoints) == 1, f"H4 violated: {len(endpoints)} endpoints for ORDER BY in https mode"
     ticket, locations = parse_endpoint(endpoints[0])
     assert ticket is None and len(locations) == 1
@@ -479,5 +578,26 @@ if __name__ == "__main__":
         # 400M join 指纹（同 fg 用户）——用例间必须 TRUNCATE fg_operation，否则命中
         # 上一例的终态行（如 CANCELLED）得到假结果；另勿并行跑（local[2] 引擎会饱和）
         cancel_inflight(c, "SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")
+    # ---------------- D17/D18 命令族（set/show/explain/describe/ddl-dml/ddl-dml-idem） ----------------
+    elif which == "set":
+        cmd_set(c)
+    elif which == "show":
+        cmd_show(c)
+    elif which == "explain":
+        cmd_explain(c)
+    elif which == "describe":
+        cmd_describe(c)
+    elif which == "ddl-dml":
+        cmd_ddl_dml(c)
+    elif which == "ddl-dml-idem":
+        cmd_ddl_dml_idem(c)
+    elif which == "commands":
+        # 命令族一次性全套（DDL 表自建自清；引擎须跨用例存活——内存 catalog）
+        cmd_set(c)
+        cmd_show(c)
+        cmd_explain(c)
+        cmd_describe(c)
+        cmd_ddl_dml(c)
+        cmd_ddl_dml_idem(c)
     else:
         raise SystemExit(f"unknown case {which}")

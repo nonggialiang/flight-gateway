@@ -149,13 +149,20 @@ class OperationStoreDaoIT {
   }
 
   @Test
-  void commandInsertIsNotFingerprintDeduped() throws Exception {
-    // D19 幂等豁免：同会话同 SQL 的 COMMAND 各自成行（新 queryId），不受 QUERY 部分唯一索引约束
-    OperationRow first = dao.insertCommand(newCommandRow("s-cmd", "INSERT INTO t SELECT 1"));
-    OperationRow second = dao.insertCommand(newCommandRow("s-cmd", "INSERT INTO t SELECT 1"));
-    assertThat(second.queryId()).isNotEqualTo(first.queryId());
-    assertThat(dao.get(first.queryId()).orElseThrow().kind()).isEqualTo(OperationRow.Kind.COMMAND);
-    assertThat(dao.get(second.queryId()).orElseThrow().kind()).isEqualTo(OperationRow.Kind.COMMAND);
+  void commandInsertDedupsInflightAndRerunsAfterTerminal() throws Exception {
+    // D19 修正：在途幂等——同会话同 SQL 的 COMMAND 在 RUNNING 期间 register 复用在途行
+    //（PollFlightInfo 逐次 register 不重触发）；终态后索引释放，新执行照常新行（豁免保留）
+    OperationRow first = dao.insertCommandOrGet(newCommandRow("s-cmd", "INSERT INTO t SELECT 1"));
+    OperationRow second = dao.insertCommandOrGet(newCommandRow("s-cmd", "INSERT INTO t SELECT 1"));
+    assertThat(second.queryId()).isEqualTo(first.queryId()); // RUNNING 复用，不重执行
+    assertThat(dao.getRunningCommand("s-cmd", QueryOrchestrator.sha256("INSERT INTO t SELECT 1"))
+        .orElseThrow().queryId()).isEqualTo(first.queryId());
+
+    // 终态释放：COMPLETED 后同指纹新行（新 queryId，新执行）
+    assertThat(dao.casCompleteCommand(first.queryId(), new byte[] {1}, new byte[] {2})).isTrue();
+    OperationRow rerun = dao.insertCommandOrGet(newCommandRow("s-cmd", "INSERT INTO t SELECT 1"));
+    assertThat(rerun.queryId()).isNotEqualTo(first.queryId());
+
     // getByFingerprint 只看 QUERY（防御）：COMMAND 同名指纹不可见
     assertThat(dao.getByFingerprint("s-cmd", QueryOrchestrator.sha256("INSERT INTO t SELECT 1")))
         .isEmpty();
@@ -165,7 +172,7 @@ class OperationStoreDaoIT {
   void queryAndCommandWithSameFingerprintCoexist() throws Exception {
     String sql = "SET k = v";
     OperationRow query = dao.insertOrGet(newRow("s-mixed", sql)); // kind 列默认 QUERY
-    OperationRow command = dao.insertCommand(newCommandRow("s-mixed", sql));
+    OperationRow command = dao.insertCommandOrGet(newCommandRow("s-mixed", sql));
     assertThat(query.kind()).isEqualTo(OperationRow.Kind.QUERY);
     assertThat(command.kind()).isEqualTo(OperationRow.Kind.COMMAND);
     // QUERY 幂等不受 COMMAND 行影响：同指纹再注册仍命中首行
@@ -175,7 +182,7 @@ class OperationStoreDaoIT {
 
   @Test
   void casCompleteCommandLandsSchemaAndResult() throws Exception {
-    OperationRow row = dao.insertCommand(newCommandRow("s-cmd-res", "SHOW DATABASES"));
+    OperationRow row = dao.insertCommandOrGet(newCommandRow("s-cmd-res", "SHOW DATABASES"));
     byte[] schema = new byte[] {1, 2, 3};
     byte[] ipc = new byte[] {4, 5, 6, 7};
     assertThat(dao.casCompleteCommand(row.queryId(), schema, ipc)).isTrue();
