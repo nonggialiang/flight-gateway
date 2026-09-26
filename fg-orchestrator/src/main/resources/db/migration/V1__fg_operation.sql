@@ -45,13 +45,26 @@ CREATE INDEX idx_fg_operation_status ON fg_operation (status);
 CREATE INDEX idx_fg_operation_terminal ON fg_operation (terminal_at);
 CREATE INDEX idx_fg_operation_created ON fg_operation (created_at);
 
--- fg_session_option 会话选项表（design D20）：Flight SetSessionOptions 通道的持久层——
--- SET 即时命令之外，选项经此表持久，openSession 时注入 GatewaySession.options、Spark kit
--- 按差异重放到 Connect session。
-CREATE TABLE fg_session_option (
-  session_ref  TEXT NOT NULL,
-  key          TEXT NOT NULL,
-  value        TEXT NOT NULL,
-  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (session_ref, key)
+-- fg_session 会话登记表（design D20 生命周期绑定）：fg 会话 ↔ 引擎 Connect 会话一一对应，
+-- 化身（connect_session_id）由本表唯一裁决（网关不再确定性派生）。生命周期：
+--   born（首次接触：无身份请求铸 cookie / x-fg-session-id 自报）→ ACTIVE
+--   → CLOSED（client 显式关闭 | engine_lost：attach 校验发现引擎侧会话已死）
+-- CLOSED 为终态且 sticky——不复活、不翻新；客户端必须换新会话身份（重连取新 cookie /
+-- 轮换 x-fg-session-id）。会话选项不落盘（值在引擎会话 conf，随会话生灭），本表仅登记
+-- option_keys 供 GetSessionOptions 回读；engine_ref 记录会话归属引擎（admin 调用定向，
+-- M2 引擎注册表落地前经配置解析地址）。
+CREATE TABLE fg_session (
+  session_ref        TEXT PRIMARY KEY,
+  user_name          TEXT NOT NULL,
+  engine_ref         TEXT NOT NULL,
+  connect_session_id UUID NOT NULL,
+  engine_started_at  BIGINT,
+  option_keys        TEXT[] NOT NULL DEFAULT '{}',
+  status             TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'CLOSED')),
+  closed_reason      TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_active_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at          TIMESTAMPTZ
 );
+
+CREATE INDEX idx_fg_session_status ON fg_session (status);

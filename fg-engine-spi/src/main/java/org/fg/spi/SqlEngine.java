@@ -1,6 +1,9 @@
 package org.fg.spi;
 
 import java.time.Duration;
+import java.util.Collection;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -59,6 +62,32 @@ public interface SqlEngine extends AutoCloseable {
   void releaseExecution(EngineExecutionHandle handle);
 
   EngineCatalog catalog(EngineSession session);
+
+  // ------------------------------------------------------------- 会话生命周期（D20）
+
+  /**
+   * 会话状态/化身校验（D20 生命周期绑定）。实现<b>不得有副作用</b>：不得经普通 Connect
+   * RPC 探测——Spark Connect 收到未知 session_id 的请求会静默重建同 id 会话，探测即污染。
+   * 引擎 kit 应经自带 admin 通道读服务端会话登记。
+   */
+  EngineSessionStatus sessionStatus(EngineSession session) throws Exception;
+
+  /**
+   * 关闭引擎侧会话（客户端 CloseSession → 网关登记 CLOSED 前的引擎侧资源释放：在途执行
+   * 中断 + 会话逐出）。Spark 3.5 协议面无此 RPC，由 kit 经 session-admin 实现；升级 4.x
+   * 后换原生 ReleaseSession，本签名不动。
+   */
+  void closeSession(EngineSession session) throws Exception;
+
+  /**
+   * 会话选项（D20，不落盘——生命周期即引擎会话生命周期）：即时代理到引擎会话 conf。
+   * toSet 批量设；toUnset 清除（Flight SQL SessionOptionValue 空值 = 清除语义）。
+   */
+  void setSessionConf(EngineSession session, Map<String, String> toSet, Set<String> toUnset)
+      throws Exception;
+
+  /** 会话选项回读（GetSessionOptions 用）：keys 为已登记选项键，值实时取引擎会话。 */
+  Map<String, String> getSessionConf(EngineSession session, Collection<String> keys) throws Exception;
 
   /** submit 过程回调（触发实例用）。 */
   interface SubmitListener {

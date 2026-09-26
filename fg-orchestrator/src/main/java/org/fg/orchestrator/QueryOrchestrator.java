@@ -7,8 +7,10 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -20,11 +22,13 @@ import org.fg.common.service.Service;
 import org.fg.common.sql.StatementClassifier;
 import org.fg.orchestrator.store.OperationRow;
 import org.fg.orchestrator.store.OperationStoreDao;
+import org.fg.orchestrator.store.SessionRegistryDao;
 import org.fg.result.manifest.ResultManifest;
 import org.fg.result.store.ObjectStoreService;
 import org.fg.spi.CommandOutcome;
 import org.fg.spi.EngineExecutionHandle;
 import org.fg.spi.EngineSession;
+import org.fg.spi.EngineSessionStatus;
 import org.fg.spi.ExecutionOutcome;
 import org.fg.spi.GatewaySession;
 import org.fg.spi.MaterializationSpec;
@@ -52,6 +56,7 @@ public class QueryOrchestrator implements Service {
   public static final String SESSION_USER_KEY = "user";
 
   private final OperationStoreDao dao;
+  private final SessionRegistryDao sessions;
   private final SqlEngine engine;
   private final ObjectStoreService objects;
   private final GatewayConfig config;
@@ -64,11 +69,13 @@ public class QueryOrchestrator implements Service {
 
   public QueryOrchestrator(
       OperationStoreDao dao,
+      SessionRegistryDao sessions,
       SqlEngine engine,
       ObjectStoreService objects,
       GatewayConfig config,
       ExecutorService controlExecutor) {
     this.dao = dao;
+    this.sessions = sessions;
     this.engine = engine;
     this.objects = objects;
     this.config = config;
@@ -93,6 +100,119 @@ public class QueryOrchestrator implements Service {
     activeAttaches.clear();
   }
 
+  // ------------------------------------------------------------- 会话生命周期（D20）
+
+  /** 会话已关闭（终态 sticky）：客户端须换新会话身份（重连取新 cookie / 轮换 x-fg-session-id）。 */
+  public static final class SessionClosedException extends RuntimeException {
+    public final String reason; // client | engine_lost
+
+    public SessionClosedException(String reason) {
+      super("Session closed (" + reason + "); re-establish session"
+          + ("engine_lost".equals(reason) ? " — engine-side session is gone (evicted/restarted)" : ""));
+      this.reason = reason;
+    }
+  }
+
+  /**
+   * 会话解析（D20 生命周期绑定，所有客户端入口 RPC 必经）：born-or-get 登记 → CLOSED 即拒
+   * （sticky）→ 化身校验（engine_started_at 已锚定者比对引擎侧 status：!alive 或 startedAt
+   * 不符 = 引擎侧已死/转世 → markClosed(engine_lost) 即拒；未锚定者不校验——首个真实
+   * Connect RPC 才会让引擎侧会话诞生，且一旦 alive 即锚定）。touch 活跃度。
+   *
+   * <p>校验成本 = 每次 RPC 一次 engine admin 查询（kit 内实现，无 Connect 副作用）；poll
+   * 续轮不走此处（操作已在途，会话状态与其无关）。
+   */
+  private GatewaySession resolveSession(String sessionRef, String user) throws Exception {
+    SessionRegistryDao.SessionRow row = sessions.bornOrGet(sessionRef, user, engine.type()).row();
+    if (row.status() == SessionRegistryDao.Status.CLOSED) {
+      throw new SessionClosedException(row.closedReason() == null ? "client" : row.closedReason());
+    }
+    GatewaySession ctx = new GatewaySession(sessionRef, user, row.connectSessionId());
+    if (row.engineStartedAt() != null) {
+      EngineSessionStatus st = engine.sessionStatus(engine.openSession(ctx));
+      if (!st.alive() || st.engineStartedAt() != row.engineStartedAt()) {
+        sessions.markClosed(sessionRef, "engine_lost");
+        logger.warn("Session {} engine-side gone (alive={} latched={} actual={})",
+            sessionRef, st.alive(), row.engineStartedAt(), st.engineStartedAt());
+        throw new SessionClosedException("engine_lost");
+      }
+    } else {
+      // 未锚定：alive 即锚定当前化身；!alive 视为尚未与引擎接触（预诞生），放行
+      EngineSessionStatus st = engine.sessionStatus(engine.openSession(ctx));
+      if (st.alive()) {
+        sessions.markEngineStarted(sessionRef, st.engineStartedAt());
+      }
+    }
+    sessions.touch(sessionRef);
+    return ctx;
+  }
+
+  /** 操作续行路径（poll/attach/触发异步体）取会话：只取化身 id，不做生命周期校验。 */
+  private GatewaySession sessionFor(OperationRow row) throws Exception {
+    SessionRegistryDao.SessionRow s =
+        sessions.bornOrGet(row.sessionRef(), row.user(), row.engineRef()).row();
+    return new GatewaySession(row.sessionRef(), row.user(), s.connectSessionId());
+  }
+
+  /**
+   * 化身锚定补针：resolveSession 时引擎会话可能尚未诞生（首个真实 RPC 在其后）——锚定
+   * 推迟到首次引擎接触完成后（QUERY：同步 AnalyzePlan 后；COMMAND：执行终态后）。
+   * 不锚定的窗口内引擎重启会被误判"预诞生"放行（engine_lost 漏检），故必补。
+   */
+  private void latchEngineStarted(String sessionRef, String user) {
+    try {
+      SessionRegistryDao.SessionRow row = sessions.get(sessionRef).orElse(null);
+      if (row == null || row.status() != SessionRegistryDao.Status.ACTIVE
+          || row.engineStartedAt() != null) {
+        return;
+      }
+      EngineSessionStatus st =
+          engine.sessionStatus(
+              engine.openSession(new GatewaySession(sessionRef, user, row.connectSessionId())));
+      if (st.alive()) {
+        sessions.markEngineStarted(sessionRef, st.engineStartedAt());
+      }
+    } catch (Exception e) {
+      logger.debug("Engine-started latch skipped for {}: {}", sessionRef, e.toString());
+    }
+  }
+
+  /**
+   * SetSessionOptions（D20 不落盘）：即时代理到引擎会话 conf；option_keys 登记仅供
+   * {@link #getSessionOptions} 回读。空值清除（unset）正合 Flight SQL SessionOptionValue 语义。
+   */
+  public void applySessionOptions(
+      String sessionRef, String user, Map<String, String> toSet, Set<String> toUnset)
+      throws Exception {
+    GatewaySession ctx = resolveSession(sessionRef, user);
+    engine.setSessionConf(engine.openSession(ctx), toSet, toUnset);
+    sessions.mergeOptionKeys(sessionRef, toSet.keySet(), toUnset);
+  }
+
+  /** GetSessionOptions：已登记键，值实时取引擎会话（会话死即无值——键随 CLOSED 行留存但读不出）。 */
+  public Map<String, String> getSessionOptions(String sessionRef, String user) throws Exception {
+    GatewaySession ctx = resolveSession(sessionRef, user);
+    List<String> keys =
+        sessions.get(sessionRef).map(SessionRegistryDao.SessionRow::optionKeys).orElse(List.of());
+    if (keys.isEmpty()) {
+      return Map.of();
+    }
+    return engine.getSessionConf(engine.openSession(ctx), keys);
+  }
+
+  /** CloseSession（客户端显式关闭）：引擎侧释放（在途执行中断 + 会话逐出）→ 行 CLOSED(client)。 */
+  public void closeSession(String sessionRef, String user) throws Exception {
+    SessionRegistryDao.SessionRow row = sessions.get(sessionRef).orElse(null);
+    if (row == null || row.status() == SessionRegistryDao.Status.CLOSED) {
+      return; // 未知会话无物可关；幂等
+    }
+    engine.closeSession(
+        engine.openSession(new GatewaySession(sessionRef, user, row.connectSessionId())));
+    sessions.markClosed(sessionRef, "client");
+    logger.info("Session {} closed by client (connect session {} released)",
+        sessionRef, row.connectSessionId());
+  }
+
   // ------------------------------------------------------------- 注册 + 触发
 
   /**
@@ -109,9 +229,10 @@ public class QueryOrchestrator implements Service {
    */
   public Registration register(String sessionRef, String user, String sql, OperationRow.Mode mode)
       throws Exception {
+    GatewaySession ctx = resolveSession(sessionRef, user); // D20：入口必经（CLOSED sticky 即拒）
     StatementClassifier.Kind stmtKind = StatementClassifier.classify(sql);
     if (stmtKind != StatementClassifier.Kind.QUERY) {
-      return registerCommand(sessionRef, user, sql, mode, stmtKind);
+      return registerCommand(ctx, sql, mode, stmtKind);
     }
 
     String sqlHash = sha256(sql);
@@ -121,8 +242,8 @@ public class QueryOrchestrator implements Service {
     }
 
     Duration prepareTimeout = Duration.ofMillis(config.getDurationMs("fg.query.prepare.timeout"));
-    EngineSession session = engine.openSession(new GatewaySession(sessionRef, user, Map.of()));
-    Schema schema = engine.analyzeSchema(session, sql, prepareTimeout);
+    Schema schema = engine.analyzeSchema(engine.openSession(ctx), sql, prepareTimeout);
+    latchEngineStarted(ctx.sessionId(), ctx.user()); // 引擎会话已随 AnalyzePlan 诞生
 
     String queryId = QueryIdHolder.newQueryId();
     String resultKeyPrefix =
@@ -154,14 +275,13 @@ public class QueryOrchestrator implements Service {
    * resultKeyPrefix 置空串（无物化对象）；随即 triggerCommand 持流执行。
    */
   private Registration registerCommand(
-      String sessionRef, String user, String sql, OperationRow.Mode mode,
+      GatewaySession ctx, String sql, OperationRow.Mode mode,
       StatementClassifier.Kind stmtKind) throws Exception {
     byte[] schemaBytes;
     Schema declared = null;
     if (StatementClassifier.analyzable(stmtKind)) {
       Duration prepareTimeout = Duration.ofMillis(config.getDurationMs("fg.query.prepare.timeout"));
-      EngineSession session = engine.openSession(new GatewaySession(sessionRef, user, Map.of()));
-      declared = engine.analyzeSchema(session, sql, prepareTimeout);
+      declared = engine.analyzeSchema(engine.openSession(ctx), sql, prepareTimeout);
     }
     if (declared == null) {
       declared = CommandSchemas.staticSchema(stmtKind);
@@ -175,9 +295,9 @@ public class QueryOrchestrator implements Service {
     OperationRow row =
         new OperationRow()
             .queryId(queryId)
-            .sessionRef(sessionRef)
+            .sessionRef(ctx.sessionId())
             .sqlHash(sha256(sql)) // 仍存指纹（排查/展示用），不再参与唯一约束
-            .user(user)
+            .user(ctx.user())
             .sqlText(sql)
             .resultKeyPrefix("") // 命令无物化对象
             .mode(mode)
@@ -218,6 +338,7 @@ public class QueryOrchestrator implements Service {
             executed.whenComplete(
                 (outcome, err) -> {
                   try {
+                    latchEngineStarted(row.sessionRef(), row.user()); // 引擎会话已随执行诞生
                     if (err != null) {
                       dao.casFail(row.queryId(), "command submit failed: " + err);
                       return;
@@ -255,9 +376,8 @@ public class QueryOrchestrator implements Service {
    */
   public byte[] analyzeSchema(String sessionRef, String user, String sql) throws Exception {
     Duration prepareTimeout = Duration.ofMillis(config.getDurationMs("fg.query.prepare.timeout"));
-    // engine session 缓存策略与 triggerExecution 同款，后续按需增强
-    EngineSession session = engine.openSession(new GatewaySession(sessionRef, user, Map.of()));
-    Schema schema = engine.analyzeSchema(session, sql, prepareTimeout);
+    GatewaySession ctx = resolveSession(sessionRef, user); // D20：入口必经
+    Schema schema = engine.analyzeSchema(engine.openSession(ctx), sql, prepareTimeout);
     return schema == null ? null : SchemaSerde.serialize(schema);
   }
 
@@ -333,7 +453,8 @@ public class QueryOrchestrator implements Service {
   }
 
   private EngineSession openEngineSession(OperationRow row) throws Exception {
-    return engine.openSession(new GatewaySession(row.sessionRef(), row.user(), Map.of()));
+    // 续行路径（触发异步体/attach）：经登记表取化身 id，不做生命周期校验（操作已在途）
+    return engine.openSession(sessionFor(row));
   }
 
   // ------------------------------------------------------------- poll 长等待

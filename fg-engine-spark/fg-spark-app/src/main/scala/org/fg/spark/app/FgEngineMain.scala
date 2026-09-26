@@ -38,6 +38,11 @@ object FgEngineMain {
 
     val spark = builder.getOrCreate()
 
+    // 会话生命周期管理面（D20）：listener 登记会话化身 + HTTP admin（status/close）
+    FgSessionAdmin.registerListener(spark)
+    FgSessionAdmin.startHttp(
+      prop("fg.engine.admin.port").getOrElse("15003").toInt)
+
     // idle 自杀钩子：fg.engine.idle.timeout（默认 30m）无作业活动即退出（M1 简化为作业级判定）
     val lastActivity = new AtomicLong(System.currentTimeMillis())
     spark.sparkContext.addSparkListener(new SparkListener {

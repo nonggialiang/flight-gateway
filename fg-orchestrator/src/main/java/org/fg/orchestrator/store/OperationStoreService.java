@@ -15,6 +15,7 @@ public final class OperationStoreService implements Service {
 
   private final HikariDataSource dataSource;
   private final OperationStoreDao dao;
+  private final SessionRegistryDao sessionDao;
 
   public OperationStoreService(GatewayConfig config) {
     HikariConfig hikari = new HikariConfig();
@@ -25,6 +26,7 @@ public final class OperationStoreService implements Service {
     hikari.setPoolName("fg-operation-store");
     this.dataSource = new HikariDataSource(hikari);
     this.dao = new OperationStoreDao(dataSource);
+    this.sessionDao = new SessionRegistryDao(dataSource);
   }
 
   @Override
@@ -50,5 +52,10 @@ public final class OperationStoreService implements Service {
 
   public OperationStoreDao dao() {
     return dao;
+  }
+
+  /** fg_session 会话登记 DAO（D20 生命周期绑定）。 */
+  public SessionRegistryDao sessionDao() {
+    return sessionDao;
   }
 }

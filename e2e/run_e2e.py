@@ -93,14 +93,19 @@ class Client:
     需自行经 FlightCallOptions 附到每个调用；grpcio 直打（PollFlightInfo）同用此头。
     历史：曾走 auth1 Handshake（BasicAuth 载荷 → auth-token-bin 头）——arrow-java 的
     Handshake RPC 只经 auth1 ServerAuthHandler，与 JDBC 驱动所需的 auth2 互斥，
-    网关已统一 auth2（见 FgFlightService）。"""
+    网关已统一 auth2（见 FgFlightService）。
 
-    def __init__(self):
+    D20 会话身份：无 cookie 能力 → 自报 x-fg-session-id 头（每进程随机；sid= 参数
+    可显式指定，session-lifecycle 用例轮换/复用）；closed 后须换 id 重建。"""
+
+    def __init__(self, sid=None):
+        import uuid
+        self.session_id = sid or str(uuid.uuid4())
         self.fc = fl.FlightClient(GW)
         self.token = self.fc.authenticate_basic_token(USER, PASSWORD)
         assert self.token[0] == b"authorization" and self.token[1].startswith(b"Bearer "), \
             f"unexpected token header: {self.token!r}"
-        self.headers = [self.token]
+        self.headers = [self.token, (b"x-fg-session-id", self.session_id.encode())]
         self.opts = fl.FlightCallOptions(headers=self.headers, timeout=600)
 
     def get_flight_info(self, descr):
@@ -144,8 +149,8 @@ def poll_flight_info(c, sql, expect_rows, max_polls=90,
     import grpc
 
     ch = grpc.insecure_channel("localhost:32010")
-    # auth2：复用 Client 的 Authorization Basic 头
-    md = ((c.headers[0][0].decode(), c.headers[0][1].decode()),)
+    # auth2 + D20 会话身份：复用 Client 全部头（Authorization + x-fg-session-id）
+    md = tuple((k.decode(), v.decode()) for k, v in c.headers)
 
     # 2) PollFlightInfo：请求体直接是 FlightDescriptor{descriptor_type=1:CMD(2), command=2:Any}
     any_msg = f_string(1, TYPE_QUERY) + f_bytes(2, f_string(1, sql))
@@ -232,7 +237,7 @@ def poll_terminal(c, sql, max_polls=90, extra_headers=()):
     ("x-fg-endpoint-mode", "https")——https 用例自包含，无需网关特殊启动。"""
     import grpc
     ch = grpc.insecure_channel("localhost:32010")
-    md = ((c.headers[0][0].decode(), c.headers[0][1].decode()),) + tuple(extra_headers)
+    md = tuple((k.decode(), v.decode()) for k, v in c.headers) + tuple(extra_headers)
     any_msg = f_string(1, TYPE_QUERY) + f_bytes(2, f_string(1, sql))
     descriptor = varint((1 << 3) | 0) + varint(2) + f_bytes(2, any_msg)
     poll = ch.unary_unary("/arrow.flight.protocol.FlightService/PollFlightInfo",
@@ -348,6 +353,108 @@ def cmd_ddl_dml_idem(c):
         capture_output=True, text=True, check=True).stdout.strip()
     assert out == "2", f"[idem] 幂等豁免断言失败：op 行数 {out} != 2"
     print("[ddl-dml-idem] PASS（同 SQL 两次执行 = 2 行 COMMAND op）")
+
+
+# ---------------- D20 会话选项 / 生命周期（SetSessionOptions/GetSessionOptions/CloseSession） ----------------
+
+def set_session_options_body(options):
+    """SetSessionOptionsRequest{map<string,SessionOptionValue> session_options=1} 手工编码。
+
+    map 在 wire 上 = repeated entry（字段号 1），entry{key=1 string, value=2 message}；
+    SessionOptionValue oneof：string_value=1（本用例只用 string；空值 = 全 oneof 缺席 = 清除）。"""
+    out = b""
+    for k, v in options.items():
+        value = b"" if v is None else f_string(1, v)  # None → empty SessionOptionValue = unset
+        out += f_bytes(1, f_string(1, k) + f_bytes(2, value))
+    return out
+
+
+def get_session_options(c):
+    """GetSessionOptions DoAction → dict{key: string_value}（经引擎会话实时回读）。"""
+    results = list(c.do_action(fl.Action("GetSessionOptions", b"")))
+    assert results, "GetSessionOptions returned no result"
+    opts = {}
+    for f1, w, entry in walk(results[0].body.to_pybytes()):
+        if f1 != 1:
+            continue
+        key, val = None, None
+        for f2, w2, v2 in walk(entry):
+            if f2 == 1:
+                key = v2.decode()
+            elif f2 == 2:  # SessionOptionValue
+                for f3, w3, v3 in walk(v2):
+                    if f3 == 1:
+                        val = v3.decode()  # string_value
+        if key is not None:
+            opts[key] = val
+    return opts
+
+
+def session_set_action(c):
+    """SetSessionOptions 通道闭环：set → GetSessionOptions 回读 + 引擎侧生效（SET SQL 佐证）
+    + fg_session.option_keys 登记 + 空值清除（unset）。值不落盘（D20：随会话生灭）。"""
+    key = "spark.sql.adaptive.enabled"
+    c2 = Client()  # 独立会话，勿污染其他用例的引擎会话 conf
+    list(c2.do_action(fl.Action("SetSessionOptions", set_session_options_body({key: "false"}))))
+
+    got = get_session_options(c2)
+    assert got.get(key) == "false", f"[set-action] GetSessionOptions 回读 {got}"
+    # 引擎会话实际生效：SET SQL（命令通道）读当前 conf
+    t = command_run(c2, f"SET {key}")
+    d = t.to_pylist()[0]
+    assert str(d.get("value")).lower() == "false", f"[set-action] 引擎侧未生效: {d}"
+
+    import subprocess
+    out = subprocess.run(
+        ["docker", "exec", "fg-pg", "psql", "-U", "fg", "-d", "flightgateway", "-tAc",
+         f"SELECT option_keys FROM fg_session WHERE session_ref='{c2.session_id}'"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    assert key in out, f"[set-action] option_keys 未登记: {out}"
+
+    # 空值清除（Flight SQL empty = unset）：回读消失，引擎侧回默认 true
+    list(c2.do_action(fl.Action("SetSessionOptions", set_session_options_body({key: None}))))
+    got = get_session_options(c2)
+    assert key not in got, f"[set-action] unset 后仍回读 {got}"
+    t = command_run(c2, f"SET {key}")
+    assert str(t.to_pylist()[0].get("value")).lower() == "true", "[set-action] unset 未回默认"
+    print("[set-action] PASS（set/回读/引擎生效/登记/unset）")
+
+
+def session_lifecycle(c):
+    """CloseSession 生命周期绑定：关 → 引擎侧会话逐出 → 同 id 再来即拒（sticky，engineLost
+    同理由 admin 化身校验触发）；客户端轮换 x-fg-session-id 重建。"""
+    import subprocess
+    sid = f"fg-e2e-lc-{int(time.time())}"
+    a = Client(sid=sid)
+    legacy_get_flight_info(a, "SELECT id FROM range(10)", 10)
+
+    # 关闭：CloseSessionRequest 为空消息 → 结果 CloseSessionResult{status=1 CLOSED}
+    results = list(a.do_action(fl.Action("CloseSession", b"")))
+    assert results, "CloseSession returned no result"
+    status = next((v for f, w, v in walk(results[0].body.to_pybytes()) if f == 1), None)
+    print(f"[lifecycle] CloseSession status={status}")
+    assert status == 1, f"expected CLOSED(1), got {status}"
+
+    # 同 id 再来：sticky 拒绝（INVALID_ARGUMENT "Session closed"）
+    err = None
+    try:
+        a.get_flight_info(command_descriptor("SELECT id FROM range(10)"))
+    except Exception as e:
+        err = e
+    assert err is not None and "Session closed" in str(err), \
+        f"[lifecycle] closed 会话未拒: {type(err).__name__}: {err}"
+
+    row = subprocess.run(
+        ["docker", "exec", "fg-pg", "psql", "-U", "fg", "-d", "flightgateway", "-tAc",
+         f"SELECT status || '/' || coalesce(closed_reason,'') FROM fg_session"
+         f" WHERE session_ref='{sid}'"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    assert row == "CLOSED/client", f"[lifecycle] fg_session 行 {row}"
+
+    # 轮换 id 重建（客户端主导，无服务端复活）
+    b = Client(sid=sid + "-r2")
+    legacy_get_flight_info(b, "SELECT id FROM range(10)", 10)
+    print("[lifecycle] PASS（close → sticky 拒 → 轮换重建）")
 
 
 def https_presign(c, sql, expect_rows, do_renew=False):
@@ -599,5 +706,10 @@ if __name__ == "__main__":
         cmd_describe(c)
         cmd_ddl_dml(c)
         cmd_ddl_dml_idem(c)
+    # ---------------- D20 会话选项 / 生命周期 ----------------
+    elif which == "set-action":
+        session_set_action(c)
+    elif which == "session-lifecycle":
+        session_lifecycle(c)
     else:
         raise SystemExit(f"unknown case {which}")

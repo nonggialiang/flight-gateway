@@ -3,20 +3,33 @@ package org.fg.frontend;
 import com.google.protobuf.Any;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.CancelFlightInfoRequest;
 import org.apache.arrow.flight.CancelStatus;
+import org.apache.arrow.flight.CloseSessionRequest;
+import org.apache.arrow.flight.CloseSessionResult;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightProducer;
 import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.FlightStream;
+import org.apache.arrow.flight.GetSessionOptionsRequest;
+import org.apache.arrow.flight.GetSessionOptionsResult;
 import org.apache.arrow.flight.PollInfo;
 import org.apache.arrow.flight.RenewFlightEndpointRequest;
+import org.apache.arrow.flight.SessionOptionValue;
+import org.apache.arrow.flight.SessionOptionValueVisitor;
+import org.apache.arrow.flight.SessionOptionValueFactory;
+import org.apache.arrow.flight.SetSessionOptionsRequest;
+import org.apache.arrow.flight.SetSessionOptionsResult;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.flight.sql.NoOpFlightSqlProducer;
 import org.apache.arrow.flight.sql.impl.FlightSql;
@@ -488,6 +501,106 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     }
   }
 
+  // ------------------------------------------------------------- 会话选项 / 生命周期（D20）
+
+  /** SetSessionOptions：值转字符串即时代理到引擎会话 conf（不落盘）；空值 = 清除（UNSET）。 */
+  @Override
+  public void setSessionOptions(
+      SetSessionOptionsRequest request,
+      FlightProducer.CallContext context,
+      FlightProducer.StreamListener<SetSessionOptionsResult> listener) {
+    Map<String, String> toSet = new LinkedHashMap<>();
+    Set<String> toUnset = new java.util.LinkedHashSet<>();
+    for (Map.Entry<String, SessionOptionValue> e : request.getSessionOptions().entrySet()) {
+      String value = stringify(e.getValue());
+      if (value == null) {
+        toUnset.add(e.getKey()); // Flight SQL 语义：空值清除该选项
+      } else {
+        toSet.put(e.getKey(), value);
+      }
+    }
+    try {
+      orchestrator.applySessionOptions(sessionRef(context), user(context), toSet, toUnset);
+      listener.onNext(new SetSessionOptionsResult(Map.of()));
+      listener.onCompleted();
+    } catch (QueryOrchestrator.SessionClosedException e) {
+      listener.onError(invalid(e.getMessage()));
+    } catch (Exception e) {
+      listener.onError(invalid("SetSessionOptions failed: " + e.getMessage()));
+    }
+  }
+
+  /** GetSessionOptions：已登记键 + 引擎会话实时值（回读即 *DBC round-trip 验证面）。 */
+  @Override
+  public void getSessionOptions(
+      GetSessionOptionsRequest request,
+      FlightProducer.CallContext context,
+      FlightProducer.StreamListener<GetSessionOptionsResult> listener) {
+    try {
+      Map<String, String> options =
+          orchestrator.getSessionOptions(sessionRef(context), user(context));
+      Map<String, SessionOptionValue> values = new HashMap<>();
+      options.forEach((k, v) -> values.put(k, SessionOptionValueFactory.makeSessionOptionValue(v)));
+      listener.onNext(new GetSessionOptionsResult(values));
+      listener.onCompleted();
+    } catch (QueryOrchestrator.SessionClosedException e) {
+      listener.onError(invalid(e.getMessage()));
+    } catch (Exception e) {
+      listener.onError(invalid("GetSessionOptions failed: " + e.getMessage()));
+    }
+  }
+
+  /** CloseSession：引擎侧会话释放（在途中断 + 逐出）→ fg_session CLOSED(client) sticky。 */
+  @Override
+  public void closeSession(
+      CloseSessionRequest request,
+      FlightProducer.CallContext context,
+      FlightProducer.StreamListener<CloseSessionResult> listener) {
+    try {
+      orchestrator.closeSession(sessionRef(context), user(context));
+      listener.onNext(new CloseSessionResult(CloseSessionResult.Status.CLOSED));
+      listener.onCompleted();
+    } catch (Exception e) {
+      listener.onError(invalid("CloseSession failed: " + e.getMessage()));
+    }
+  }
+
+  /** SessionOptionValue → String（*DBC 驱动兼容面：string/bool/long/double/string[] 全收敛）。 */
+  private static String stringify(SessionOptionValue value) {
+    return value.acceptVisitor(
+        new SessionOptionValueVisitor<String>() {
+          @Override
+          public String visit(String v) {
+            return v;
+          }
+
+          @Override
+          public String visit(boolean v) {
+            return Boolean.toString(v);
+          }
+
+          @Override
+          public String visit(long v) {
+            return Long.toString(v);
+          }
+
+          @Override
+          public String visit(double v) {
+            return Double.toString(v);
+          }
+
+          @Override
+          public String visit(String[] v) {
+            return String.join(",", v);
+          }
+
+          @Override
+          public String visit(Void v) {
+            return null; // empty = 清除
+          }
+        });
+  }
+
   // ------------------------------------------------------------- helpers
 
   /**
@@ -510,24 +623,34 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   }
 
   private String sessionRef(FlightProducer.CallContext context) {
-    // per-connection 会话（原 M3 "cookie 双轨" 提前到 M1.5）：一个客户端连接 =
-    // 一个 fg 会话 = 一个 Connect session = 引擎侧一个 SparkSession。三级解析：
-    //   ① cookie 会话（JDBC/ADBC 等带 cookie jar 的客户端；arrow_flight_session_id
-    //     由 ServerSessionMiddleware 绑定，SetSessionOptions 等类型化入口触发）；
-    //   ② Authorization 头派生（无 cookie 客户端兜底：Bearer token 每连接一次握手、
-    //     连接内稳定；Basic 直发退化场景同值稳定）——sha256 前缀，凭证材料不落库；
-    //   ③ peerIdentity 兜底（auth2-only 下必带 Authorization 头，理论不可达）。
-    // fingerprint 幂等语义随之变为"同连接同 SQL 不重复执行"（跨连接本就不该共享）。
+    // D20 会话身份（每个会话都受生命周期绑定，无未绑定兜底）：
+    //   ① cookie 会话（arrow_flight_session_id 由 ServerSessionMiddleware 绑定；JDBC 等
+    //     内建 cookie jar 的客户端粘住）；
+    //   ② x-fg-session-id 自报头（无 cookie 能力客户端：pyarrow FlightCallOptions /
+    //     ADBC call_header 连接选项）——closed 后客户端自行轮换 id 重建会话；
+    //   ③ 两者皆无 → getSession() 铸造 cookie 会话（mint-on-first-contact + Set-Cookie）。
+    //     不存 cookie 又不发头的非合规客户端每请求开一个新绑定会话——行为退化但语义完整
+    //     （fg_session 可见），协议要求客户端携带身份。
     org.apache.arrow.flight.ServerSessionMiddleware session =
         context.getMiddleware(SESSION_MIDDLEWARE_KEY);
-    if (session != null && session.hasSession()) {
-      return session.getSession().id;
+    if (session != null) {
+      if (session.hasSession()) {
+        return session.getSession().id;
+      }
+      SessionIdMiddleware declared = context.getMiddleware(SessionIdMiddleware.KEY);
+      if (declared != null && declared.sessionId() != null && !declared.sessionId().isBlank()) {
+        return declared.sessionId().trim();
+      }
+      return session.getSession().id; // 铸造 + Set-Cookie
     }
-    AuthHeaderMiddleware auth = context.getMiddleware(AuthHeaderMiddleware.KEY);
-    if (auth != null && auth.authorization() != null && !auth.authorization().isBlank()) {
-      return "auth-" + QueryOrchestrator.sha256(auth.authorization()).substring(0, 16);
+    SessionIdMiddleware declared = context.getMiddleware(SessionIdMiddleware.KEY);
+    if (declared != null && declared.sessionId() != null && !declared.sessionId().isBlank()) {
+      return declared.sessionId().trim();
     }
-    return context.peerIdentity();
+    throw CallStatus.INVALID_ARGUMENT
+        .withDescription("No session identity: carry arrow_flight_session_id cookie"
+            + " (auto on first contact) or x-fg-session-id header")
+        .toRuntimeException();
   }
 
   /**

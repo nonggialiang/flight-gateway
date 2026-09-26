@@ -41,6 +41,7 @@ public final class JdbcClientE2E {
         case "types" -> types(conn);
         case "prepare" -> prepare(conn);
         case "update" -> update(conn);
+        case "set" -> set(conn);
         case "cancel" -> cancel(conn);
         case "cancel-poll" -> cancelPoll(conn);
         default -> throw new IllegalArgumentException("unknown case " + which);
@@ -202,19 +203,47 @@ public final class JdbcClientE2E {
   }
 
   /**
-   * DML 负面（网关 SqlInfo 声明 read-only）：INSERT 走到 prepare 的 plan-only AnalyzePlan
-   * 即刻失败（TABLE_OR_VIEW_NOT_FOUND fail-fast）——断言干净 SQLException 错误面，
-   * 无挂起、无半状态行（外部判据 fg_operation count 不增）。
+   * DDL/DML 正面（D17/D18，SqlInfo 已开 DDL/写）：CREATE/INSERT/DROP 经 executeUpdate，
+   * V1 in-memory catalog 下 INSERT 无行产出（update count=0；num_affected_rows 仅 V2
+   * write path 有——同 python ddl-dml 用例 pin 的实际形状）；写效应由 count(*) 查询证明。
    */
   private static void update(Connection conn) throws Exception {
     long t0 = System.nanoTime();
     try (Statement st = conn.createStatement()) {
-      st.executeUpdate("INSERT INTO nowhere VALUES (1)");
-      throw new AssertionError("[jdbc-update] DML 未按预期失败");
-    } catch (SQLException e) {
-      System.out.printf("[jdbc-update] SQLException: %s%n", firstLine(e.getMessage()));
+      st.executeUpdate("DROP TABLE IF EXISTS fg_e2e_jdbc_t");
+      st.executeUpdate("CREATE TABLE fg_e2e_jdbc_t (id BIGINT) USING PARQUET");
+      int affected = st.executeUpdate("INSERT INTO fg_e2e_jdbc_t SELECT id FROM range(10)");
+      if (affected != 0) {
+        // V2 catalog 接入后这里会变成 10——条件记录，不硬断 0
+        System.out.printf("[jdbc-update] INSERT count=%d（V2 catalog 应为 10）%n", affected);
+      }
+      try (ResultSet rs = st.executeQuery("SELECT count(*) AS n FROM fg_e2e_jdbc_t")) {
+        rs.next();
+        if (rs.getLong(1) != 10) {
+          throw new AssertionError("[jdbc-update] count(*)=" + rs.getLong(1) + " != 10");
+        }
+      }
+      st.executeUpdate("DROP TABLE fg_e2e_jdbc_t");
     }
     System.out.printf("[jdbc-update] PASS (%.1fs)%n", elapsedSec(t0));
+  }
+
+  /** SET 语句经 JDBC（命令通道 D17/D18）：execute 返回 [key,value] 结果集。 */
+  private static void set(Connection conn) throws Exception {
+    long t0 = System.nanoTime();
+    try (Statement st = conn.createStatement()) {
+      boolean hasRs = st.execute("SET spark.sql.adaptive.enabled=true");
+      if (!hasRs) {
+        throw new AssertionError("[jdbc-set] SET 未返回结果集");
+      }
+      try (ResultSet rs = st.getResultSet()) {
+        if (!rs.next()) {
+          throw new AssertionError("[jdbc-set] SET 结果集空");
+        }
+        System.out.printf("[jdbc-set] %s=%s%n", rs.getString(1), rs.getString(2));
+      }
+    }
+    System.out.printf("[jdbc-set] PASS (%.1fs)%n", elapsedSec(t0));
   }
 
   private static String firstLine(String message) {

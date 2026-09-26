@@ -6,6 +6,8 @@ import org.apache.spark.connect.proto._
 import org.fg.common.config.GatewayConfig
 import org.fg.spi._
 
+import scala.jdk.CollectionConverters._
+
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
 
@@ -262,6 +264,110 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
     future
   }
 
+  // ------------------------------------------------------------- 会话生命周期（D20）
+
+  /** 会话管理面 HTTP 客户端（fg-spark-app FgSessionAdmin；主机同 connect.uri）。 */
+  private lazy val adminHttp = java.net.http.HttpClient.newHttpClient()
+  private lazy val adminBase = {
+    val (host, _) = ConnectChannel.parse(config.getString("fg.engine.spark.connect.uri"))
+    s"http://$host:${config.getInt("fg.engine.spark.admin.port")}"
+  }
+  private lazy val confTimeoutMs = config.getDurationMs("fg.query.prepare.timeout")
+
+  /**
+   * 化身校验（无副作用——admin 事件登记查询，不经 Connect RPC：Spark Connect 收到未知
+   * session_id 的请求会静默重建同 id 会话，普通 RPC 探测即污染）。
+   */
+  override def sessionStatus(session: EngineSession): EngineSessionStatus = {
+    val s = session.asInstanceOf[SparkEngineSession]
+    val uri = java.net.URI.create(
+      s"$adminBase/session/status?user=${url(s.user)}&id=${url(s.gatewaySessionId)}")
+    val resp = adminHttp.send(
+      java.net.http.HttpRequest.newBuilder(uri).GET().timeout(
+        java.time.Duration.ofMillis(confTimeoutMs)).build(),
+      java.net.http.HttpResponse.BodyHandlers.ofString())
+    if (resp.statusCode() != 200) {
+      throw new IllegalStateException(s"session admin status ${resp.statusCode()}: ${resp.body()}")
+    }
+    val alive = "\"alive\":true".r.findFirstIn(resp.body()).isDefined
+    val started = "\"startedAt\":(\\d+)".r.findFirstMatchIn(resp.body()).map(_.group(1).toLong).getOrElse(0L)
+    new EngineSessionStatus(alive, started)
+  }
+
+  /** 引擎侧关会话（cache invalidate → removal listener → expireSession 正规清理）。 */
+  override def closeSession(session: EngineSession): Unit = {
+    val s = session.asInstanceOf[SparkEngineSession]
+    val uri = java.net.URI.create(
+      s"$adminBase/session/close?user=${url(s.user)}&id=${url(s.gatewaySessionId)}")
+    val resp = adminHttp.send(
+      java.net.http.HttpRequest.newBuilder(uri).POST(
+        java.net.http.HttpRequest.BodyPublishers.noBody()).timeout(
+        java.time.Duration.ofMillis(confTimeoutMs)).build(),
+      java.net.http.HttpResponse.BodyHandlers.ofString())
+    // 404 = 会话本不在引擎侧（已逐出/重启），关闭语义已达成
+    if (resp.statusCode() != 200 && resp.statusCode() != 404) {
+      throw new IllegalStateException(s"session admin close ${resp.statusCode()}: ${resp.body()}")
+    }
+  }
+
+  /** 会话选项：即时代理到引擎会话 conf（Config RPC；set 与 unset 分请求，operation 单选）。 */
+  override def setSessionConf(
+      session: EngineSession, toSet: java.util.Map[String, String],
+      toUnset: java.util.Set[String]): Unit = {
+    val s = session.asInstanceOf[SparkEngineSession]
+    if (toSet != null && !toSet.isEmpty) {
+      val setOp = ConfigRequest.Operation.newBuilder()
+        .setSet(ConfigRequest.Set.newBuilder()
+          .addAllPairs(toSet.asScala.map { case (k, v) =>
+            KeyValue.newBuilder().setKey(k).setValue(v).build()
+          }.toSeq.asJava)
+          .build())
+        .build()
+      configRpc(s, setOp)
+    }
+    if (toUnset != null && !toUnset.isEmpty) {
+      val unsetOp = ConfigRequest.Operation.newBuilder()
+        .setUnset(ConfigRequest.Unset.newBuilder()
+          .addAllKeys(toUnset.asScala.toSeq.asJava)
+          .build())
+        .build()
+      configRpc(s, unsetOp)
+    }
+  }
+
+  /** 会话选项回读：Config GET（值实时取引擎会话；键不存在即缺席）。 */
+  override def getSessionConf(
+      session: EngineSession, keys: java.util.Collection[String]): java.util.Map[String, String] = {
+    val s = session.asInstanceOf[SparkEngineSession]
+    if (keys == null || keys.isEmpty) return java.util.Map.of()
+    val getOp = ConfigRequest.Operation.newBuilder()
+      .setGet(ConfigRequest.Get.newBuilder()
+        .addAllKeys(keys.asScala.toSeq.asJava)
+        .build())
+      .build()
+    val resp = configRpc(s, getOp)
+    val out = new java.util.LinkedHashMap[String, String]()
+    resp.getPairsList.asScala.foreach(kv => out.put(kv.getKey, kv.getValue))
+    out
+  }
+
+  private def configRpc(s: SparkEngineSession, op: ConfigRequest.Operation): ConfigResponse = {
+    val stub = channel
+      .unaryStub[SparkConnectServiceGrpc.SparkConnectServiceBlockingStub](
+        ch => SparkConnectServiceGrpc.newBlockingStub(ch),
+        s.user, s.gatewaySessionId, confTimeoutMs)
+      .withDeadlineAfter(confTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+    val request = ConfigRequest.newBuilder()
+      .setSessionId(s.gatewaySessionId)
+      .setUserContext(UserContext.newBuilder().setUserId(s.user))
+      .setClientType("fg-gateway")
+      .setOperation(op)
+      .build()
+    stub.config(request)
+  }
+
+  private def url(v: String): String = java.net.URLEncoder.encode(v, "UTF-8")
+
   // ------------------------------------------------------------- attach
 
   override def attach(
@@ -381,17 +487,17 @@ private[client] object SparkEngineClient {
   }
 }
 
-/** Connect 会话：gateway 会话 ↔ Connect session 一一映射。Connect 要求 session_id 为
- * UUID（INVALID_HANDLE.FORMAT 校验），由 gateway 会话引用确定性派生。 */
+/** Connect 会话：gateway 会话 ↔ Connect session 一一映射（D20 生命周期绑定）。会话 id
+ * 由 fg_session 登记表铸造（{@link GatewaySession#connectSessionId}，UUID 满足 Connect
+ * INVALID_HANDLE.FORMAT 校验），不再确定性派生——化身唯一以登记表为准。 */
 final class SparkEngineSession(val ctx: GatewaySession, channel: ConnectChannel)
     extends EngineSession {
   val user: String = ctx.user()
-  val gatewaySessionId: String =
-    java.util.UUID.nameUUIDFromBytes(("fg-" + ctx.sessionId()).getBytes("UTF-8")).toString
+  val gatewaySessionId: String = ctx.connectSessionId()
 
   override def sessionId(): String = gatewaySessionId
 
   override def close(): Unit = {
-    // Connect server 会话由空闲回收；gateway 侧无额外状态
+    // Connect 会话生命周期经 session-admin 显式管理（D20）；此处无 gateway 侧状态
   }
 }

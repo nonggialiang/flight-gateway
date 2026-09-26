@@ -52,7 +52,8 @@ final class GatewayDaemonModule {
     // 6. Orchestrator + 超时护栏
     QueryOrchestrator orchestrator =
         new QueryOrchestrator(
-            operationStore.dao(), engine, objects, config, context.getExecutor());
+            operationStore.dao(), operationStore.sessionDao(), engine, objects, config,
+            context.getExecutor());
     registry.bindSelf(orchestrator);
     registry.bindSelf(new QueryTimeoutSweeper(operationStore.dao(), config));
 
