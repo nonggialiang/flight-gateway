@@ -623,34 +623,41 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   }
 
   private String sessionRef(FlightProducer.CallContext context) {
-    // D20 会话身份（每个会话都受生命周期绑定，无未绑定兜底）：
-    //   ① cookie 会话（arrow_flight_session_id 由 ServerSessionMiddleware 绑定；JDBC 等
-    //     内建 cookie jar 的客户端粘住）；
-    //   ② x-fg-session-id 自报头（无 cookie 能力客户端：pyarrow FlightCallOptions /
-    //     ADBC call_header 连接选项）——closed 后客户端自行轮换 id 重建会话；
-    //   ③ 两者皆无 → getSession() 铸造 cookie 会话（mint-on-first-contact + Set-Cookie）。
-    //     不存 cookie 又不发头的非合规客户端每请求开一个新绑定会话——行为退化但语义完整
-    //     （fg_session 可见），协议要求客户端携带身份。
+    // D20 会话身份（严格模式，fg-p2）：身份一律客户端携带，服务端零铸造——
+    //   ① cookie 会话（arrow_flight_session_id 由 ServerSessionMiddleware 解析；
+    //     供已持有 cookie 的客户端）；
+    //   ② x-fg-session-id 自报头（主通道：FG JDBC 驱动每连接自动生成；pyarrow
+    //     FlightCallOptions / ADBC call_header 连接选项；closed 后客户端轮换 id 重建）。
+    // 解析值必须为 UUID（Connect INVALID_HANDLE.FORMAT 约束前移）——session_ref 即引擎
+    // 会话 id，零映射直传。两者皆无/非 UUID → 拒绝（INVALID_ARGUMENT）。不做
+    // mint-on-first-contact（Dremio 模式）：无 cookie 客户端会逐请求新会话，去重失效/
+    // options 即丢/长查询 poll 不收敛，且与拒绝不可兼得（首请求被拒则永远拿不到
+    // Set-Cookie）——故统一要求自报 UUID 身份。
     org.apache.arrow.flight.ServerSessionMiddleware session =
         context.getMiddleware(SESSION_MIDDLEWARE_KEY);
-    if (session != null) {
-      if (session.hasSession()) {
-        return session.getSession().id;
-      }
+    String resolved = null;
+    if (session != null && session.hasSession()) {
+      resolved = session.getSession().id;
+    } else {
       SessionIdMiddleware declared = context.getMiddleware(SessionIdMiddleware.KEY);
       if (declared != null && declared.sessionId() != null && !declared.sessionId().isBlank()) {
-        return declared.sessionId().trim();
+        resolved = declared.sessionId().trim();
       }
-      return session.getSession().id; // 铸造 + Set-Cookie
     }
-    SessionIdMiddleware declared = context.getMiddleware(SessionIdMiddleware.KEY);
-    if (declared != null && declared.sessionId() != null && !declared.sessionId().isBlank()) {
-      return declared.sessionId().trim();
+    if (resolved == null) {
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription("No session identity: carry x-fg-session-id header"
+              + " (FG JDBC driver does this automatically) or arrow_flight_session_id cookie")
+          .toRuntimeException();
     }
-    throw CallStatus.INVALID_ARGUMENT
-        .withDescription("No session identity: carry arrow_flight_session_id cookie"
-            + " (auto on first contact) or x-fg-session-id header")
-        .toRuntimeException();
+    try {
+      return java.util.UUID.fromString(resolved).toString(); // 归一化（大小写/变体）
+    } catch (IllegalArgumentException e) {
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription("Session identity must be a UUID (used directly as the engine"
+              + " session id): '" + resolved + "'")
+          .toRuntimeException();
+    }
   }
 
   /**

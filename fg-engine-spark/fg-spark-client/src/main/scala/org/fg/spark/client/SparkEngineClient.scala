@@ -488,12 +488,12 @@ private[client] object SparkEngineClient {
 }
 
 /** Connect 会话：gateway 会话 ↔ Connect session 一一映射（D20 生命周期绑定）。会话 id
- * 由 fg_session 登记表铸造（{@link GatewaySession#connectSessionId}，UUID 满足 Connect
- * INVALID_HANDLE.FORMAT 校验），不再确定性派生——化身唯一以登记表为准。 */
+ * 即客户端自报的 {@link GatewaySession#sessionId}（UUID 由网关入口强制，满足 Connect
+ * INVALID_HANDLE.FORMAT 校验），零映射透传——化身事实由 fg_session 登记表裁决。 */
 final class SparkEngineSession(val ctx: GatewaySession, channel: ConnectChannel)
     extends EngineSession {
   val user: String = ctx.user()
-  val gatewaySessionId: String = ctx.connectSessionId()
+  val gatewaySessionId: String = ctx.sessionId()
 
   override def sessionId(): String = gatewaySessionId
 

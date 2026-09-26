@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
-import java.util.UUID;
 import javax.sql.DataSource;
 import org.fg.common.service.Service;
 
@@ -38,7 +37,6 @@ public class SessionRegistryDao implements Service {
       String sessionRef,
       String user,
       String engineRef,
-      String connectSessionId,
       Long engineStartedAt,
       List<String> optionKeys,
       Status status,
@@ -46,6 +44,13 @@ public class SessionRegistryDao implements Service {
 
   /** bornOrGet 结果：isNew=false 表示并发/重复接触命中既有行。 */
   public record Born(SessionRow row, boolean isNew) {}
+
+  /** 跨用户占用：会话 id 属另一用户（客户端自报 id 可被恶意复用他人 UUID）。 */
+  public static final class SessionOwnerMismatchException extends IllegalStateException {
+    public SessionOwnerMismatchException(String sessionRef, String owner) {
+      super("Session " + sessionRef + " belongs to another user (" + owner + ")");
+    }
+  }
 
   private final DataSource dataSource;
 
@@ -60,32 +65,32 @@ public class SessionRegistryDao implements Service {
   public void close() {}
 
   /**
-   * 首次接触登记（mint-on-first-contact）：INSERT ... ON CONFLICT DO NOTHING——铸造
-   * connect_session_id（随机 UUID，化身自此由本表唯一裁决）；0 行即既有会话，选回。
-   * 与 fg_operation.insertOrGet 同款多实例仲裁。
+   * 首次接触登记：INSERT ... ON CONFLICT DO NOTHING（与 fg_operation.insertOrGet 同款多实例
+   * 仲裁）；0 行即既有会话，选回并断言归属一致（防跨用户占用他人自报 id）。session_ref
+   * 即 Connect session id（UUID 由入口强制，此处不再铸造/映射）。
    */
   public Born bornOrGet(String sessionRef, String user, String engineRef) throws SQLException {
     String insert =
-        "INSERT INTO fg_session (session_ref, user_name, engine_ref, connect_session_id)"
-            + " VALUES (?, ?, ?, ?) ON CONFLICT (session_ref) DO NOTHING";
-    UUID minted = UUID.randomUUID();
+        "INSERT INTO fg_session (session_ref, user_name, engine_ref)"
+            + " VALUES (?, ?, ?) ON CONFLICT (session_ref) DO NOTHING";
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps = c.prepareStatement(insert)) {
       ps.setString(1, sessionRef);
       ps.setString(2, user);
       ps.setString(3, engineRef);
-      ps.setObject(4, minted);
       if (ps.executeUpdate() == 1) {
         return new Born(
-            new SessionRow(sessionRef, user, engineRef, minted.toString(), null,
-                List.of(), Status.ACTIVE, null),
+            new SessionRow(sessionRef, user, engineRef, null, List.of(), Status.ACTIVE, null),
             true);
       }
     }
-    return new Born(
+    SessionRow existing =
         get(sessionRef)
-            .orElseThrow(() -> new IllegalStateException("Session conflict but row missing: " + sessionRef)),
-        false);
+            .orElseThrow(() -> new IllegalStateException("Session conflict but row missing: " + sessionRef));
+    if (!existing.user().equals(user)) {
+      throw new SessionOwnerMismatchException(sessionRef, existing.user());
+    }
+    return new Born(existing, false);
   }
 
   public Optional<SessionRow> get(String sessionRef) throws SQLException {
@@ -173,7 +178,6 @@ public class SessionRegistryDao implements Service {
         rs.getString("session_ref"),
         rs.getString("user_name"),
         rs.getString("engine_ref"),
-        rs.getObject("connect_session_id", UUID.class).toString(),
         started,
         List.copyOf(optionKeys),
         Status.parse(rs.getString("status")),

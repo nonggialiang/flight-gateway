@@ -422,11 +422,22 @@ def session_set_action(c):
 
 def session_lifecycle(c):
     """CloseSession 生命周期绑定：关 → 引擎侧会话逐出 → 同 id 再来即拒（sticky，engineLost
-    同理由 admin 化身校验触发）；客户端轮换 x-fg-session-id 重建。"""
+    同理由 admin 化身校验触发）；客户端轮换 x-fg-session-id 重建。
+    会话 id 必须为 UUID（fg-p2：session_ref 即引擎会话 id，零映射直传）。"""
     import subprocess
-    sid = f"fg-e2e-lc-{int(time.time())}"
+    import uuid
+    sid = str(uuid.uuid4())
     a = Client(sid=sid)
     legacy_get_flight_info(a, "SELECT id FROM range(10)", 10)
+
+    # 非 UUID 身份被拒（入口格式契约）
+    err = None
+    try:
+        Client(sid="not-a-uuid").get_flight_info(command_descriptor("SELECT id FROM range(10)"))
+    except Exception as e:
+        err = e
+    assert err is not None and "must be a UUID" in str(err), \
+        f"[lifecycle] 非 UUID 未拒: {type(err).__name__}: {err}"
 
     # 关闭：CloseSessionRequest 为空消息 → 结果 CloseSessionResult{status=1 CLOSED}
     results = list(a.do_action(fl.Action("CloseSession", b"")))
@@ -452,9 +463,9 @@ def session_lifecycle(c):
     assert row == "CLOSED/client", f"[lifecycle] fg_session 行 {row}"
 
     # 轮换 id 重建（客户端主导，无服务端复活）
-    b = Client(sid=sid + "-r2")
+    b = Client(sid=str(uuid.uuid4()))
     legacy_get_flight_info(b, "SELECT id FROM range(10)", 10)
-    print("[lifecycle] PASS（close → sticky 拒 → 轮换重建）")
+    print("[lifecycle] PASS（UUID 契约 / close → sticky 拒 → 轮换重建）")
 
 
 def https_presign(c, sql, expect_rows, do_renew=False):
@@ -614,10 +625,16 @@ def adbc_query(c, sql, expect_rows, tag="adbc", extra_db_kwargs=None):
     无 Relay complete 而行数正确 = PollFlightInfo + presigned HTTP GET；mode 落行见
     fg_operation.mode。extra_db_kwargs 注入连接选项（D15 头协商等）。"""
     import adbc_driver_flightsql.dbapi as dbapi
+    import uuid
     t0 = time.time()
     # 127.0.0.1 而非 localhost：ADBC 内置 gRPC 的 macOS name resolver 对 localhost
     # 走 IPv6(::1) 探测，而网关 0.0.0.0 仅 IPv4 → 每次连接多耗 ~20s（pyarrow/grpcio 无此问题）
-    kwargs = {"username": USER, "password": PASSWORD}
+    kwargs = {
+        "username": USER,
+        "password": PASSWORD,
+        # fg-p2 严格会话身份：ADBC 无 cookie 能力 → call_header 自报（每连接一个 uuid）
+        "adbc.flight.sql.rpc.call_header.x-fg-session-id": str(uuid.uuid4()),
+    }
     kwargs.update(extra_db_kwargs or {})
     with dbapi.connect(uri="grpc://127.0.0.1:32010", db_kwargs=kwargs) as conn:
         with conn.cursor() as cur:

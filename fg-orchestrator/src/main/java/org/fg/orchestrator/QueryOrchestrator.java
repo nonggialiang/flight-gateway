@@ -127,7 +127,7 @@ public class QueryOrchestrator implements Service {
     if (row.status() == SessionRegistryDao.Status.CLOSED) {
       throw new SessionClosedException(row.closedReason() == null ? "client" : row.closedReason());
     }
-    GatewaySession ctx = new GatewaySession(sessionRef, user, row.connectSessionId());
+    GatewaySession ctx = new GatewaySession(sessionRef, user);
     if (row.engineStartedAt() != null) {
       EngineSessionStatus st = engine.sessionStatus(engine.openSession(ctx));
       if (!st.alive() || st.engineStartedAt() != row.engineStartedAt()) {
@@ -151,7 +151,7 @@ public class QueryOrchestrator implements Service {
   private GatewaySession sessionFor(OperationRow row) throws Exception {
     SessionRegistryDao.SessionRow s =
         sessions.bornOrGet(row.sessionRef(), row.user(), row.engineRef()).row();
-    return new GatewaySession(row.sessionRef(), row.user(), s.connectSessionId());
+    return new GatewaySession(row.sessionRef(), row.user());
   }
 
   /**
@@ -168,7 +168,7 @@ public class QueryOrchestrator implements Service {
       }
       EngineSessionStatus st =
           engine.sessionStatus(
-              engine.openSession(new GatewaySession(sessionRef, user, row.connectSessionId())));
+              engine.openSession(new GatewaySession(sessionRef, user)));
       if (st.alive()) {
         sessions.markEngineStarted(sessionRef, st.engineStartedAt());
       }
@@ -207,10 +207,9 @@ public class QueryOrchestrator implements Service {
       return; // 未知会话无物可关；幂等
     }
     engine.closeSession(
-        engine.openSession(new GatewaySession(sessionRef, user, row.connectSessionId())));
+        engine.openSession(new GatewaySession(sessionRef, user)));
     sessions.markClosed(sessionRef, "client");
-    logger.info("Session {} closed by client (connect session {} released)",
-        sessionRef, row.connectSessionId());
+    logger.info("Session {} closed by client (engine session released)", sessionRef);
   }
 
   // ------------------------------------------------------------- 注册 + 触发

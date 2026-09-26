@@ -62,14 +62,12 @@ public final class FgFlightService implements Service {
         FlightServer.builder(allocator, listenLocation, producer)
             // D15 header 协商：捕获 x-fg-endpoint-mode（https|relay），注册时落行
             .middleware(EndpointModeMiddleware.KEY, new EndpointModeMiddleware.Factory())
-            // D20 会话身份主通道：arrow 官方 cookie 会话（arrow_flight_session_id），JDBC
-            // 等内建 cookie jar 的客户端粘住；会话在 sessionRef 解析时经 getSession()
-            // 铸造（mint-on-first-contact + Set-Cookie）
+            // D20 会话身份（fg-p2 严格模式）：服务端零铸造，身份一律客户端携带——
+            // cookie（arrow_flight_session_id，供已持有者）或 x-fg-session-id 自报头
+            //（主通道：FG JDBC 驱动 fg-p2 每连接自动生成；pyarrow/ADBC 经连接选项）
             .middleware(
                 FgFlightProducer.SESSION_MIDDLEWARE_KEY,
                 new ServerSessionMiddleware.Factory(() -> UUID.randomUUID().toString()))
-            // D20 会话身份头通道：x-fg-session-id 自报（无 cookie 能力客户端：pyarrow
-            // FlightCallOptions / ADBC call_header 连接选项）；closed 后客户端自行轮换
             .middleware(SessionIdMiddleware.KEY, new SessionIdMiddleware.Factory())
             // auth2-only（Authorization: Basic/Bearer 头，design F1）：
             // arrow-java 的 Handshake RPC 只走 auth1 ServerAuthHandler（FlightService#handshake

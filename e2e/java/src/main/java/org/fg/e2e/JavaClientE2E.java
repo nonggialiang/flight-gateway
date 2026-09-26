@@ -43,8 +43,15 @@ public final class JavaClientE2E {
   private static final String USER = "fg";
   private static final String PASSWORD = "fg";
 
+  /** fg-p2 严格会话身份：本进程自报 x-fg-session-id（网关拒绝无身份请求）。 */
+  private static org.apache.arrow.flight.HeaderCallOption sessionHeader;
+
   public static void main(String[] args) throws Exception {
     String which = args.length > 0 ? args[0] : "legacy";
+    org.apache.arrow.flight.FlightCallHeaders headers =
+        new org.apache.arrow.flight.FlightCallHeaders();
+    headers.insert("x-fg-session-id", java.util.UUID.randomUUID().toString());
+    sessionHeader = new org.apache.arrow.flight.HeaderCallOption(headers);
     try (BufferAllocator alloc = new RootAllocator(Long.MAX_VALUE);
         FlightClient client =
             FlightClient.builder(alloc, Location.forGrpcInsecure(HOST, PORT)).build()) {
@@ -64,12 +71,12 @@ public final class JavaClientE2E {
             // 复刻 JDBC 驱动路径（驱动即 shade 的 FlightSqlClient.prepare/execute；
             // close 必须携 credential——auth2 网关逐 RPC 验头，与驱动 close(getOptions()) 一致）
             FlightSqlClient.PreparedStatement ps = sql.prepare(
-                "SELECT id, id * 2 AS dbl FROM range(1000)", credential);
+                "SELECT id, id * 2 AS dbl FROM range(1000)", credential, sessionHeader);
             try {
-              FlightInfo info = ps.execute(credential);
+              FlightInfo info = ps.execute(credential, sessionHeader);
               streamAll(sql, credential, info, 1000, "[java-prepare]");
             } finally {
-              ps.close(credential);
+              ps.close(credential, sessionHeader);
             }
           }
           case "presign" -> presign(sql, credential);
@@ -85,7 +92,7 @@ public final class JavaClientE2E {
   private static void readAll(FlightSqlClient sql, CredentialCallOption credential,
       String query, long expected, String tag) {
     long t0 = System.nanoTime();
-    FlightInfo info = sql.execute(query, credential);
+    FlightInfo info = sql.execute(query, credential, sessionHeader);
     streamAll(sql, credential, info, expected, tag, t0);
   }
 
@@ -102,7 +109,7 @@ public final class JavaClientE2E {
         qid.substring(0, Math.min(8, qid.length())));
     long total = 0;
     for (FlightEndpoint ep : info.getEndpoints()) {
-      try (FlightStream fs = sql.getStream(ep.getTicket(), credential)) {
+      try (FlightStream fs = sql.getStream(ep.getTicket(), credential, sessionHeader)) {
         while (fs.next()) {
           total += fs.getRoot().getRowCount();
         }
@@ -127,11 +134,11 @@ public final class JavaClientE2E {
     String query = "SELECT id, id * 2 AS dbl FROM range(1000)";
     FlightDescriptor descriptor = FlightDescriptor.command(Any.pack(
         FlightSql.CommandStatementQuery.newBuilder().setQuery(query).build()).toByteArray());
-    Schema viaGetSchema = sql.getSchema(descriptor, credential).getSchema();
+    Schema viaGetSchema = sql.getSchema(descriptor, credential, sessionHeader).getSchema();
     if (viaGetSchema == null || viaGetSchema.getFields().isEmpty()) {
       throw new AssertionError("getSchema returned empty schema");
     }
-    FlightSqlClient.PreparedStatement ps = sql.prepare(query, credential);
+    FlightSqlClient.PreparedStatement ps = sql.prepare(query, credential, sessionHeader);
     try {
       Schema viaPrepare = ps.getResultSetSchema();
       if (viaPrepare == null || viaPrepare.getFields().isEmpty()) {
@@ -142,7 +149,7 @@ public final class JavaClientE2E {
             "getSchema/prepare schema mismatch:\n" + viaGetSchema + "\n" + viaPrepare);
       }
     } finally {
-      ps.close(credential); // auth2 逐 RPC 验头（与驱动 close(getOptions()) 一致）
+      ps.close(credential, sessionHeader); // auth2 逐 RPC 验头（与驱动 close(getOptions()) 一致）
     }
     System.out.printf("[java-schema-only] PASS getSchema fields=%d (%.1fs)%n",
         viaGetSchema.getFields().size(), elapsedSec(t0));
@@ -161,12 +168,12 @@ public final class JavaClientE2E {
                 .setQuery("SELECT a.id FROM range(400000000) a JOIN range(500) b ON a.id % 500 = b.id")
                 .build())
         .toByteArray();
-    FlightInfo info = client.getInfo(FlightDescriptor.command(command), credential);
+    FlightInfo info = client.getInfo(FlightDescriptor.command(command), credential, sessionHeader);
     System.out.printf("[java-cancel] queryId=%s... submitted%n",
         new String(info.getAppMetadata()).substring(0, 8));
     Thread.sleep(3_000);
     CancelFlightInfoResult result =
-        sql.cancelFlightInfo(new CancelFlightInfoRequest(info), credential);
+        sql.cancelFlightInfo(new CancelFlightInfoRequest(info), credential, sessionHeader);
     CancelStatus status = result.getStatus();
     System.out.printf("[java-cancel] CancelStatus=%s%n", status);
     if (status != CancelStatus.CANCELLED) {
@@ -183,7 +190,7 @@ public final class JavaClientE2E {
   private static void presign(FlightSqlClient sql, CredentialCallOption credential)
       throws Exception {
     long t0 = System.nanoTime();
-    FlightInfo info = sql.execute("SELECT id, id * 2 AS dbl FROM range(1000)", credential);
+    FlightInfo info = sql.execute("SELECT id, id * 2 AS dbl FROM range(1000)", credential, sessionHeader);
     String qid = info.getAppMetadata() == null
         ? "?" : new String(info.getAppMetadata());
     System.out.printf("[java-presign] endpoints=%d queryId=%s...%n",
@@ -200,7 +207,7 @@ public final class JavaClientE2E {
       if (!("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))) {
         throw new AssertionError("presigned endpoint location must be http(s): " + ep);
       }
-      try (ArrowReader reader = sql.openEndpoint(ep, credential)) {
+      try (ArrowReader reader = sql.openEndpoint(ep, credential, sessionHeader)) {
         while (reader.loadNextBatch()) {
           total += reader.getVectorSchemaRoot().getRowCount();
         }
@@ -231,7 +238,7 @@ public final class JavaClientE2E {
     // SQL 与 legacy 案例区分开：fingerprint 幂等（user+sql）下同 SQL 复用在册行，
     // legacy 已以 RELAY 落行 → header 不再协商（mode 首注册落行，在册行优先）
     FlightInfo info = sql.execute(
-        "SELECT id, id * 3 AS triple FROM range(1000)", credential, modeHeader);
+        "SELECT id, id * 3 AS triple FROM range(1000)", credential, modeHeader, sessionHeader);
     long total = 0;
     for (FlightEndpoint ep : info.getEndpoints()) {
       if (ep.getTicket().getBytes().length != 0
@@ -268,7 +275,7 @@ public final class JavaClientE2E {
     FlightDescriptor descriptor = FlightDescriptor.command(command);
     PollInfo info = null;
     for (int i = 0; i < 90; i++) {
-      info = client.pollInfo(descriptor, credential);
+      info = client.pollInfo(descriptor, credential, sessionHeader);
       if (info.getFlightDescriptor().isEmpty()) { // 终态：flight_descriptor unset
         System.out.printf("[java-poll] terminal after %d polls%n", i + 1);
         break;
