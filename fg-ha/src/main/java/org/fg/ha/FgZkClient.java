@@ -30,9 +30,10 @@ import org.apache.zookeeper.data.Stat;
  * 探测同量级，换取"死引擎在下一 RPC 即被察觉"的直白正确性。watch 只用在语义要害处
  * （引擎自身节点 DeReg + ZK LOST）。
  *
- * <p>拉起互斥（Kyuubi EngineRef 三段式）：非 CONNECTION share level 经 {@link #tryLock}
- * 在锁内 double-check；{@link #deregisterIfStale} 的锁内 host:port 匹配守卫防止把
- * 顶替上来的新引擎 znode 删掉。
+ * <p>拉起互斥（Kyuubi EngineRef 三段式）：冷启动经 {@link #tryLock} 在锁内 double-check
+ * （四 share level 统一；CONNECTION 的锁粒度为用户级——逐会话锁路径是持久 znode，会话数
+ * 无界即泄漏）；{@link #deregisterIfStale} 的锁内 host:port 匹配守卫防止把顶替上来的
+ * 新引擎 znode 删掉。
  */
 public final class FgZkClient implements AutoCloseable {
 
@@ -192,8 +193,8 @@ public final class FgZkClient implements AutoCloseable {
 
   /**
    * 守卫式注销（恢复路径用）：仅当 space <b>最新</b> znode 的 host:port 与陈旧引擎一致时删除
-   * ——防止把已顶替的新引擎删掉。lockPath 为 null 时免锁（CONNECTION：space 内嵌唯一
-   * refId，无跨进程顶替场景）。best-effort：任何异常返回 false。
+   * ——防止把已顶替的新引擎删掉。注销在 lockPath 锁内执行（与拉起同款互斥；CONNECTION
+   * 传用户级锁路径）。best-effort：任何异常返回 false。
    */
   public boolean deregisterIfStale(String engineSpace, String lockPath, String host, int connectPort,
       long lockTimeoutMs) {
@@ -211,7 +212,7 @@ public final class FgZkClient implements AutoCloseable {
       return false;
     };
     try {
-      return lockPath == null ? guarded.call() : tryLock(lockPath, lockTimeoutMs, guarded);
+      return lockPath != null ? tryLock(lockPath, lockTimeoutMs, guarded) : guarded.call();
     } catch (Exception e) {
       return false;
     }

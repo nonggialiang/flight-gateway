@@ -24,7 +24,8 @@ final case class EngineKey(
     if (refId != null && refId.nonEmpty) EngineSpaces.connectionSpace(base, refId) else base
   }
 
-  /** 冷启动互斥锁路径（CONNECTION 免锁——space 内嵌唯一 refId）。 */
+  /** 冷启动互斥锁路径（用户级粒度：不含 sessionId 段——逐会话锁路径是持久 znode 会泄漏；
+   * 多实例对同一会话 space 的竞争经用户级锁 + 锁内 double-check 去重）。 */
   def lockPath: String = EngineSpaces.lockPath(root, routingUser, subdomain)
 }
 

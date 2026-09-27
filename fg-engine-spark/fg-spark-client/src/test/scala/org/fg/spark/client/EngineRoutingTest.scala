@@ -94,6 +94,24 @@ class EngineRoutingTest {
   }
 
   @Test
+  def connectionLockPathIsUserGrain(): Unit = {
+    // D23：CONNECTION 锁粒度=用户级——space 内嵌会话段（无界），锁路径不含（有界，
+    // 持久 znode 不随会话泄漏）；多实例对同一会话 space 的竞争经此锁 + double-check 去重
+    System.setProperty("fg.zk.namespace", "ns-x")
+    System.setProperty("fg.engine.share.level", "CONNECTION")
+    val sid = UUID.randomUUID().toString
+    val key = router().keyOf(session("fg", sid))
+    Assertions.assertEquals("/ns-x_v1_CONNECTION_spark_lock/fg/default", key.lockPath)
+    Assertions.assertTrue(key.isConnection)
+    Assertions.assertTrue(key.space.endsWith(s"/$sid"), "space 应内嵌会话 refId 段")
+    Assertions.assertFalse(key.lockPath.contains(sid), "锁路径不应含会话段（粒度=用户级）")
+    // 同用户另一会话：space 不同、锁路径相同（同一把锁串行冷启动）
+    val key2 = router().keyOf(session("fg", UUID.randomUUID().toString))
+    Assertions.assertNotEquals(key.space, key2.space)
+    Assertions.assertEquals(key.lockPath, key2.lockPath)
+  }
+
+  @Test
   def staticGroupProviderParsesEntries(): Unit = {
     System.setProperty("fg.engine.share.group-mapping", "a:g1,b:g2")
     val p = new StaticGroupProvider(config())

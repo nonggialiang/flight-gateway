@@ -23,9 +23,11 @@ import scala.jdk.CollectionConverters._
  * <ol>
  *   <li>查 children（读穿发现，无 watcher 缓存——CONNECTION 使 space 数无界，见 fg-ha）；
  *       命中即缓存复用；</li>
- *   <li>miss → ZK 锁（engineSpace 同级 {@code _lock} 路径，CONNECTION 免锁——space 内嵌
- *       唯一 refId；多实例 CONNECTION 去重为本阶段已知边界，单实例部署假设））+ 锁内
- *       double-check；</li>
+ *   <li>miss → ZK 锁（engineSpace 同级 {@code _lock} 路径）+ 锁内 double-check。
+ *       CONNECTION 的锁粒度为<strong>用户级</strong>（lockPath 不含 sessionId 段——逐会话
+ *       锁路径是持久 znode，会话数无界即泄漏；用户级有界，且足以去重多实例对同一会话
+ *       space 的竞争：先行者注册后，后来者锁内 double-check 命中即复用）。代价：同用户
+ *       不同会话的并发冷启动在锁上串行（不同用户仍并行，全局另有 launch semaphore）；</li>
  *   <li>拉起（launch semaphore 限并发）→ 按 refId 1s 轮询 ZK 至 initialize.timeout
  *       （local 模式进程退出≠0 立即失败；超时 destroy）→ SparkEngineClient 入缓存。</li>
  * </ol>
@@ -103,7 +105,7 @@ private[client] class SparkEngineManager(
       Option(engines.remove(space)).foreach { me =>
         log.info("recovering engine space={} stale={}", space, me.node)
         try {
-          zk.deregisterIfStale(space, if (key.isConnection) null else key.lockPath,
+          zk.deregisterIfStale(space, key.lockPath,
             me.node.host(), me.node.connectPort(), lockTimeoutMs)
         } finally {
           closeQuietly(me.client)
@@ -132,13 +134,10 @@ private[client] class SparkEngineManager(
 
   // ------------------------------------------------------------- 内部
 
-  /** 冷启动互斥：非 CONNECTION 经 ZK 锁 + 锁内 double-check（他网关实例可能已拉起）。 */
+  /** 冷启动互斥：ZK 锁 + 锁内 double-check（他网关实例可能已拉起）。四 share level 统一
+   * 走此路径；CONNECTION 的 lockPath 为用户级粒度（见类 javadoc）。 */
   private def launchUnderLatch(key: EngineKey): ManagedEngine = {
-    if (key.isConnection) {
-      discoverOrLaunch(key)
-    } else {
-      zk.tryLock(key.lockPath, lockTimeoutMs, () => discoverOrLaunch(key))
-    }
+    zk.tryLock(key.lockPath, lockTimeoutMs, () => discoverOrLaunch(key))
   }
 
   private def discoverOrLaunch(key: EngineKey): ManagedEngine =
