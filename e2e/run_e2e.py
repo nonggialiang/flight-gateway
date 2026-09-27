@@ -1005,6 +1005,60 @@ def metrics_exposition(c):
     print("[metrics] PASS（/metrics 业务+JVM 序列齐备）")
 
 
+def scroll_register(c):
+    """D27 scroll 注册判据：statement 全 RPC 携 x-fg-result-set-type: scroll →
+    落行 scrollable=t + mode 强制 RELAY；终态恒单 endpoint + 非空 STREAM 票 + 无 location
+    （reuseConnection）；无分页头 DoGet 该票 = 全量顺序流（回归：现状语义不变）；
+    https+scroll 双头冲突 → scroll 胜（仍单 STREAM endpoint，非 presign）。"""
+    import uuid
+    import subprocess
+    hdrs = (("x-fg-result-set-type", "scroll"),)
+
+    sid = str(uuid.uuid4())
+    s = Client(sid=sid)
+    sql = "SELECT id, id * 2 AS dbl FROM range(97)"
+    endpoints, records, qid = poll_terminal(s, sql, extra_headers=hdrs)
+    assert records == 97, f"[scroll] totalRecords {records} != 97"
+    assert len(endpoints) == 1, f"[scroll] 终态 endpoints={len(endpoints)} != 1"
+    ticket, locations = parse_endpoint(endpoints[0])
+    assert ticket is not None and len(ticket) > 0, "[scroll] STREAM 票为空"
+    # reuseConnection 哨兵 URI（或空）合法；出现 http(s) presign 即错
+    assert all("arrow-flight-reuse-connection" in l or not l for l in locations), \
+        f"[scroll] 意外 location: {locations}"
+    print(f"[scroll] 单 STREAM endpoint + 非空票 OK queryId={qid[:8]}...")
+
+    row = subprocess.run(
+        ["docker", "exec", "fg-pg", "psql", "-U", "fg", "-d", "flightgateway", "-tAc",
+         f"SELECT mode || '/' || scrollable FROM fg_operation WHERE query_id='{qid}'"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    assert row == "RELAY/true", f"[scroll] 行标记 {row} != RELAY/true"
+
+    # 无分页头 DoGet STREAM 票 = 全量顺序流（第三方零惊讶）
+    t = fl.Ticket(ticket)
+    table = s.do_get(t).read_all()
+    assert table.num_rows == 97, f"[scroll] 无头全量 {table.num_rows} != 97"
+    assert table.column_names == ["id", "dbl"]
+
+    # 冲突：https 头 + scroll 头 → scroll 胜（mode=RELAY、单 STREAM endpoint 非 presign）
+    sid2 = str(uuid.uuid4())
+    s2 = Client(sid=sid2)
+    sql2 = "SELECT id FROM range(53)"
+    endpoints2, records2, qid2 = poll_terminal(
+        s2, sql2, extra_headers=hdrs + (("x-fg-endpoint-mode", "https"),))
+    assert records2 == 53
+    assert len(endpoints2) == 1
+    ticket2, locations2 = parse_endpoint(endpoints2[0])
+    assert ticket2 and all("arrow-flight-reuse-connection" in l or not l for l in locations2), \
+        "[scroll] 冲突路径未走 relay 单票"
+    row2 = subprocess.run(
+        ["docker", "exec", "fg-pg", "psql", "-U", "fg", "-d", "flightgateway", "-tAc",
+         f"SELECT mode || '/' || scrollable FROM fg_operation WHERE query_id='{qid2}'"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    assert row2 == "RELAY/true", f"[scroll] 冲突行 {row2} != RELAY/true"
+    print("[scroll] 冲突优先级 scroll > https OK")
+    print("[scroll-register] PASS（落行/强制 relay/单 STREAM endpoint/无头全量）")
+
+
 def engine_cluster(c):
     """cluster 拉起模式（D22/D24）：standalone master(spark://localhost:7077) 上 driver
     由 worker 拉起。前置：`~/fg-e2e/cluster-up.sh` + 网关 `~/fg-e2e/gw-cluster.sh`
@@ -1137,5 +1191,9 @@ if __name__ == "__main__":
     elif which == "metrics":
         # 任意模式网关（metrics 默认 enabled :9091）；默认模式需固定引擎在跑
         metrics_exposition(c)
+    # ---------------- D27 scroll 随机翻页 ----------------
+    elif which == "scroll-register":
+        # 任意模式网关 + 固定引擎（写路径 .bidx 边车同批落 MinIO）
+        scroll_register(c)
     else:
         raise SystemExit(f"unknown case {which}")

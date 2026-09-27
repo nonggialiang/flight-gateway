@@ -127,7 +127,9 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       String sql, FlightProducer.CallContext context, FlightDescriptor descriptor)
       throws Exception {
     QueryOrchestrator.Registration reg =
-        orchestrator.register(sessionRef(context), user(context), sql, negotiateMode(context));
+        orchestrator.register(
+            sessionRef(context), user(context), sql, negotiateMode(context),
+            scrollRequested(context));
     OperationRow row = reg.row();
     return flightInfo(
         schemaOf(row.schemaBytes()),
@@ -165,7 +167,9 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
 
       // ① 幂等注册 + 触发（首个 poll 触发；后续 poll 同 fingerprint 命中在途/终态行）
       QueryOrchestrator.Registration reg =
-          orchestrator.register(sessionRef(context), user(context), sql, negotiateMode(context));
+          orchestrator.register(
+              sessionRef(context), user(context), sql, negotiateMode(context),
+              scrollRequested(context));
       OperationRow row = reg.row();
 
       // ②…长等待（fg.poll.max-wait 到点返回未完成，客户端续 poll）
@@ -992,6 +996,10 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
    * {@code fg.result.endpoint.mode}（默认 relay）。session option 通道归 M3。
    */
   private OperationRow.Mode negotiateMode(FlightProducer.CallContext context) {
+    // D27 优先级链：scroll 强制 RELAY > x-fg-endpoint-mode > fg.result.endpoint.mode
+    if (scrollRequested(context)) {
+      return OperationRow.Mode.RELAY;
+    }
     EndpointModeMiddleware negotiated = context.getMiddleware(EndpointModeMiddleware.KEY);
     if (negotiated != null && negotiated.requestedMode() != null) {
       String requested = negotiated.requestedMode().trim();
@@ -1003,6 +1011,12 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       // 非法值不阻断：回退配置默认
     }
     return OperationRow.Mode.parse(config.getString("fg.result.endpoint.mode"));
+  }
+
+  /** D27：本 RPC 是否声明 scroll（经 ScrollModeMiddleware 捕获；注册时读取并落行）。 */
+  private boolean scrollRequested(FlightProducer.CallContext context) {
+    ScrollModeMiddleware scroll = context.getMiddleware(ScrollModeMiddleware.KEY);
+    return scroll != null && scroll.scroll();
   }
 
   private Schema schemaOf(OperationRow row) {

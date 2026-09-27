@@ -259,11 +259,13 @@ public class QueryOrchestrator implements Service {
    * 并发同指纹：双双 miss → 双双分析（重复分析可接受）→ ON CONFLICT 单赢家触发，输家读回
    * 的在册行同样带 schema。
    */
-  public Registration register(String sessionRef, String user, String sql, OperationRow.Mode mode)
+  public Registration register(
+      String sessionRef, String user, String sql, OperationRow.Mode mode, boolean scrollable)
       throws Exception {
     GatewaySession ctx = resolveSession(sessionRef, user); // D20：入口必经（CLOSED sticky 即拒）
     StatementClassifier.Kind stmtKind = StatementClassifier.classify(sql);
     if (stmtKind != StatementClassifier.Kind.QUERY) {
+      // scroll 只对 QUERY 有意义（COMMAND 终态恒单 COMMAND endpoint 内联交付）
       return registerCommand(ctx, sql, mode, stmtKind);
     }
 
@@ -289,6 +291,7 @@ public class QueryOrchestrator implements Service {
             .sqlText(sql)
             .resultKeyPrefix(resultKeyPrefix)
             .mode(mode)
+            .scrollable(scrollable) // D27：注册时落行（同 mode 的"注册时协商"语义）
             .schemaBytes(schema == null ? null : SchemaSerde.serialize(schema))
             .engineRef(engine.type());
     OperationRow stored = dao.insertOrGet(row);

@@ -77,7 +77,7 @@ public final class ManifestWriter {
     }
   }
 
-  /** abort：按精确清单删已写 part（retention 兜底双保险之一）。 */
+  /** abort：按精确清单删已写 part（retention 兜底双保险之一）；D27 连带 .bidx 边车。 */
   public static void abort(SpecOptions spec, PartMetadata[] messages) {
     try {
       Configuration conf = hadoopConf();
@@ -87,9 +87,13 @@ public final class ManifestWriter {
           continue;
         }
         Path path = new Path(URI.create(p.uri()));
+        Path bidx = new Path(URI.create(p.uri() + FgResultSinks.BATCH_INDEX_SUFFIX));
         try (FileSystem fs = path.getFileSystem(conf)) {
           if (fs.exists(path) && fs.delete(path, false)) {
             deleted++;
+          }
+          if (fs.exists(bidx)) {
+            fs.delete(bidx, false);
           }
         }
       }

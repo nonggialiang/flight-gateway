@@ -51,6 +51,8 @@ public final class OperationRow {
   private byte[] commandResult;
   private Mode mode;
   private boolean ordered;
+  /** D27：scroll 随机翻页（注册时头声明落行；mode 强制 RELAY、终态恒单 STREAM endpoint）。 */
+  private boolean scrollable;
   private byte[] schemaBytes;
   private Status status;
   private String connectOperationId;
@@ -149,6 +151,15 @@ public final class OperationRow {
 
   public OperationRow ordered(boolean ordered) {
     this.ordered = ordered;
+    return this;
+  }
+
+  public boolean scrollable() {
+    return scrollable;
+  }
+
+  public OperationRow scrollable(boolean scrollable) {
+    this.scrollable = scrollable;
     return this;
   }
 
@@ -252,6 +263,7 @@ public final class OperationRow {
     }
     OperationRow that = (OperationRow) o;
     return ordered == that.ordered
+        && scrollable == that.scrollable
         && Objects.equals(queryId, that.queryId)
         && Objects.equals(sessionRef, that.sessionRef)
         && Objects.equals(sqlHash, that.sqlHash)
@@ -276,8 +288,8 @@ public final class OperationRow {
   @Override
   public int hashCode() {
     int result = Objects.hash(queryId, sessionRef, sqlHash, user, sqlText, resultKeyPrefix, kind,
-        mode, ordered, status, connectOperationId, attachOwner, attachLeaseUntil, engineRef, error,
-        terminalAt, createdAt, updatedAt);
+        mode, ordered, scrollable, status, connectOperationId, attachOwner, attachLeaseUntil,
+        engineRef, error, terminalAt, createdAt, updatedAt);
     return 31 * result + Arrays.hashCode(schemaBytes) + 31 * Arrays.hashCode(commandResult);
   }
 }

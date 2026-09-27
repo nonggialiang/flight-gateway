@@ -18,6 +18,10 @@ import org.fg.result.manifest.ResultManifest;
  */
 public final class ObjectStoreService implements AutoCloseable {
 
+  /** D27：per-part batch 索引边车后缀（与 sink 侧 FgResultSinks.BATCH_INDEX_SUFFIX 同值——
+   * 网关按 part uri 推导边车 key，缺席回落整 part 顺序读）。 */
+  public static final String BATCH_INDEX_SUFFIX = ".bidx";
+
   private final MinioClient client;
   private final String bucket;
 
@@ -83,12 +87,15 @@ public final class ObjectStoreService implements AutoCloseable {
     }
   }
 
-  /** 按清单删除 part + manifest（retention 清扫/取消善后可选）。 */
+  /** 按清单删除 part + manifest + batch 索引边车（D27：{part}.bidx 连带）。 */
   public void purgeResult(String resultKeyPrefix) {
     List<DeleteObject> toDelete = new LinkedList<>();
     try {
       ResultManifest manifest = readManifest(resultKeyPrefix);
-      manifest.parts().forEach(p -> toDelete.add(new DeleteObject(objectName(p.uri()))));
+      manifest.parts().forEach(p -> {
+        toDelete.add(new DeleteObject(objectName(p.uri())));
+        toDelete.add(new DeleteObject(objectName(p.uri()) + BATCH_INDEX_SUFFIX));
+      });
     } catch (RuntimeException e) {
       // no manifest (orphan or aborted); fall through to delete manifest itself if present
     }

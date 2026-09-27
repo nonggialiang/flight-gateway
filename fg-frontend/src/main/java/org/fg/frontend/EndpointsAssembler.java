@@ -59,11 +59,18 @@ final class EndpointsAssembler {
    * <p>HTTPS：每 part 一个 presigned endpoint。RELAY：行 ordered（或
    * {@code fg.result.relay.single-stream} 保险开关）→ 单个 STREAM endpoint；否则每 part 一个
    * PART endpoint（无序集合，客户端可乱序消费）。
+   *
+   * <p>D27 scroll：恒单 STREAM endpoint（注册时 mode 已强制 RELAY；此处置于 HTTPS 分支前
+   * 作防御——页经 DoGet + x-fg-page-offset/limit 头切片，无头 DoGet = 全量顺序流）。
+   * PART 扇出是"静态切分、顺序消费"模型，与随机访问语义不匹配。
    */
   List<FlightEndpoint> endpoints(OperationRow row, ResultManifest manifest) {
     if (row.kind() == OperationRow.Kind.COMMAND) {
       // D18：命令结果内联行内（无 manifest/part），恒单 COMMAND 定位票 endpoint
       return List.of(commandEndpoint(row));
+    }
+    if (row.scrollable()) {
+      return List.of(streamEndpoint(row));
     }
     if (row.mode() == OperationRow.Mode.HTTPS) {
       List<FlightEndpoint> out = new ArrayList<>();

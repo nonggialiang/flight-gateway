@@ -3,7 +3,11 @@ package org.fg.spark.sink;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
+import java.nio.channels.WritableByteChannel;
+import java.util.ArrayList;
+import java.util.List;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.hadoop.fs.FileSystem;
@@ -24,6 +28,11 @@ import org.slf4j.LoggerFactory;
  * maxRecordsPerBatch 控制。空分区不产文件（commit 返回 uri=null 的 PartMetadata，manifest
  * 跳过）。writer.abort() 删本 task 半成品；task retry 以 taskId 命名不互踩。
  *
+ * <p>D27 scroll 翻页：IPC stream 文件格式不动，task 收尾时把每 batch 的
+ * {@code (offset, length, rows)} 三元组写成边车 {@code {part}.bidx}（位置由输出 channel
+ * 跟踪，对齐 padding 天然含在 length 内）——网关据此对 MinIO 做 Range GET 取单 message。
+ * 边车是优化不是正确性依赖（缺席时网关回落整 part 顺序读）。
+ *
  * <p>M1 注：Spark 3.5 发行版内嵌 Arrow 12 的 ArrowStreamWriter 不支持 IPC body 压缩，
  * zstd 标志暂不生效（保留 spec 字段，升级引擎 Arrow 后启用）。
  */
@@ -40,11 +49,14 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
   private final ArrowWriter arrowWriter;
   private final VectorSchemaRoot root;
   private final ArrowStreamWriter streamWriter;
+  private final PositionTrackingChannel channel;
   private final OutputStream out;
   private final FileSystem fs;
 
   private long rowCount = 0;
   private long pending = 0;
+  /** D27：每 batch 的 (offset, length, rows) 三元组（边车 .bidx 的内容）。 */
+  private final List<long[]> batchIndex = new ArrayList<>();
 
   public FgArrowPartWriter(
       StructType schema,
@@ -61,13 +73,15 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
     ArrowStreamWriter sw = null;
     OutputStream o = null;
     FileSystem f = null;
+    PositionTrackingChannel ch = null;
     try {
       Path path = new Path(URI.create(partUri));
       f = path.getFileSystem(hadoopConf.value());
       o = f.create(path, true);
       aw = ArrowWriter.create(schema, TIMEZONE, true);
       VectorSchemaRoot r = aw.root();
-      sw = new ArrowStreamWriter(r, null, Channels.newChannel(o));
+      ch = new PositionTrackingChannel(Channels.newChannel(o));
+      sw = new ArrowStreamWriter(r, null, ch);
       sw.start();
     } catch (Exception e) {
       closeQuietly(sw, o, aw == null ? null : aw.root());
@@ -76,6 +90,7 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
     this.arrowWriter = aw;
     this.root = aw.root();
     this.streamWriter = sw;
+    this.channel = ch;
     this.out = o;
     this.fs = f;
     if (spec.zstdCompression()) {
@@ -98,6 +113,8 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
   }
 
   private void flushBatch() throws IOException {
+    long rowsInBatch = pending;
+    long start = channel.position();
     try {
       arrowWriter.finish();
       streamWriter.writeBatch();
@@ -107,6 +124,9 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
       arrowWriter.reset();
       pending = 0;
     }
+    // encapsulated message（continuation + metadata + 对齐 + body）自包含，
+    // [start, end) 区间即该 batch 的完整字节——网关可独立 Range GET 读取
+    batchIndex.add(new long[] {start, channel.position() - start, rowsInBatch});
   }
 
   @Override
@@ -122,12 +142,31 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
         flushBatch();
       }
       closeStreams(); // streamWriter.close() writes EOS
+      writeBatchIndex();
       long bytes = fs.getFileStatus(new Path(URI.create(partUri))).getLen();
-      logger.info("Part committed: {} rows={} bytes={}", partUri, rowCount, bytes);
+      logger.info("Part committed: {} rows={} bytes={} batches={}",
+          partUri, rowCount, bytes, batchIndex.size());
       return new PartMetadata(partUri, partitionId, rowCount, bytes, (int) taskId);
     } catch (Exception e) {
       abort();
       throw new IOException("Failed to commit " + partUri, e);
+    }
+  }
+
+  /** D27：边车 {part}.bidx——紧凑 JSON 数组 [[offset, length, rows], ...]。 */
+  private void writeBatchIndex() throws IOException {
+    StringBuilder sb = new StringBuilder("{\"batches\":[");
+    for (int i = 0; i < batchIndex.size(); i++) {
+      long[] t = batchIndex.get(i);
+      if (i > 0) {
+        sb.append(',');
+      }
+      sb.append('[').append(t[0]).append(',').append(t[1]).append(',').append(t[2]).append(']');
+    }
+    sb.append("]}");
+    Path path = new Path(URI.create(partUri + FgResultSinks.BATCH_INDEX_SUFFIX));
+    try (OutputStream out = fs.create(path, true)) {
+      out.write(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
   }
 
@@ -153,8 +192,44 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
       if (fs != null && fs.exists(path)) {
         fs.delete(path, false);
       }
+      Path bidx = new Path(URI.create(partUri + FgResultSinks.BATCH_INDEX_SUFFIX));
+      if (fs != null && fs.exists(bidx)) {
+        fs.delete(bidx, false);
+      }
     } catch (Exception e) {
       logger.warn("Part cleanup failed for {}: {}", partUri, e.toString());
+    }
+  }
+
+  /** 位置跟踪输出 channel（D27）：ArrowStreamWriter 写入位置的可靠来源。 */
+  static final class PositionTrackingChannel implements WritableByteChannel {
+
+    private final WritableByteChannel delegate;
+    private long position;
+
+    PositionTrackingChannel(WritableByteChannel delegate) {
+      this.delegate = delegate;
+    }
+
+    long position() {
+      return position;
+    }
+
+    @Override
+    public int write(ByteBuffer src) throws IOException {
+      int n = delegate.write(src);
+      position += n;
+      return n;
+    }
+
+    @Override
+    public boolean isOpen() {
+      return delegate.isOpen();
+    }
+
+    @Override
+    public void close() throws IOException {
+      delegate.close();
     }
   }
 

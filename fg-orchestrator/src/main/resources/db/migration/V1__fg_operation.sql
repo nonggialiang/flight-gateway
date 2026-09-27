@@ -14,6 +14,10 @@ CREATE TABLE fg_operation (
   command_result         BYTEA,
   mode                   TEXT NOT NULL CHECK (mode IN ('HTTPS', 'RELAY')),
   ordered                BOOLEAN NOT NULL DEFAULT FALSE,
+  -- D27 scroll 随机翻页：注册时客户端声明 TYPE_SCROLL_INSENSITIVE（头 x-fg-result-set-type:
+  -- scroll）即落 true——mode 同时强制 RELAY，终态 FlightInfo 恒单 STREAM endpoint，页经
+  -- DoGet + x-fg-page-offset/limit 头切片（无头 DoGet = 全量顺序流，第三方零惊讶）
+  scrollable             BOOLEAN NOT NULL DEFAULT FALSE,
   schema_bytes           BYTEA,
   status                 TEXT NOT NULL CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED')),
   connect_operation_id   TEXT,

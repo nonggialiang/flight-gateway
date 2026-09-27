@@ -69,9 +69,9 @@ public class OperationStoreDao implements Service {
   public OperationRow insertOrGet(OperationRow row) throws SQLException {
     String insert =
         "INSERT INTO fg_operation (query_id, session_ref, sql_hash, user_name, sql_text,"
-            + " result_key_prefix, kind, mode, ordered, schema_bytes, status, engine_ref,"
-            + " created_at, updated_at)"
-            + " VALUES (?, ?, ?, ?, ?, ?, 'QUERY', ?, ?, ?, 'RUNNING', ?, now(), now())"
+            + " result_key_prefix, kind, mode, ordered, scrollable, schema_bytes, status,"
+            + " engine_ref, created_at, updated_at)"
+            + " VALUES (?, ?, ?, ?, ?, ?, 'QUERY', ?, ?, ?, ?, 'RUNNING', ?, now(), now())"
             + " ON CONFLICT (session_ref, sql_hash) WHERE kind = 'QUERY' DO NOTHING";
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps = c.prepareStatement(insert)) {
@@ -83,8 +83,9 @@ public class OperationStoreDao implements Service {
       ps.setString(6, row.resultKeyPrefix());
       ps.setString(7, row.mode().name());
       ps.setBoolean(8, row.ordered());
-      ps.setBytes(9, row.schemaBytes());
-      ps.setString(10, row.engineRef());
+      ps.setBoolean(9, row.scrollable());
+      ps.setBytes(10, row.schemaBytes());
+      ps.setString(11, row.engineRef());
       if (ps.executeUpdate() == 1) {
         countRegistered("QUERY");
         return row.status(OperationRow.Status.RUNNING);
@@ -105,9 +106,9 @@ public class OperationStoreDao implements Service {
   public OperationRow insertCommandOrGet(OperationRow row) throws SQLException {
     String insert =
         "INSERT INTO fg_operation (query_id, session_ref, sql_hash, user_name, sql_text,"
-            + " result_key_prefix, kind, mode, ordered, schema_bytes, status, engine_ref,"
-            + " created_at, updated_at)"
-            + " VALUES (?, ?, ?, ?, ?, ?, 'COMMAND', ?, ?, ?, 'RUNNING', ?, now(), now())"
+            + " result_key_prefix, kind, mode, ordered, scrollable, schema_bytes, status,"
+            + " engine_ref, created_at, updated_at)"
+            + " VALUES (?, ?, ?, ?, ?, ?, 'COMMAND', ?, ?, ?, ?, 'RUNNING', ?, now(), now())"
             + " ON CONFLICT (session_ref, sql_hash) WHERE kind = 'COMMAND'"
             + " AND status = 'RUNNING' DO NOTHING";
     try (Connection c = dataSource.getConnection();
@@ -120,8 +121,9 @@ public class OperationStoreDao implements Service {
       ps.setString(6, row.resultKeyPrefix());
       ps.setString(7, row.mode().name());
       ps.setBoolean(8, row.ordered());
-      ps.setBytes(9, row.schemaBytes());
-      ps.setString(10, row.engineRef());
+      ps.setBoolean(9, row.scrollable());
+      ps.setBytes(10, row.schemaBytes());
+      ps.setString(11, row.engineRef());
       if (ps.executeUpdate() == 1) {
         countRegistered("COMMAND");
         return row.status(OperationRow.Status.RUNNING);
@@ -348,6 +350,7 @@ public class OperationStoreDao implements Service {
         .commandResult(rs.getBytes("command_result"))
         .mode(OperationRow.Mode.parse(rs.getString("mode")))
         .ordered(rs.getBoolean("ordered"))
+        .scrollable(rs.getBoolean("scrollable"))
         .schemaBytes(rs.getBytes("schema_bytes"))
         .status(OperationRow.Status.valueOf(rs.getString("status")))
         .connectOperationId(rs.getString("connect_operation_id"))
