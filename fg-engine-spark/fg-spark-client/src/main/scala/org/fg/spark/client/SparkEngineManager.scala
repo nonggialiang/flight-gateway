@@ -6,6 +6,7 @@ import io.micrometer.core.instrument.MeterRegistry
 import org.fg.common.config.GatewayConfig
 import org.fg.ha.EngineNode
 import org.fg.ha.FgZkClient
+import org.slf4j.LoggerFactory
 
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
@@ -38,6 +39,8 @@ private[client] class SparkEngineManager(
     config: GatewayConfig,
     zk: FgZkClient,
     meterRegistry: MeterRegistry) extends AutoCloseable {
+
+  private val log = LoggerFactory.getLogger(getClass)
 
   private val initTimeoutMs = config.getDurationMs("fg.engine.initialize.timeout")
   private val lockTimeoutMs = (initTimeoutMs * 1.1).toLong
@@ -98,6 +101,7 @@ private[client] class SparkEngineManager(
     followLaunch(key.space, {
       val space = key.space
       Option(engines.remove(space)).foreach { me =>
+        log.info("recovering engine space={} stale={}", space, me.node)
         try {
           zk.deregisterIfStale(space, if (key.isConnection) null else key.lockPath,
             me.node.host(), me.node.connectPort(), lockTimeoutMs)
@@ -164,6 +168,9 @@ private[client] class SparkEngineManager(
     launchesCounter.increment()
     var launched: LaunchedEngine = null
     try {
+      log.info("launching engine space={} refId={} connectPort={} adminPort={} deploy={}",
+        space, refId, connectPort, adminPort,
+        config.getString("fg.engine.spark.launch.deploy-mode"))
       launched = launcher.launch(key, space, refId, connectPort, adminPort)
       val deadline = System.currentTimeMillis() + initTimeoutMs
       var result: ManagedEngine = null
@@ -171,6 +178,7 @@ private[client] class SparkEngineManager(
         val found = zk.engineByRefId(space, refId) // java Optional
         if (found.isPresent) {
           result = cache(space, found.get())
+          log.info("engine registered space={} refId={} node={}", space, refId, result.node)
         } else {
           if (launched.exitedAbnormally) {
             throw new IllegalStateException(
@@ -178,6 +186,8 @@ private[client] class SparkEngineManager(
           }
           if (System.currentTimeMillis() > deadline) {
             launched.destroy()
+            // cluster 模式此 destroy 只及 submitter（已早退）：卡死引擎无 admin 句柄可达，
+            // 依赖引擎侧 idle 看门狗 / max-lifetime 自愈（D22-c 已知边界）
             throw new IllegalStateException(
               s"engine registration timeout after ${initTimeoutMs}ms (refId=$refId)")
           }
@@ -235,6 +245,7 @@ private[client] class SparkEngineManager(
         if (!stillThere) {
           engines.remove(me.space, me)
           closeQuietly(me.client)
+          log.debug("evicted engine {} (znode gone): {}", me.space, me.node)
         }
       } catch {
         case _: Exception => // ZK 抖动：本轮跳过
