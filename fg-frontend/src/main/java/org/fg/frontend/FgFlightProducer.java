@@ -311,6 +311,12 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
         .withSqlDdlCatalog(true)
         .withSqlDdlSchema(true)
         .withSqlDdlTable(true)
+        // D27：TYPE_SCROLL_INSENSITIVE = 服务端分页随机翻页（x-fg-result-set-type 判据）
+        .withSqlSupportedResultSetTypes(
+            org.apache.arrow.flight.sql.impl.FlightSql.SqlSupportedResultSetType
+                .SQL_RESULT_SET_TYPE_FORWARD_ONLY,
+            org.apache.arrow.flight.sql.impl.FlightSql.SqlSupportedResultSetType
+                .SQL_RESULT_SET_TYPE_SCROLL_INSENSITIVE)
         .send(command.getInfoList(), listener);
   }
 

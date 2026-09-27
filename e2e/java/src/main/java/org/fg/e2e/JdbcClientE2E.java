@@ -45,6 +45,7 @@ public final class JdbcClientE2E {
         case "set" -> set(conn);
         case "cancel" -> cancel(conn);
         case "cancel-poll" -> cancelPoll(conn);
+        case "scroll-paging" -> scrollPaging(conn);
         default -> throw new IllegalArgumentException("unknown case " + which);
       }
     }
@@ -451,4 +452,128 @@ public final class JdbcClientE2E {
   }
 
   private JdbcClientE2E() {}
+
+  // ------------------------------------------------------------- D27 scroll 分页
+
+  /**
+   * D27：TYPE_SCROLL_INSENSITIVE → 网关服务端分页（x-fg-result-set-type: scroll 判据 +
+   * DoGet 页头切片）。断言：absolute 随机跳页逐值、last/first/previous/afterLast 语义、
+   * fetchSize=页大小、FORWARD_ONLY 回归不受影响、DatabaseMetaData 宣告 scroll 支持。
+   */
+  private static void scrollPaging(Connection conn) throws Exception {
+    // ① 宣告面
+    try (var md = conn.createStatement(); ResultSet probe = md.executeQuery("SELECT 1")) {
+      // supportsResultSetType 经 SqlInfo 位图驱动
+      boolean scrollSupported =
+          conn.getMetaData().supportsResultSetType(ResultSet.TYPE_SCROLL_INSENSITIVE);
+      System.out.println("[jdbc-scroll] supportsResultSetType(SCROLL_INSENSITIVE)=" + scrollSupported);
+      if (!scrollSupported) {
+        throw new AssertionError("gateway SqlInfo should advertise SCROLL_INSENSITIVE (D27)");
+      }
+    }
+
+    // ② 随机翻页（fetchSize=50 → 页大小 50）
+    try (Statement st = conn.createStatement(
+        ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY)) {
+      if (st.getResultSetType() != ResultSet.TYPE_SCROLL_INSENSITIVE) {
+        throw new AssertionError("getResultSetType != SCROLL_INSENSITIVE");
+      }
+      st.setFetchSize(50);
+      try (ResultSet rs = st.executeQuery("SELECT id, id * 2 AS dbl FROM range(297) ORDER BY id")) {
+        // 顺序读第一页
+        for (int i = 0; i < 50; i++) {
+          if (!rs.next()) throw new AssertionError("next@" + i);
+          check(rs, i, i + 1, i == 0, false);
+        }
+        // 随机跳：absolute(101) → 0 基 100
+        if (!rs.absolute(101)) throw new AssertionError("absolute(101)");
+        check(rs, 100, 101, false, false);
+        // previous 语义
+        if (!rs.previous()) throw new AssertionError("previous");
+        check(rs, 99, 100, false, false);
+        // 再跳最后一页
+        if (!rs.last()) throw new AssertionError("last");
+        check(rs, 296, 297, false, true);
+        if (!rs.next() && !rs.isAfterLast()) throw new AssertionError("after last");
+        if (rs.next()) throw new AssertionError("next after last must be false");
+        // first + relative
+        if (!rs.first()) throw new AssertionError("first");
+        check(rs, 0, 1, true, false);
+        if (!rs.relative(150)) throw new AssertionError("relative(150)");
+        check(rs, 150, 151, false, false);
+        if (!rs.relative(-150)) throw new AssertionError("relative(-150)");
+        check(rs, 0, 1, true, false);
+        // 负 absolute：-1 = 最后一行
+        if (!rs.absolute(-1)) throw new AssertionError("absolute(-1)");
+        check(rs, 296, 297, false, true);
+        // afterLast + 逆序遍历计数
+        rs.afterLast();
+        int seen = 0;
+        long lastId = 297;
+        while (rs.previous()) {
+          long id = rs.getLong(1);
+          long dbl = rs.getLong(2);
+          if (id != lastId - 1 || dbl != id * 2) throw new AssertionError("reverse@" + id);
+          lastId = id;
+          seen++;
+        }
+        if (seen != 297) throw new AssertionError("reverse count " + seen);
+        // 越界 absolute
+        if (rs.absolute(298)) throw new AssertionError("absolute beyond must be false");
+        if (!rs.isAfterLast()) throw new AssertionError("beyond -> afterLast");
+      }
+    }
+    System.out.println("[jdbc-scroll] absolute/previous/last/relative/reverse 全语义 PASS");
+
+    // ③ 大结果翻页（fetchSize=1000；跨页跳）
+    try (Statement st = conn.createStatement(
+        ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY)) {
+      st.setFetchSize(1000);
+      try (ResultSet rs = st.executeQuery("SELECT id FROM range(70000) ORDER BY id")) {
+        if (!rs.absolute(65537)) throw new AssertionError("absolute(65537)");
+        if (rs.getLong(1) != 65536) throw new AssertionError("row value " + rs.getLong(1));
+        if (!rs.absolute(1)) throw new AssertionError("absolute(1)");
+        if (rs.getLong(1) != 0) throw new AssertionError("first row " + rs.getLong(1));
+        if (!rs.last()) throw new AssertionError("last");
+        if (rs.getLong(1) != 69999) throw new AssertionError("last row " + rs.getLong(1));
+        if (rs.getRow() != 70000) throw new AssertionError("getRow " + rs.getRow());
+      }
+    }
+    System.out.println("[jdbc-scroll] 70k 大结果跨页跳 PASS");
+
+    // ④ FORWARD_ONLY 回归（默认类型不受影响）
+    try (Statement st = conn.createStatement();
+        ResultSet rs = st.executeQuery("SELECT id FROM range(10) ORDER BY id")) {
+      int n = 0;
+      while (rs.next()) {
+        if (rs.getLong(1) != n) throw new AssertionError("forward@" + n);
+        n++;
+      }
+      if (n != 10) throw new AssertionError("forward count " + n);
+      try {
+        rs.absolute(5);
+        throw new AssertionError("absolute on FORWARD_ONLY must throw");
+      } catch (SQLException expected) {
+        // ok
+      }
+    }
+    System.out.println("[jdbc-scroll] FORWARD_ONLY 回归 + absolute 拒绝 PASS");
+    System.out.println("[jdbc-scroll] PASS");
+  }
+
+  private static void check(ResultSet rs, long expectedId, int expectedRow,
+      boolean first, boolean last) throws Exception {
+    long id = rs.getLong(1);
+    long dbl = rs.getLong(2);
+    if (id != expectedId || dbl != expectedId * 2) {
+      throw new AssertionError("row content " + id + "/" + dbl + " expected " + expectedId);
+    }
+    if (rs.getRow() != expectedRow) {
+      throw new AssertionError("getRow " + rs.getRow() + " expected " + expectedRow);
+    }
+    if (rs.isFirst() != first || rs.isLast() != last) {
+      throw new AssertionError("isFirst/isLast " + rs.isFirst() + "/" + rs.isLast()
+          + " expected " + first + "/" + last);
+    }
+  }
 }

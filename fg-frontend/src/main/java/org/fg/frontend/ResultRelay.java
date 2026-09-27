@@ -212,7 +212,6 @@ final class ResultRelay {
       org.apache.arrow.vector.types.pojo.Schema schema = readSchema(schemaMessage, child);
       out = VectorSchemaRoot.create(schema, child);
       listener.start(out);
-      VectorLoader loader = new VectorLoader(out);
 
       long emitted = 0;
       if (offset < total) {
@@ -232,16 +231,14 @@ final class ResultRelay {
                       "batch index stale for " + objectKey + " batch#" + bs.batchIndex());
                 }
                 VectorSchemaRoot src = reader.getVectorSchemaRoot();
-                emitted += emitSlice(
-                    src, bs.start(), bs.rows(), loader, out, listener, t.queryId(), child);
+                emitted += appendSlice(src, bs.start(), bs.rows(), out);
                 remaining -= bs.rows();
               }
             }
           } else {
             // fallback：整 part 顺序读，行区间裁剪（.bidx 缺席/损坏）
             emitted += relayFallbackRange(
-                objectKey, schemaMessage, ps.offset(), ps.rows(), loader, out, listener,
-                t.queryId(), child);
+                objectKey, ps.offset(), ps.rows(), out, t.queryId(), child);
             remaining -= ps.rows();
           }
           if (remaining <= 0) {
@@ -251,6 +248,11 @@ final class ResultRelay {
       }
       logger.info("Scroll page: {} offset={} limit={} total={} emitted={}",
           t.queryId(), offset, limit, total, emitted);
+      if (out.getRowCount() > 0) {
+        // 单页单 batch：驱动以整页为装载单元（页 LRU 缓存的原子粒度）；空页只 start+completed
+        putNextWhenClientReady(
+            listener, config.getDurationMs("fg.relay.client.readiness.timeout"), t.queryId());
+      }
       listener.completed();
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -269,12 +271,9 @@ final class ResultRelay {
   /** fallback 路径：整 part 顺序读，仅装载 [offset, offset+rows) 行。 */
   private long relayFallbackRange(
       String objectKey,
-      byte[] schemaMessage,
       long offset,
       long rows,
-      VectorLoader loader,
       VectorSchemaRoot out,
-      ServerStreamListener listener,
       String queryId,
       BufferAllocator child)
       throws Exception {
@@ -291,9 +290,7 @@ final class ResultRelay {
         long sliceStart = Math.max(offset, batchStart);
         long sliceEnd = Math.min(offset + rows, cursor);
         if (sliceEnd > sliceStart) {
-          emitted += emitSlice(
-              src, sliceStart - batchStart, sliceEnd - sliceStart, loader, out, listener, queryId,
-              child);
+          emitted += appendSlice(src, sliceStart - batchStart, sliceEnd - sliceStart, out);
           need -= sliceEnd - sliceStart;
         }
       }
@@ -301,50 +298,24 @@ final class ResultRelay {
     return emitted;
   }
 
-  /** 装载（必要时裁剪）一段行区间到输出 root 并 putNext（背压沿用泵语义）。 */
-  private long emitSlice(
-      VectorSchemaRoot src,
-      long start,
-      long count,
-      VectorLoader loader,
-      VectorSchemaRoot out,
-      ServerStreamListener listener,
-      String queryId,
-      BufferAllocator child)
-      throws Exception {
+  /**
+   * 把 src 的行区间 [start, start+count) 追加到输出 root 末尾（copyValueSafe 逐行，容量自扩）。
+   * 多个 slice 追加成一页后由调用方单次 putNext（单页单 batch 契约，D27-c 驱动页装载单元）。
+   */
+  private long appendSlice(VectorSchemaRoot src, long start, long count, VectorSchemaRoot out) {
     if (count <= 0) {
       return 0;
     }
-    if (start == 0 && count == src.getRowCount()) {
-      ArrowRecordBatch batch = new VectorUnloader(src).getRecordBatch();
-      try {
-        loader.load(batch);
-      } finally {
-        batch.close();
-      }
-    } else {
-      // 行区间裁剪：逐向量 splitAndTransfer（多数类型为 buffer 切片）→ 临时 root → 卸载装载
-      VectorSchemaRoot sliced = VectorSchemaRoot.create(src.getSchema(), child);
-      try {
-        for (org.apache.arrow.vector.types.pojo.Field field : src.getSchema().getFields()) {
-          org.apache.arrow.vector.ValueVector from = src.getVector(field.getName());
-          org.apache.arrow.vector.ValueVector to = sliced.getVector(field.getName());
-          from.makeTransferPair(to).splitAndTransfer((int) start, (int) count);
-        }
-        sliced.setRowCount((int) count);
-        ArrowRecordBatch batch = new VectorUnloader(sliced).getRecordBatch();
-        try {
-          loader.load(batch);
-        } finally {
-          batch.close();
-        }
-      } finally {
-        sliced.close();
+    int base = out.getRowCount();
+    for (org.apache.arrow.vector.types.pojo.Field field : src.getSchema().getFields()) {
+      org.apache.arrow.vector.ValueVector from = src.getVector(field.getName());
+      org.apache.arrow.vector.ValueVector to = out.getVector(field.getName());
+      org.apache.arrow.vector.util.TransferPair tp = from.makeTransferPair(to);
+      for (int i = 0; i < count; i++) {
+        tp.copyValueSafe((int) (start + i), base + i);
       }
     }
-    out.setRowCount((int) count);
-    putNextWhenClientReady(listener, config.getDurationMs("fg.relay.client.readiness.timeout"),
-        queryId);
+    out.setRowCount(base + (int) count);
     return count;
   }
 
