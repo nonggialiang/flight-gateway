@@ -87,6 +87,9 @@ final class ResultRelay {
     metrics.counter("fg.relay.streams", "kind", t.kind().name()).increment();
 
     boolean paged = t.kind() == TicketKind.STREAM && paging != null && paging.offset() != null;
+    if (paged) {
+      metrics.counter("fg.scroll.pages").increment(); // D27：页 DoGet 量（驱动翻页频率）
+    }
     // 在途等待，预算按票 kind 分策略（D15/D18/设计 §4.7）：
     //   STREAM（legacy GetFlightInfo 快返票）——票可能在查询 RUNNING 时就到 DoGet，且 legacy
     //     客户端没有 poll 循环可退避，等待预算 = fg.query.timeout（D9 唯一护栏），挂满查询全程；
