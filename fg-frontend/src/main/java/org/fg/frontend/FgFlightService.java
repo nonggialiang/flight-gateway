@@ -57,7 +57,11 @@ public final class FgFlightService implements Service {
         new FgFlightProducer(orchestrator, endpoints, relay, config, relayExecutor, allocator);
 
     int port = config.getInt(GatewayConfig.FLIGHT_PORT);
-    Location listenLocation = Location.forGrpcInsecure("0.0.0.0", port);
+    boolean tlsEnabled = config.getBoolean(GatewayConfig.FLIGHT_TLS_ENABLED);
+    // D25：TLS 时 listen location 同步切 grpc+tls（bind host:port 不变，scheme 保持一致语义）
+    Location listenLocation = tlsEnabled
+        ? Location.forGrpcTls("0.0.0.0", port)
+        : Location.forGrpcInsecure("0.0.0.0", port);
     FlightServer.Builder builder =
         FlightServer.builder(allocator, listenLocation, producer)
             // D15 header 协商：捕获 x-fg-endpoint-mode（https|relay），注册时落行
@@ -75,10 +79,14 @@ public final class FgFlightService implements Service {
             // if/else 单选）；而 JDBC 驱动只说 auth2 → 统一 auth2。Bearer 优先/Basic 回退/签
             // 发 token 见 FgBearerTokenAuthenticator（DremioBearerTokenAuthenticator 范式）。
             .headerAuthenticator(new FgBearerTokenAuthenticator(config));
-    if (config.getBoolean(GatewayConfig.FLIGHT_TLS_ENABLED)) {
-      // M3：KeyStore→PEM（照 Dremio SSLConfigurator 范式）；M1 开发态默认关闭
-      throw new IllegalStateException(
-          "TLS requires keystore wiring (M3); set fg.flight.tls.enabled=false for dev");
+    if (tlsEnabled) {
+      // D25：PEM 双文件 / KeyStore(PKCS12/JKS) 二选一，可选 mTLS 客户端验证
+      //（材料缺失/混用在此快败，见 ServerTlsMaterial）
+      ServerTlsMaterial tls = ServerTlsMaterial.load(config);
+      builder.useTls(tls.certChain(), tls.key());
+      if (tls.clientCaCert().isPresent()) {
+        builder.useMTlsClientVerification(tls.clientCaCert().get());
+      }
     }
     server = builder.build();
     server.start();

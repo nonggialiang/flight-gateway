@@ -17,8 +17,21 @@ import pyarrow
 import pyarrow.flight as fl
 
 GW = b"grpc://localhost:32010"
+GW_TLS = b"grpc+tls://127.0.0.1:32010"  # IP-literal：对 server 证书 SAN IP:127.0.0.1 校验（D25）
 USER, PASSWORD = "fg", "fg"
 TYPE_QUERY = "type.googleapis.com/arrow.flight.protocol.sql.CommandStatementQuery"
+
+# TLS 状态（D25 tls 用例置位；poll 直打通道据此切换 secure/insecure）
+TLS = {"root_certs": None}
+
+
+def poll_channel():
+    import grpc
+    if TLS["root_certs"]:
+        return grpc.secure_channel(
+            "127.0.0.1:32010",
+            grpc.ssl_channel_credentials(root_certificates=TLS["root_certs"]))
+    return grpc.insecure_channel("localhost:32010")
 
 # ---------------- protobuf 手工编码 ----------------
 
@@ -98,10 +111,13 @@ class Client:
     D20 会话身份：无 cookie 能力 → 自报 x-fg-session-id 头（每进程随机；sid= 参数
     可显式指定，session-lifecycle 用例轮换/复用）；closed 后须换 id 重建。"""
 
-    def __init__(self, sid=None, user=USER, password=PASSWORD):
+    def __init__(self, sid=None, user=USER, password=PASSWORD, tls_root_certs=None):
         import uuid
         self.session_id = sid or str(uuid.uuid4())
-        self.fc = fl.FlightClient(GW)
+        if tls_root_certs:
+            self.fc = fl.FlightClient(GW_TLS, tls_root_certs=tls_root_certs)
+        else:
+            self.fc = fl.FlightClient(GW)
         self.token = self.fc.authenticate_basic_token(user, password)
         assert self.token[0] == b"authorization" and self.token[1].startswith(b"Bearer "), \
             f"unexpected token header: {self.token!r}"
@@ -148,7 +164,7 @@ def poll_flight_info(c, sql, expect_rows, max_polls=90,
     轻回流的 pending 用例用）。"""
     import grpc
 
-    ch = grpc.insecure_channel("localhost:32010")
+    ch = poll_channel()
     # auth2 + D20 会话身份：复用 Client 全部头（Authorization + x-fg-session-id）
     md = tuple((k.decode(), v.decode()) for k, v in c.headers)
 
@@ -236,7 +252,7 @@ def poll_terminal(c, sql, max_polls=90, extra_headers=()):
     extra_headers：注册期协商头透传（D15 模式协商等），如
     ("x-fg-endpoint-mode", "https")——https 用例自包含，无需网关特殊启动。"""
     import grpc
-    ch = grpc.insecure_channel("localhost:32010")
+    ch = poll_channel()
     md = tuple((k.decode(), v.decode()) for k, v in c.headers) + tuple(extra_headers)
     any_msg = f_string(1, TYPE_QUERY) + f_bytes(2, f_string(1, sql))
     descriptor = varint((1 << 3) | 0) + varint(2) + f_bytes(2, any_msg)
@@ -925,6 +941,43 @@ def engine_connection_share(c):
     print("[engine-connection-share] PASS（会话级引擎 + CloseSession 下线 + 邻居存活）")
 
 
+def gateway_tls(c):
+    """服务端 TLS（D25）：证书链校验 + auth2 + 查询/poll/DoGet relay 全链路 + 负向
+    （明文客户端被拒、错误凭证被拒）。前置：`~/fg-e2e/gen-certs.sh` + TLS 网关
+    `~/fg-e2e/gw-tls.sh [pem|p12]` + 默认固定引擎 `~/fg-e2e/engine-fixed.sh`。"""
+    ca = open("/Users/nonggia/fg-e2e/certs/ca.crt", "rb").read()
+    TLS["root_certs"] = ca
+    try:
+        t = Client(tls_root_certs=ca)
+        legacy_get_flight_info(t, "SELECT id, id * 2 AS dbl FROM range(100)", 100)
+        poll_flight_info(t, "SELECT id FROM range(50)", 50, max_polls=60)
+        # 会话生命周期动作面（DoAction）同走 TLS
+        results = list(t.do_action(fl.Action("CloseSession", b"")))
+        status = next((v for f, w, v in walk(results[0].body.to_pybytes()) if f == 1), None)
+        assert status == 1, f"[tls] CloseSession status={status}"
+        print("[tls] legacy/poll/DoGet/DoAction over TLS PASS")
+
+        # 负向：错误凭证（auth2 在 TLS 上照常拒）
+        err = None
+        try:
+            Client(password="wrong", tls_root_certs=ca).get_flight_info(
+                command_descriptor("SELECT 1"))
+        except Exception as e:
+            err = e
+        assert err is not None, "[tls] 错误凭证未被拒"
+        # 负向：明文客户端打 TLS 端口（握手层拒绝）
+        err = None
+        try:
+            Client().get_flight_info(command_descriptor("SELECT 1"))
+        except Exception as e:
+            err = e
+        assert err is not None, "[tls] 明文客户端未被拒"
+        print("[tls] negatives PASS（bad creds / plaintext rejected）")
+    finally:
+        TLS["root_certs"] = None
+    print("[tls] PASS（TLS 全链路 + 负向）")
+
+
 def engine_cluster(c):
     """cluster 拉起模式（D22/D24）：standalone master(spark://localhost:7077) 上 driver
     由 worker 拉起。前置：`~/fg-e2e/cluster-up.sh` + 网关 `~/fg-e2e/gw-cluster.sh`
@@ -960,7 +1013,8 @@ def engine_cluster(c):
 
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "legacy"
-    c = client()
+    # tls 用例自建 TLS 客户端（默认明文 client 打 TLS 端口会在握手层失败）
+    c = None if which == "tls" else client()
     if which == "legacy":
         legacy_get_flight_info(c, "SELECT id, id * 2 AS dbl, concat('v-', cast(id as STRING)) AS s FROM range(1000)", 1000)
     elif which == "legacy-long":
@@ -1048,5 +1102,9 @@ if __name__ == "__main__":
     elif which == "engine-cluster":
         # 前置：~/fg-e2e/cluster-up.sh（standalone master 7077+worker）+ ~/fg-e2e/gw-cluster.sh 网关
         engine_cluster(c)
+    # ---------------- D25 TLS ----------------
+    elif which == "tls":
+        # 前置：~/fg-e2e/gen-certs.sh + ~/fg-e2e/gw-tls.sh [pem|p12] + ~/fg-e2e/engine-fixed.sh
+        gateway_tls(c)
     else:
         raise SystemExit(f"unknown case {which}")
