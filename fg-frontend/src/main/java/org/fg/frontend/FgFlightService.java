@@ -71,6 +71,8 @@ public final class FgFlightService implements Service {
             .middleware(EndpointModeMiddleware.KEY, new EndpointModeMiddleware.Factory())
             // D27 scroll 判据：捕获 x-fg-result-set-type（scroll），注册时落行 + 强制 relay
             .middleware(ScrollModeMiddleware.KEY, new ScrollModeMiddleware.Factory())
+            // D27 页头：DoGet 时捕获 x-fg-page-offset/limit（STREAM 票页切片）
+            .middleware(PagingMiddleware.KEY, new PagingMiddleware.Factory())
             // D20 会话身份（fg-p2 严格模式）：服务端零铸造，身份一律客户端携带——
             // cookie（arrow_flight_session_id，供已持有者）或 x-fg-session-id 自报头
             //（主通道：FG JDBC 驱动 fg-p2 每连接自动生成；pyarrow/ADBC 经连接选项）

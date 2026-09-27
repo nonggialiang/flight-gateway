@@ -66,6 +66,14 @@ final class ResultRelay {
   }
 
   void relay(String user, Ticket ticket, ServerStreamListener listener) {
+    relay(user, ticket, listener, null);
+  }
+
+  void relay(
+      String user,
+      Ticket ticket,
+      ServerStreamListener listener,
+      PagingMiddleware.PageRequest paging) {
     RelayTicket t;
     try {
       t = ticketCodec.decode(new String(ticket.getBytes(), java.nio.charset.StandardCharsets.UTF_8), user);
@@ -78,6 +86,7 @@ final class ResultRelay {
     }
     metrics.counter("fg.relay.streams", "kind", t.kind().name()).increment();
 
+    boolean paged = t.kind() == TicketKind.STREAM && paging != null && paging.offset() != null;
     // 在途等待，预算按票 kind 分策略（D15/D18/设计 §4.7）：
     //   STREAM（legacy GetFlightInfo 快返票）——票可能在查询 RUNNING 时就到 DoGet，且 legacy
     //     客户端没有 poll 循环可退避，等待预算 = fg.query.timeout（D9 唯一护栏），挂满查询全程；
@@ -85,10 +94,12 @@ final class ResultRelay {
     //     挂满命令全程（fg.command.timeout 先行熔断 + sweeper 兜底，此预算只是上限）；
     //   PART（poll 终态票）——铸造时行已 CAS 终态（单向），到达 DoGet 时必然 COMPLETED，
     //     零等待；若见 RUNNING 即异常态，快速 UNAVAILABLE 暴露而非长等掩盖。
+    //   分页 STREAM（D27）——同 PART：页只服务终态数据（驱动先拿 total_records 才翻页），
+    //     RUNNING 即 UNAVAILABLE，不占 relay 池长挂。
     // 长等待传入 listener::isCancelled：客户端断流后在一个 fg.poll.db.interval 内释放
     // 有界 relay 池线程（否则 600s 预算下废弃流会占满池）。
     Duration waitBudget =
-        t.kind() == TicketKind.PART
+        t.kind() == TicketKind.PART || paged
             ? Duration.ZERO
             : Duration.ofMillis(config.getDurationMs("fg.query.timeout"));
     QueryOrchestrator.PollOutcome outcome;
@@ -130,6 +141,12 @@ final class ResultRelay {
       return;
     }
 
+    // D27：分页 STREAM——页切片（row 级 [offset, offset+limit)），无头路径不进此分支
+    if (paged) {
+      scrollPage(t, manifest, paging, listener);
+      return;
+    }
+
     List<ResultManifest.Part> parts = manifest.parts();
     if (t.kind() == TicketKind.PART) {
       parts =
@@ -161,6 +178,198 @@ final class ResultRelay {
       fail(listener, CallStatus.INTERNAL, "Relay failed: " + e.getMessage());
     } finally {
       closePump(pump, child);
+    }
+  }
+
+  // ------------------------------------------------------------- D27 分页 STREAM（scroll）
+
+  /**
+   * 页切片：row 级 {@code [offset, offset+limit)}。两级收敛（Dremio loadJobData 同构）：
+   * manifest per-part 行数选相交 part（不相交 part 不打开）→ per-part .bidx 选相交 batch →
+   * Range GET 取单 encapsulated message →（schema message + 该 message + EOS 的 mini stream
+   * 解码——ArrowStreamReader 不能直读裸 batch 切片）→ 首尾 batch 经 splitAndTransfer 裁行。
+   * .bidx 缺席/损坏回落整 part 顺序读（优化非正确性依赖）。clamp：limit 缺省
+   * {@code fg.result.page.default-rows}、上限 {@code fg.result.page.max-rows}；offset ≥ 总行数
+   * 返回空页（非空 schema 承诺照旧）。
+   */
+  private void scrollPage(
+      RelayTicket t, ResultManifest manifest, PagingMiddleware.PageRequest paging,
+      ServerStreamListener listener) {
+    long defaultRows = config.getInt("fg.result.page.default-rows");
+    long maxRows = config.getInt("fg.result.page.max-rows");
+    long offset = paging.offset();
+    long limit = paging.limit() == null || paging.limit() <= 0
+        ? defaultRows : Math.min(paging.limit(), maxRows);
+
+    List<ResultManifest.Part> parts = manifest.parts();
+    long[] partRows = parts.stream().mapToLong(ResultManifest.Part::recordCount).toArray();
+    long total = manifest.rowCount();
+
+    byte[] schemaMessage = java.util.Base64.getDecoder().decode(manifest.schemaBase64());
+    BufferAllocator child = allocator.newChildAllocator("fg-page-" + t.queryId(), 0, Long.MAX_VALUE);
+    VectorSchemaRoot out = null;
+    try {
+      org.apache.arrow.vector.types.pojo.Schema schema = readSchema(schemaMessage, child);
+      out = VectorSchemaRoot.create(schema, child);
+      listener.start(out);
+      VectorLoader loader = new VectorLoader(out);
+
+      long emitted = 0;
+      if (offset < total) {
+        long remaining = limit;
+        for (ScrollPagePlanner.PartSlice ps : ScrollPagePlanner.planParts(partRows, offset, limit)) {
+          ResultManifest.Part part = parts.get(ps.partIndex());
+          String objectKey = ObjectStoreService.objectName(part.uri());
+          org.fg.result.manifest.BatchIndex bidx = objects.readBatchIndex(objectKey);
+          if (bidx != null) {
+            for (ScrollPagePlanner.BatchSlice bs
+                : ScrollPagePlanner.planBatches(bidx, ps.offset(), ps.rows())) {
+              org.fg.result.manifest.BatchIndex.Batch b = bidx.batches().get(bs.batchIndex());
+              byte[] message = readRange(objectKey, b.offset(), b.length());
+              try (ArrowStreamReader reader = miniStream(schemaMessage, message, child)) {
+                if (!reader.loadNextBatch()) {
+                  throw new IllegalStateException(
+                      "batch index stale for " + objectKey + " batch#" + bs.batchIndex());
+                }
+                VectorSchemaRoot src = reader.getVectorSchemaRoot();
+                emitted += emitSlice(
+                    src, bs.start(), bs.rows(), loader, out, listener, t.queryId(), child);
+                remaining -= bs.rows();
+              }
+            }
+          } else {
+            // fallback：整 part 顺序读，行区间裁剪（.bidx 缺席/损坏）
+            emitted += relayFallbackRange(
+                objectKey, schemaMessage, ps.offset(), ps.rows(), loader, out, listener,
+                t.queryId(), child);
+            remaining -= ps.rows();
+          }
+          if (remaining <= 0) {
+            break;
+          }
+        }
+      }
+      logger.info("Scroll page: {} offset={} limit={} total={} emitted={}",
+          t.queryId(), offset, limit, total, emitted);
+      listener.completed();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      fail(listener, CallStatus.INTERNAL, "Page relay interrupted");
+    } catch (Exception e) {
+      logger.warn("Scroll page failed for {}: {}", t.queryId(), e.toString());
+      fail(listener, CallStatus.INTERNAL, "Scroll page failed: " + e.getMessage());
+    } finally {
+      if (out != null) {
+        out.close();
+      }
+      child.close();
+    }
+  }
+
+  /** fallback 路径：整 part 顺序读，仅装载 [offset, offset+rows) 行。 */
+  private long relayFallbackRange(
+      String objectKey,
+      byte[] schemaMessage,
+      long offset,
+      long rows,
+      VectorLoader loader,
+      VectorSchemaRoot out,
+      ServerStreamListener listener,
+      String queryId,
+      BufferAllocator child)
+      throws Exception {
+    long emitted = 0;
+    long cursor = 0;
+    long need = rows;
+    try (InputStream in = objects.getObject(objectKey);
+        ArrowStreamReader reader = new ArrowStreamReader(in, child)) {
+      VectorSchemaRoot src = reader.getVectorSchemaRoot();
+      while (need > 0 && reader.loadNextBatch()) {
+        int batchRows = src.getRowCount();
+        long batchStart = cursor;
+        cursor += batchRows;
+        long sliceStart = Math.max(offset, batchStart);
+        long sliceEnd = Math.min(offset + rows, cursor);
+        if (sliceEnd > sliceStart) {
+          emitted += emitSlice(
+              src, sliceStart - batchStart, sliceEnd - sliceStart, loader, out, listener, queryId,
+              child);
+          need -= sliceEnd - sliceStart;
+        }
+      }
+    }
+    return emitted;
+  }
+
+  /** 装载（必要时裁剪）一段行区间到输出 root 并 putNext（背压沿用泵语义）。 */
+  private long emitSlice(
+      VectorSchemaRoot src,
+      long start,
+      long count,
+      VectorLoader loader,
+      VectorSchemaRoot out,
+      ServerStreamListener listener,
+      String queryId,
+      BufferAllocator child)
+      throws Exception {
+    if (count <= 0) {
+      return 0;
+    }
+    if (start == 0 && count == src.getRowCount()) {
+      ArrowRecordBatch batch = new VectorUnloader(src).getRecordBatch();
+      try {
+        loader.load(batch);
+      } finally {
+        batch.close();
+      }
+    } else {
+      // 行区间裁剪：逐向量 splitAndTransfer（多数类型为 buffer 切片）→ 临时 root → 卸载装载
+      VectorSchemaRoot sliced = VectorSchemaRoot.create(src.getSchema(), child);
+      try {
+        for (org.apache.arrow.vector.types.pojo.Field field : src.getSchema().getFields()) {
+          org.apache.arrow.vector.ValueVector from = src.getVector(field.getName());
+          org.apache.arrow.vector.ValueVector to = sliced.getVector(field.getName());
+          from.makeTransferPair(to).splitAndTransfer((int) start, (int) count);
+        }
+        sliced.setRowCount((int) count);
+        ArrowRecordBatch batch = new VectorUnloader(sliced).getRecordBatch();
+        try {
+          loader.load(batch);
+        } finally {
+          batch.close();
+        }
+      } finally {
+        sliced.close();
+      }
+    }
+    out.setRowCount((int) count);
+    putNextWhenClientReady(listener, config.getDurationMs("fg.relay.client.readiness.timeout"),
+        queryId);
+    return count;
+  }
+
+  /** Range GET 读取单 encapsulated message 字节。 */
+  private byte[] readRange(String objectKey, long offset, long length) throws Exception {
+    try (InputStream in = objects.getObjectRange(objectKey, offset, length)) {
+      return in.readAllBytes();
+    }
+  }
+
+  /** schema message + 单 batch message + EOS → ArrowStreamReader（可直读的 mini stream）。 */
+  private ArrowStreamReader miniStream(byte[] schemaMessage, byte[] message, BufferAllocator a) {
+    java.io.ByteArrayOutputStream mini = new java.io.ByteArrayOutputStream();
+    byte[] eos = {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 0, 0, 0, 0};
+    mini.writeBytes(schemaMessage);
+    mini.writeBytes(message);
+    mini.write(eos, 0, eos.length);
+    return new ArrowStreamReader(new java.io.ByteArrayInputStream(mini.toByteArray()), a);
+  }
+
+  /** manifest.schemaBase64（schema IPC message）→ Schema。 */
+  private org.apache.arrow.vector.types.pojo.Schema readSchema(
+      byte[] schemaMessage, BufferAllocator a) throws java.io.IOException {
+    try (ArrowStreamReader reader = miniStream(schemaMessage, new byte[0], a)) {
+      return reader.getVectorSchemaRoot().getSchema();
     }
   }
 

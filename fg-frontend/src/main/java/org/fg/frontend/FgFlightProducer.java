@@ -276,8 +276,11 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     } catch (Exception e) {
       // 非 protobuf 票 → HMAC 信封
     }
-    // relay 阻塞等待只在有界 relay-executor（设计 §4.1）
-    relayExecutor.execute(() -> relay.relay(context.peerIdentity(), ticket, listener));
+    // relay 阻塞等待只在有界 relay-executor（设计 §4.1）；D27 页头（x-fg-page-offset/limit）
+    // 经 PagingMiddleware 捕获后随票下发——STREAM 票 + 页头 = scroll 页切片
+    PagingMiddleware paging = context.getMiddleware(PagingMiddleware.KEY);
+    PagingMiddleware.PageRequest page = paging == null ? null : paging.request();
+    relayExecutor.execute(() -> relay.relay(context.peerIdentity(), ticket, listener, page));
   }
 
   // ------------------- SqlInfo（JDBC DatabaseMetaData 最小面，设计 7.4；SqlInfoBuilder 照 Dremio 范式）

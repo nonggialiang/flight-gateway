@@ -1059,6 +1059,92 @@ def scroll_register(c):
     print("[scroll-register] PASS（落行/强制 relay/单 STREAM endpoint/无头全量）")
 
 
+def page_get(c, ticket_bytes, offset, limit=None):
+    """D27 页 DoGet：STREAM 票 + x-fg-page-offset/limit 头 → 该页行。"""
+    hdrs = [(b"x-fg-page-offset", str(offset).encode())]
+    if limit is not None:
+        hdrs.append((b"x-fg-page-limit", str(limit).encode()))
+    opts = fl.FlightCallOptions(headers=c.headers + hdrs, timeout=120)
+    return c.fc.do_get(fl.Ticket(ticket_bytes), options=opts).read_all()
+
+
+def scroll_page(c):
+    """D27 页切片全链路：已知序页逐值断言 / 跨 part 多重集一致 / 越界空页 /
+    默认 limit=1000 / max-rows clamp / 删 .bidx 后 fallback 正确。"""
+    import uuid
+    hdrs = (("x-fg-result-set-type", "scroll"),)
+
+    # ① 单 part 已知序（ORDER BY → 单 part；行内/batch 内切片逐值断言）
+    s = Client(sid=str(uuid.uuid4()))
+    eps, recs, qid = poll_terminal(
+        s, "SELECT id, id * 2 AS dbl FROM range(297) ORDER BY id", extra_headers=hdrs)
+    assert recs == 297
+    tk, _ = parse_endpoint(eps[0])
+    full = s.do_get(fl.Ticket(tk)).read_all().to_pydict()
+
+    p0 = page_get(s, tk, 0, 50)
+    assert p0.num_rows == 50 and p0.column_names == ["id", "dbl"]
+    assert p0.column("id").to_pylist() == list(range(0, 50))
+    p_mid = page_get(s, tk, 100, 50)
+    assert p_mid.column("id").to_pylist() == list(range(100, 150))
+    assert p_mid.column("dbl").to_pylist() == [i * 2 for i in range(100, 150)]
+    p_tail = page_get(s, tk, 250, 100)  # 尾段自然截断
+    assert p_tail.num_rows == 47 and p_tail.column("id").to_pylist()[-1] == 296
+    p_over = page_get(s, tk, 297, 10)  # offset == total → 空页（非空 schema）
+    assert p_over.num_rows == 0 and p_over.num_columns == 2
+    # 分页拼接 == 无头全量
+    import pyarrow as pa
+    pieces = [page_get(s, tk, off, 100) for off in range(0, 297, 100)]
+    assert pa.concat_tables(pieces).to_pydict() == full
+    print("[scroll-page] 单 part 页切片逐值 + 越界空页 + 拼接一致 OK")
+
+    # ② 跨 part（DISTRIBUTE BY → 多 part 无序）：分页拼接与全量多重集一致
+    s2 = Client(sid=str(uuid.uuid4()))
+    eps2, recs2, _ = poll_terminal(
+        s2, "SELECT id, id * 2 AS dbl FROM range(1500) DISTRIBUTE BY id", extra_headers=hdrs)
+    assert recs2 == 1500
+    tk2, _ = parse_endpoint(eps2[0])
+    full2 = s2.do_get(fl.Ticket(tk2)).read_all().to_pydict()
+    pieces2 = [page_get(s2, tk2, off, 500) for off in range(0, 1500, 500)]
+    assert sum(t.num_rows for t in pieces2) == 1500
+    got = pa.concat_tables(pieces2).to_pydict()
+    assert sorted(got["id"]) == sorted(full2["id"]) == list(range(1500))
+    assert sorted(got["dbl"]) == sorted(full2["dbl"])
+    print("[scroll-page] 跨 part 分页拼接多重集一致 OK")
+
+    # ③ 默认 limit（只带 offset 头）= 1000
+    p_def = page_get(s, tk, 0)  # 297 < 1000 → 全量
+    assert p_def.num_rows == 297
+
+    # ④ max-rows clamp：limit 超上限 → 恰 65536（fg.result.page.max-rows）
+    s4 = Client(sid=str(uuid.uuid4()))
+    eps4, recs4, _ = poll_terminal(
+        s4, "SELECT id FROM range(70000) ORDER BY id", extra_headers=hdrs)
+    assert recs4 == 70000
+    tk4, _ = parse_endpoint(eps4[0])
+    p_clamp = page_get(s4, tk4, 0, 999999)
+    assert p_clamp.num_rows == 65536
+    assert p_clamp.column("id").to_pylist()[0] == 0 and p_clamp.column("id").to_pylist()[-1] == 65535
+    p_next = page_get(s4, tk4, 65536, 999999)
+    assert p_next.num_rows == 70000 - 65536 and p_next.column("id").to_pylist()[0] == 65536
+    print("[scroll-page] 默认 limit + max-rows clamp OK")
+
+    # ⑤ fallback：删该查询全部 .bidx 边车 → 页仍正确（整 part 顺序读路径）
+    from minio import Minio
+    from minio.deleteobjects import DeleteObject
+    mc = Minio("localhost:9000", access_key="minioadmin", secret_key="minioadmin", secure=False)
+    prefix = f"results/spark/fg/{qid}/"
+    bidxs = [o.object_name for o in mc.list_objects("fg-results", prefix=prefix, recursive=True)
+             if o.object_name.endswith(".bidx")]
+    assert bidxs, "[scroll-page] 前置 .bidx 缺失（D27-a 写路径未生效？）"
+    for _ in mc.remove_objects("fg-results", [DeleteObject(n) for n in bidxs]):
+        pass  # lazy iterable，消费驱动删除
+    p_fb = page_get(s, tk, 120, 30)
+    assert p_fb.num_rows == 30 and p_fb.column("id").to_pylist() == list(range(120, 150))
+    print(f"[scroll-page] fallback（删除 {len(bidxs)} 个 .bidx 后页仍正确）OK")
+    print("[scroll-page] PASS（切片/跨 part/越界/默认页/clamp/fallback）")
+
+
 def engine_cluster(c):
     """cluster 拉起模式（D22/D24）：standalone master(spark://localhost:7077) 上 driver
     由 worker 拉起。前置：`~/fg-e2e/cluster-up.sh` + 网关 `~/fg-e2e/gw-cluster.sh`
@@ -1195,5 +1281,8 @@ if __name__ == "__main__":
     elif which == "scroll-register":
         # 任意模式网关 + 固定引擎（写路径 .bidx 边车同批落 MinIO）
         scroll_register(c)
+    elif which == "scroll-page":
+        # 前置同 scroll-register；断言页切片全链路
+        scroll_page(c)
     else:
         raise SystemExit(f"unknown case {which}")

@@ -111,6 +111,37 @@ public final class ObjectStoreService implements AutoCloseable {
     }
   }
 
+  /**
+   * D27 Range GET（batch 级随机读）：取对象 [offset, offset+length) 字节——页切片按
+   * .bidx 三元组取单 encapsulated message，不触碰对象其余部分。
+   */
+  public InputStream getObjectRange(String objectKey, long offset, long length) {
+    try {
+      return client.getObject(
+          GetObjectArgs.builder()
+              .bucket(bucket)
+              .object(objectKey)
+              .offset(offset)
+              .length(length)
+              .build());
+    } catch (Exception e) {
+      throw new IllegalStateException(
+          "Unable to get range " + objectKey + "[" + offset + "," + (offset + length) + ")", e);
+    }
+  }
+
+  /**
+   * D27：读 part 的 batch 索引边车（{part}.bidx）。<b>缺席/任何异常均返回 null</b>——
+   * 边车是优化不是正确性依赖，调用方回落整 part 顺序读（真实故障会在回落路径浮出）。
+   */
+  public org.fg.result.manifest.BatchIndex readBatchIndex(String partObjectKey) {
+    try (InputStream in = getObject(partObjectKey + BATCH_INDEX_SUFFIX)) {
+      return org.fg.result.manifest.BatchIndex.parse(in.readAllBytes());
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
   /** part uri（如 s3a://bucket/key 或纯 key）→ object key（去 scheme+bucket，仅留 key）。 */
   public static String objectName(String partUri) {
     if (!partUri.contains("://")) {
