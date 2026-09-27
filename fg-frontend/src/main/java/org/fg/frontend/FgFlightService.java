@@ -24,6 +24,7 @@ public final class FgFlightService implements Service {
   private final QueryOrchestrator orchestrator;
   private final ObjectStoreService objects;
   private final java.util.concurrent.ExecutorService relayExecutor;
+  private final io.micrometer.core.instrument.MeterRegistry metrics;
 
   private FlightServer server;
   private int boundPort;
@@ -33,12 +34,14 @@ public final class FgFlightService implements Service {
       BufferAllocator allocator,
       QueryOrchestrator orchestrator,
       ObjectStoreService objects,
-      java.util.concurrent.ExecutorService relayExecutor) {
+      java.util.concurrent.ExecutorService relayExecutor,
+      io.micrometer.core.instrument.MeterRegistry metrics) {
     this.config = config;
     this.allocator = allocator;
     this.orchestrator = orchestrator;
     this.objects = objects;
     this.relayExecutor = relayExecutor;
+    this.metrics = metrics;
   }
 
   @Override
@@ -52,7 +55,7 @@ public final class FgFlightService implements Service {
             Duration.ofMillis(config.getDurationMs("fg.result.ticket.ttl")));
     EndpointsAssembler endpoints = new EndpointsAssembler(config, objects, ticketCodec);
     ResultRelay relay =
-        new ResultRelay(orchestrator, objects, ticketCodec, config, allocator);
+        new ResultRelay(orchestrator, objects, ticketCodec, config, allocator, metrics);
     FgFlightProducer producer =
         new FgFlightProducer(orchestrator, endpoints, relay, config, relayExecutor, allocator);
 

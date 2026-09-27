@@ -28,9 +28,17 @@ import org.fg.common.service.Service;
 public class OperationStoreDao implements Service {
 
   private final DataSource dataSource;
+  private final io.micrometer.core.instrument.MeterRegistry metrics;
 
   public OperationStoreDao(DataSource dataSource) {
+    this(dataSource, new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
+  }
+
+  /** D26：注册/终态计数在此汇点（所有 CAS 路径——attach/对账/sweeper/cancel——统一覆盖）。 */
+  public OperationStoreDao(
+      DataSource dataSource, io.micrometer.core.instrument.MeterRegistry metrics) {
     this.dataSource = dataSource;
+    this.metrics = metrics;
   }
 
   @Override
@@ -38,6 +46,16 @@ public class OperationStoreDao implements Service {
 
   @Override
   public void close() {}
+
+  /** fg.query.registered{kind}——只计真实新建行（executeUpdate==1；poll 重注册不计）。 */
+  private void countRegistered(String kind) {
+    metrics.counter("fg.query.registered", "kind", kind).increment();
+  }
+
+  /** fg.query.outcome{outcome}——只计 CAS 赢得终态迁移（返回 true）的行。 */
+  private void countOutcome(String outcome) {
+    metrics.counter("fg.query.outcome", "outcome", outcome).increment();
+  }
 
   /**
    * 幂等 INSERT；返回落库后的行（已存在时返回既有行）。schema_bytes 随行写入——
@@ -68,6 +86,7 @@ public class OperationStoreDao implements Service {
       ps.setBytes(9, row.schemaBytes());
       ps.setString(10, row.engineRef());
       if (ps.executeUpdate() == 1) {
+        countRegistered("QUERY");
         return row.status(OperationRow.Status.RUNNING);
       }
       return getByFingerprint(row.sessionRef(), row.sqlHash())
@@ -104,6 +123,7 @@ public class OperationStoreDao implements Service {
       ps.setBytes(9, row.schemaBytes());
       ps.setString(10, row.engineRef());
       if (ps.executeUpdate() == 1) {
+        countRegistered("COMMAND");
         return row.status(OperationRow.Status.RUNNING);
       }
       return getRunningCommand(row.sessionRef(), row.sqlHash())
@@ -130,15 +150,20 @@ public class OperationStoreDao implements Service {
    */
   public boolean casCompleteCommand(String queryId, byte[] schemaBytes, byte[] resultBytes)
       throws SQLException {
-    return update(
-        "UPDATE fg_operation SET status = 'COMPLETED', schema_bytes = ?, command_result = ?,"
-            + " terminal_at = now(), updated_at = now(), attach_owner = NULL, attach_lease_until = NULL"
-            + " WHERE query_id = ? AND status = 'RUNNING'",
-        ps -> {
-          ps.setBytes(1, schemaBytes);
-          ps.setBytes(2, resultBytes);
-          ps.setObject(3, UUID.fromString(queryId));
-        });
+    boolean won =
+        update(
+            "UPDATE fg_operation SET status = 'COMPLETED', schema_bytes = ?, command_result = ?,"
+                + " terminal_at = now(), updated_at = now(), attach_owner = NULL, attach_lease_until = NULL"
+                + " WHERE query_id = ? AND status = 'RUNNING'",
+            ps -> {
+              ps.setBytes(1, schemaBytes);
+              ps.setBytes(2, resultBytes);
+              ps.setObject(3, UUID.fromString(queryId));
+            });
+    if (won) {
+      countOutcome("COMPLETED");
+    }
+    return won;
   }
 
   public Optional<OperationRow> get(String queryId) throws SQLException {
@@ -200,15 +225,20 @@ public class OperationStoreDao implements Service {
   }
 
   private boolean casTerminal(String queryId, String status, String error) throws SQLException {
-    return update(
-        "UPDATE fg_operation SET status = ?, error = ?, terminal_at = now(), updated_at = now(),"
-            + " attach_owner = NULL, attach_lease_until = NULL"
-            + " WHERE query_id = ? AND status = 'RUNNING'",
-        ps -> {
-          ps.setString(1, status);
-          ps.setString(2, error);
-          ps.setObject(3, UUID.fromString(queryId));
-        });
+    boolean won =
+        update(
+            "UPDATE fg_operation SET status = ?, error = ?, terminal_at = now(), updated_at = now(),"
+                + " attach_owner = NULL, attach_lease_until = NULL"
+                + " WHERE query_id = ? AND status = 'RUNNING'",
+            ps -> {
+              ps.setString(1, status);
+              ps.setString(2, error);
+              ps.setObject(3, UUID.fromString(queryId));
+            });
+    if (won) {
+      countOutcome(status);
+    }
+    return won;
   }
 
   /**

@@ -72,6 +72,12 @@ private[client] class SparkEngineManager(
     (s: Semaphore) => (maxConcurrentLaunches - s.availablePermits()).toDouble)
     .register(meterRegistry)
   private val launchesCounter: Counter = Counter.builder("fg.engine.launches").register(meterRegistry)
+  private val launchFailuresCounter: Counter =
+    Counter.builder("fg.engine.launch.failures").register(meterRegistry)
+  private val recoveriesCounter: Counter =
+    Counter.builder("fg.engine.recoveries").register(meterRegistry)
+  private def evictionsCounter(reason: String): Counter =
+    meterRegistry.counter("fg.engine.evictions", "reason", reason)
 
   // ------------------------------------------------------------- 发现与拉起
 
@@ -103,12 +109,14 @@ private[client] class SparkEngineManager(
     followLaunch(key.space, {
       val space = key.space
       Option(engines.remove(space)).foreach { me =>
+        recoveriesCounter.increment()
         log.info("recovering engine space={} stale={}", space, me.node)
         try {
           zk.deregisterIfStale(space, key.lockPath,
             me.node.host(), me.node.connectPort(), lockTimeoutMs)
         } finally {
           closeQuietly(me.client)
+          evictionsCounter("recover").increment()
         }
       }
       discoverOrLaunch(key)
@@ -122,7 +130,10 @@ private[client] class SparkEngineManager(
   /** 显式驱逐（CONNECTION closeSession 用）。 */
   def evict(key: EngineKey): Unit = {
     val me = engines.remove(key.space)
-    if (me != null) closeQuietly(me.client)
+    if (me != null) {
+      closeQuietly(me.client)
+      evictionsCounter("close").increment()
+    }
   }
 
   override def close(): Unit = {
@@ -194,6 +205,10 @@ private[client] class SparkEngineManager(
         }
       }
       result
+    } catch {
+      case e: Throwable =>
+        launchFailuresCounter.increment()
+        throw e
     } finally {
       launchSlots.release()
     }
@@ -244,6 +259,7 @@ private[client] class SparkEngineManager(
         if (!stillThere) {
           engines.remove(me.space, me)
           closeQuietly(me.client)
+          evictionsCounter("sweep").increment()
           log.debug("evicted engine {} (znode gone): {}", me.space, me.node)
         }
       } catch {

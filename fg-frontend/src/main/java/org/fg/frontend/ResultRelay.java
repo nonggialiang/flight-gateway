@@ -42,18 +42,27 @@ final class ResultRelay {
   private final RelayTicketCodec ticketCodec;
   private final GatewayConfig config;
   private final BufferAllocator allocator;
+  private final io.micrometer.core.instrument.MeterRegistry metrics;
 
   ResultRelay(
       QueryOrchestrator orchestrator,
       ObjectStoreService objects,
       RelayTicketCodec ticketCodec,
       GatewayConfig config,
-      BufferAllocator allocator) {
+      BufferAllocator allocator,
+      io.micrometer.core.instrument.MeterRegistry metrics) {
     this.orchestrator = orchestrator;
     this.objects = objects;
     this.ticketCodec = ticketCodec;
     this.config = config;
     this.allocator = allocator;
+    this.metrics = metrics;
+  }
+
+  /** 错误回写统一汇点（D26）：计数 fg.relay.failures{status} 后经 listener 上报。 */
+  private void fail(ServerStreamListener listener, CallStatus status, String description) {
+    metrics.counter("fg.relay.failures", "status", status.code().name()).increment();
+    listener.error(status.withDescription(description).toRuntimeException());
   }
 
   void relay(String user, Ticket ticket, ServerStreamListener listener) {
@@ -61,15 +70,13 @@ final class ResultRelay {
     try {
       t = ticketCodec.decode(new String(ticket.getBytes(), java.nio.charset.StandardCharsets.UTF_8), user);
     } catch (RelayTicketCodec.ExpiredTicketException e) {
-      listener.error(
-          CallStatus.INVALID_ARGUMENT
-              .withDescription("Ticket expired; re-poll for fresh endpoints")
-              .toRuntimeException());
+      fail(listener, CallStatus.INVALID_ARGUMENT, "Ticket expired; re-poll for fresh endpoints");
       return;
     } catch (Exception e) {
-      listener.error(CallStatus.UNAUTHENTICATED.withDescription("Invalid ticket: " + e.getMessage()).toRuntimeException());
+      fail(listener, CallStatus.UNAUTHENTICATED, "Invalid ticket: " + e.getMessage());
       return;
     }
+    metrics.counter("fg.relay.streams", "kind", t.kind().name()).increment();
 
     // 在途等待，预算按票 kind 分策略（D15/D18/设计 §4.7）：
     //   STREAM（legacy GetFlightInfo 快返票）——票可能在查询 RUNNING 时就到 DoGet，且 legacy
@@ -91,24 +98,23 @@ final class ResultRelay {
       Thread.currentThread().interrupt();
       return; // 客户端已断流，流已死，无需回写
     } catch (Exception e) {
-      listener.error(CallStatus.INTERNAL.withDescription("Poll failed: " + e.getMessage()).toRuntimeException());
+      fail(listener, CallStatus.INTERNAL, "Poll failed: " + e.getMessage());
       return;
     }
     if (!outcome.done()) {
-      listener.error(
-          CallStatus.UNAVAILABLE.withDescription("Result not ready yet; re-poll").toRuntimeException());
+      fail(listener, CallStatus.UNAVAILABLE, "Result not ready yet; re-poll");
       return;
     }
     OperationRow row = outcome.row();
     switch (row.status()) {
       case COMPLETED -> { /* fall through to stream */ }
       case CANCELLED -> {
-          listener.error(CallStatus.CANCELLED.withDescription("Query was cancelled").toRuntimeException());
+          fail(listener, CallStatus.CANCELLED, "Query was cancelled");
           return;
         }
       default -> {
-          listener.error(
-              CallStatus.INTERNAL.withDescription("Query failed: " + (row.error() == null ? row.status() : row.error())).toRuntimeException());
+          fail(listener, CallStatus.INTERNAL,
+              "Query failed: " + (row.error() == null ? row.status() : row.error()));
           return;
         }
     }
@@ -120,7 +126,7 @@ final class ResultRelay {
 
     ResultManifest manifest = outcome.manifest();
     if (manifest == null) {
-      listener.error(CallStatus.INTERNAL.withDescription("Manifest missing for completed query").toRuntimeException());
+      fail(listener, CallStatus.INTERNAL, "Manifest missing for completed query");
       return;
     }
 
@@ -131,7 +137,7 @@ final class ResultRelay {
               .filter(p -> p.index() == t.partIndex())
               .toList();
       if (parts.isEmpty()) {
-          listener.error(CallStatus.NOT_FOUND.withDescription("Unknown partIndex: " + t.partIndex()).toRuntimeException());
+          fail(listener, CallStatus.NOT_FOUND, "Unknown partIndex: " + t.partIndex());
           return;
         }
     }
@@ -149,10 +155,10 @@ final class ResultRelay {
       listener.completed();
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      listener.error(CallStatus.INTERNAL.withDescription("Relay interrupted").toRuntimeException());
+      fail(listener, CallStatus.INTERNAL, "Relay interrupted");
     } catch (Exception e) {
       logger.warn("Relay failed for {}: {}", t.queryId(), e.toString());
-      listener.error(CallStatus.INTERNAL.withDescription("Relay failed: " + e.getMessage()).toRuntimeException());
+      fail(listener, CallStatus.INTERNAL, "Relay failed: " + e.getMessage());
     } finally {
       closePump(pump, child);
     }
@@ -165,8 +171,7 @@ final class ResultRelay {
     byte[] result = row.commandResult();
     if (result == null) {
       // COMPLETED 但行内无结果：终态 CAS 与读行之间的异常态（或行被外部改动）
-      listener.error(
-          CallStatus.INTERNAL.withDescription("Command result missing for completed command").toRuntimeException());
+      fail(listener, CallStatus.INTERNAL, "Command result missing for completed command");
       return;
     }
     BufferAllocator child = allocator.newChildAllocator("fg-relay-" + t.queryId(), 0, Long.MAX_VALUE);
@@ -177,10 +182,10 @@ final class ResultRelay {
       listener.completed();
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      listener.error(CallStatus.INTERNAL.withDescription("Relay interrupted").toRuntimeException());
+      fail(listener, CallStatus.INTERNAL, "Relay interrupted");
     } catch (Exception e) {
       logger.warn("Relay failed for {}: {}", t.queryId(), e.toString());
-      listener.error(CallStatus.INTERNAL.withDescription("Relay failed: " + e.getMessage()).toRuntimeException());
+      fail(listener, CallStatus.INTERNAL, "Relay failed: " + e.getMessage());
     } finally {
       closePump(pump, child);
     }

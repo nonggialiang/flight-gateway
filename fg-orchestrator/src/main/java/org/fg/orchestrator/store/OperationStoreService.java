@@ -17,7 +17,7 @@ public final class OperationStoreService implements Service {
   private final OperationStoreDao dao;
   private final SessionRegistryDao sessionDao;
 
-  public OperationStoreService(GatewayConfig config) {
+  public OperationStoreService(GatewayConfig config, io.micrometer.core.instrument.MeterRegistry metrics) {
     HikariConfig hikari = new HikariConfig();
     hikari.setJdbcUrl(config.getString("fg.db.url"));
     hikari.setUsername(config.getString("fg.db.username"));
@@ -25,8 +25,8 @@ public final class OperationStoreService implements Service {
     hikari.setMaximumPoolSize(config.getInt("fg.db.max.pool.size"));
     hikari.setPoolName("fg-operation-store");
     this.dataSource = new HikariDataSource(hikari);
-    this.dao = new OperationStoreDao(dataSource);
-    this.sessionDao = new SessionRegistryDao(dataSource);
+    this.dao = new OperationStoreDao(dataSource, metrics);
+    this.sessionDao = new SessionRegistryDao(dataSource, metrics);
   }
 
   @Override

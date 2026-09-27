@@ -978,6 +978,33 @@ def gateway_tls(c):
     print("[tls] PASS（TLS 全链路 + 负向）")
 
 
+def metrics_exposition(c):
+    """指标暴露（D26）：跑一次查询 + CloseSession 后 GET /metrics（默认 :9091），
+    断言 Prometheus 文本格式含 JVM 基线 + fg.query/fg.session/fg.relay 业务序列。
+    对任意模式网关可用（metrics 默认 enabled；fg.engine.* 仅 ZK 模式出现）。"""
+    legacy_get_flight_info(c, "SELECT id FROM range(7)", 7)
+    results = list(c.do_action(fl.Action("CloseSession", b"")))
+    status = next((v for f, w, v in walk(results[0].body.to_pybytes()) if f == 1), None)
+    assert status == 1, f"[metrics] CloseSession status={status}"
+
+    import urllib.request
+    body = urllib.request.urlopen(
+        "http://localhost:9091/metrics", timeout=10).read().decode()
+    for needle in [
+        "fg_query_registered_total{",        # D26：QUERY/COMMAND 注册（kind 维度）
+        "fg_query_outcome_total{",           # COMPLETED/FAILED/CANCELLED
+        'fg_session_closed_total{reason="client"}',
+        "fg_relay_streams_total{",           # STREAM/PART/COMMAND
+        "jvm_memory_used_bytes",             # JVM 基线 binder
+    ]:
+        assert needle in body, f"[metrics] 缺序列: {needle}"
+    for line in body.splitlines():
+        if line.startswith(("fg_query_registered_total", "fg_query_outcome_total",
+                            "fg_session_closed_total", "fg_relay_streams_total")):
+            print("[metrics]", line)
+    print("[metrics] PASS（/metrics 业务+JVM 序列齐备）")
+
+
 def engine_cluster(c):
     """cluster 拉起模式（D22/D24）：standalone master(spark://localhost:7077) 上 driver
     由 worker 拉起。前置：`~/fg-e2e/cluster-up.sh` + 网关 `~/fg-e2e/gw-cluster.sh`
@@ -1106,5 +1133,9 @@ if __name__ == "__main__":
     elif which == "tls":
         # 前置：~/fg-e2e/gen-certs.sh + ~/fg-e2e/gw-tls.sh [pem|p12] + ~/fg-e2e/engine-fixed.sh
         gateway_tls(c)
+    # ---------------- D26 指标 ----------------
+    elif which == "metrics":
+        # 任意模式网关（metrics 默认 enabled :9091）；默认模式需固定引擎在跑
+        metrics_exposition(c)
     else:
         raise SystemExit(f"unknown case {which}")

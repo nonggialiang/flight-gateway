@@ -4,6 +4,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import org.fg.common.BootStrapContext;
+import org.fg.common.MetricsHttpServer;
 import org.fg.common.concurrent.CloseableThreadPool;
 import org.fg.common.concurrent.NamedThreadFactory;
 import org.fg.common.config.GatewayConfig;
@@ -33,8 +34,17 @@ final class GatewayDaemonModule {
   static void build(SingletonRegistry registry, BootStrapContext context) {
     GatewayConfig config = context.getConfig();
 
+    // D26：Prometheus 抓取端点（fg.metrics.enabled → BootStrapContext 已选 Prometheus 注册表）
+    if (context.getMeterRegistry() instanceof io.micrometer.prometheusmetrics.PrometheusMeterRegistry) {
+      registry.bindSelf(
+          new MetricsHttpServer(
+              (io.micrometer.prometheusmetrics.PrometheusMeterRegistry) context.getMeterRegistry(),
+              config));
+    }
+
     // 2. OperationStore（PostgreSQL + Flyway）
-    OperationStoreService operationStore = new OperationStoreService(config);
+    OperationStoreService operationStore =
+        new OperationStoreService(config, context.getMeterRegistry());
     registry.bind(OperationStoreService.class, operationStore);
 
     // 4. ResultStore（presign/manifest/purge）
@@ -80,7 +90,8 @@ final class GatewayDaemonModule {
     // 8. FlightFrontend（对外）
     FgFlightService flight =
         new FgFlightService(
-            config, context.getAllocator(), orchestrator, objects, relayExecutor);
+            config, context.getAllocator(), orchestrator, objects, relayExecutor,
+            context.getMeterRegistry());
     registry.bindSelf(flight);
   }
 }

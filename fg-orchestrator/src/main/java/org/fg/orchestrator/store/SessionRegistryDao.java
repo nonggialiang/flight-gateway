@@ -53,9 +53,17 @@ public class SessionRegistryDao implements Service {
   }
 
   private final DataSource dataSource;
+  private final io.micrometer.core.instrument.MeterRegistry metrics;
 
   public SessionRegistryDao(DataSource dataSource) {
+    this(dataSource, new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
+  }
+
+  /** D26：会话生命周期计数汇点（born 只计新建；closed 只计 ACTIVE→CLOSED 真实迁移）。 */
+  public SessionRegistryDao(
+      DataSource dataSource, io.micrometer.core.instrument.MeterRegistry metrics) {
     this.dataSource = dataSource;
+    this.metrics = metrics;
   }
 
   @Override
@@ -79,6 +87,7 @@ public class SessionRegistryDao implements Service {
       ps.setString(2, user);
       ps.setString(3, engineRef);
       if (ps.executeUpdate() == 1) {
+        metrics.counter("fg.session.born").increment();
         return new Born(
             new SessionRow(sessionRef, user, engineRef, null, List.of(), Status.ACTIVE, null),
             true);
@@ -135,7 +144,11 @@ public class SessionRegistryDao implements Service {
                 + " WHERE session_ref = ? AND status = 'ACTIVE'")) {
       ps.setString(1, reason);
       ps.setString(2, sessionRef);
-      return ps.executeUpdate() == 1;
+      boolean won = ps.executeUpdate() == 1;
+      if (won) {
+        metrics.counter("fg.session.closed", "reason", reason).increment();
+      }
+      return won;
     }
   }
 
