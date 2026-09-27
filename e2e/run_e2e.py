@@ -925,6 +925,39 @@ def engine_connection_share(c):
     print("[engine-connection-share] PASS（会话级引擎 + CloseSession 下线 + 邻居存活）")
 
 
+def engine_cluster(c):
+    """cluster 拉起模式（D22/D24）：standalone master(spark://localhost:7077) 上 driver
+    由 worker 拉起。前置：`~/fg-e2e/cluster-up.sh` + 网关 `~/fg-e2e/gw-cluster.sh`
+    （CONNECTION + launch.deploy-mode=cluster）。断言：ZK-only 就绪、JDK17 add-opens 注入
+    生效（driver 起得来）、复用、CloseSession 经 admin 平面拆解（无进程句柄）——
+    znode+会话目录消失、driver 进程退场。单会话单引擎（cluster 固定端口 15002/15003，
+    同节点多引擎撞端口=已知边界）。进程模型：SparkLauncher 的 submitter 在 driver 达
+    RUNNING 后即退（不滞留；driver 起跑前失败仍会上报 → 网关 FAILED 快败）——每引擎
+    恰 1 个常驻进程（worker 拉起的 DriverWrapper driver）。"""
+    sid = str(_uuid.uuid4())
+    space = f"{CONN_SPACE}/fg/default/{sid}"
+    pids0 = len(engine_pids())
+    assert pids0 == 0, f"[engine-cluster] 起始有引擎进程残留: {pids0}"
+
+    a = Client(sid=sid)
+    engine_query(a, 10)  # 冷启动：submitter 提交 → worker 拉 driver → ZK 注册
+    wait_until(lambda: len(zk_nodes(space)) == 1, what="cluster engine znode")
+    assert len(engine_pids()) == 1, \
+        f"[engine-cluster] driver 进程数 {len(engine_pids())} != 1"
+
+    engine_query(a, 7)  # 复用：不重拉
+    assert len(zk_nodes(space)) == 1
+    assert len(engine_pids()) == 1
+
+    # CloseSession → /engine/stop（admin 平面，cluster 无进程句柄的唯一通路）
+    results = list(a.do_action(fl.Action("CloseSession", b"")))
+    status = next((v for f, w, v in walk(results[0].body.to_pybytes()) if f == 1), None)
+    assert status == 1, f"[engine-cluster] CloseSession status={status}"
+    wait_until(lambda: zk_ls(space) is None, what="cluster engine znode+space removal")
+    wait_until(lambda: len(engine_pids()) == 0, what="cluster engine process exit")
+    print("[engine-cluster] PASS（cluster 拉起/ZK 就绪/复用/admin 拆解/进程退场）")
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "legacy"
     c = client()
@@ -1012,5 +1045,8 @@ if __name__ == "__main__":
         engine_group_share(c)
     elif which == "engine-connection-share":
         engine_connection_share(c)
+    elif which == "engine-cluster":
+        # 前置：~/fg-e2e/cluster-up.sh（standalone master 7077+worker）+ ~/fg-e2e/gw-cluster.sh 网关
+        engine_cluster(c)
     else:
         raise SystemExit(f"unknown case {which}")

@@ -16,8 +16,30 @@ import scala.jdk.CollectionConverters._
  * {@code fg.engine.spark.launch.conf.*} 透传任意 spark conf。
  *
  * <p>local 模式（master=local[*]、deploy-mode=client）：驱动进程即引擎进程，端口经
- * 端口段分配；cluster 模式：固定配置端口、launcher 进程早退不算失败（就绪只看 ZK 注册）。
+ * 端口段分配；cluster 模式：固定配置端口、driver JVM 由 worker 拉起（注入 JDK17
+ * add-opens），FAILED/KILLED/LOST 快败、FINISHED 容忍，就绪判定只看 ZK 注册。
  */
+private[client] object EngineLauncher {
+  /** JDK17+ driver 必需的模块开放（Spark 3.5 JavaModuleOptions 同款子集：netty/arrow/
+   * StorageUtils/codegen 触达面）。cluster 模式注入 spark.driver.extraJavaOptions。 */
+  val Jdk17AddOpens: String =
+    "--add-opens=java.base/java.lang=ALL-UNNAMED " +
+      "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED " +
+      "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED " +
+      "--add-opens=java.base/java.io=ALL-UNNAMED " +
+      "--add-opens=java.base/java.net=ALL-UNNAMED " +
+      "--add-opens=java.base/java.nio=ALL-UNNAMED " +
+      "--add-opens=java.base/java.util=ALL-UNNAMED " +
+      "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED " +
+      "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED " +
+      "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED " +
+      "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED " +
+      "--add-opens=java.base/sun.security.action=ALL-UNNAMED " +
+      "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED " +
+      "--add-opens=jdk.unsupported/sun.misc=ALL-UNNAMED " +
+      "--add-opens=jdk.unsupported/sun.reflect=ALL-UNNAMED"
+}
+
 private[client] final class EngineLauncher(config: GatewayConfig) {
 
   def launch(key: EngineKey, engineSpace: String, refId: String, connectPort: Int,
@@ -81,8 +103,19 @@ private[client] final class EngineLauncher(config: GatewayConfig) {
       .map(_.trim).filter(_.nonEmpty).foreach(launcher.addJar)
 
     // 任意 spark conf 透传
-    config.getFlatEntries("fg.engine.spark.launch.conf").forEach { (k, v) =>
+    val confPassthrough = config.getFlatEntries("fg.engine.spark.launch.conf")
+    confPassthrough.forEach { (k, v) =>
       launcher.setConf(k, v)
+    }
+
+    // cluster 模式：worker 拉起的 driver JVM 不带 add-opens（client 模式由 spark-submit
+    // 注入）——JDK17+ 无之则 SparkContext init 即 IllegalAccessError（StorageUtils→
+    // DirectBuffer，standalone 实证）。与 launch.conf 传入的 extraJavaOptions 合并
+    //（add-opens 叠加无冲突）。
+    if (deployMode.equalsIgnoreCase("cluster")) {
+      val user = confPassthrough.get("spark.driver.extraJavaOptions")
+      val merged = (if (user != null && user.nonEmpty) user + " " else "") + EngineLauncher.Jdk17AddOpens
+      launcher.setConf("spark.driver.extraJavaOptions", merged)
     }
 
     // stdout/err 重定向
@@ -99,18 +132,19 @@ private[client] final class EngineLauncher(config: GatewayConfig) {
 }
 
 /**
- * 拉起产物：client 模式下 FAILED/KILLED/LOST/FINISHED（main 返回=引擎死）即异常退出；
- * cluster 模式 spark-submit 早退是正常态（就绪只看 ZK 注册），状态不作失败信号。
+ * 拉起产物。client 模式：FAILED/KILLED/LOST/FINISHED（main 返回=引擎死）即异常退出。
+ * cluster 模式：FAILED/KILLED/LOST 仍为失败信号（submitter 轮询 master，driver 终态
+ * 失败时上报后退出——不傻等 ZK 超时）；FINISHED 容忍（submitter 可在 driver 起跑后
+ * 早退，或 driver 完成后正常退出），就绪判定只看 ZK 注册。destroy 只及 submitter
+ * （真实集群引擎无进程句柄，超时清理由引擎侧 idle/max-lifetime 兜底）。
  */
 private[client] final class LaunchedEngine(handle: SparkAppHandle, deployMode: String) {
 
   def exitedAbnormally: Boolean = {
-    if (deployMode.equalsIgnoreCase("cluster")) {
-      return false
-    }
     import SparkAppHandle.State._
     handle.getState match {
-      case FAILED | KILLED | LOST | FINISHED => true
+      case FAILED | KILLED | LOST => true
+      case FINISHED => !deployMode.equalsIgnoreCase("cluster")
       case _ => false
     }
   }

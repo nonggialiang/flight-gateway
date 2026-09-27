@@ -63,6 +63,15 @@ final class FgZkAgent(
       try registration.close()
       catch { case _: Throwable => }
     }
+    // PersistentNode.close() 的删除是异步落地——有界等 children 清空再删空目录
+    // （否则 CONNECTION 会话目录残留：empty 空壳，无害但脏）
+    val deregDeadline = System.currentTimeMillis() + 3000
+    var drained = false
+    while (!drained && System.currentTimeMillis() < deregDeadline) {
+      drained = try zk.listEngines(engineSpace).isEmpty
+      catch { case _: Throwable => true }
+      if (!drained) Thread.sleep(100)
+    }
     try zk.deleteIfEmpty(engineSpace)
     catch { case _: Throwable => }
     // 2. 有界排空：等在活 Connect 会话登记清空
