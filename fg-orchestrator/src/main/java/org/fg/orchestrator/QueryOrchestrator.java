@@ -26,6 +26,7 @@ import org.fg.orchestrator.store.SessionRegistryDao;
 import org.fg.result.manifest.ResultManifest;
 import org.fg.result.store.ObjectStoreService;
 import org.fg.spi.CommandOutcome;
+import org.fg.spi.EngineCatalog;
 import org.fg.spi.EngineExecutionHandle;
 import org.fg.spi.EngineSession;
 import org.fg.spi.EngineSessionStatus;
@@ -210,6 +211,38 @@ public class QueryOrchestrator implements Service {
         engine.openSession(new GatewaySession(sessionRef, user)));
     sessions.markClosed(sessionRef, "client");
     logger.info("Session {} closed by client (engine session released)", sessionRef);
+  }
+
+  // ------------------------------------------------------------- 元数据目录（D21，M2）
+
+  /** 目录表概要（frontend 不直碰 SPI——orchestrator 自带小 record）。 */
+  public record TableSummary(
+      String catalog, String database, String name, String type, boolean temporary) {}
+
+  /**
+   * 元数据目录出口（三方法，均 resolveSession 必经 + engine.catalog 收敛调用；同步内联
+   * 小结果，不建 fg_operation 行、无 poll 语义——与 GetSchema plan-only 同类，D21）。
+   * pattern 过滤归 frontend（SqlPatternMatcher），此处返回引擎原始清单。
+   */
+  public List<String> catalogCatalogs(String sessionRef, String user) throws Exception {
+    GatewaySession ctx = resolveSession(sessionRef, user);
+    return engine.catalog(engine.openSession(ctx)).listCatalogs();
+  }
+
+  public List<String> catalogDatabases(String sessionRef, String user, String catalog)
+      throws Exception {
+    GatewaySession ctx = resolveSession(sessionRef, user);
+    return engine.catalog(engine.openSession(ctx)).listDatabases(catalog).stream()
+        .map(EngineCatalog.EngineDatabase::name)
+        .collect(java.util.stream.Collectors.toList());
+  }
+
+  public List<TableSummary> catalogTables(
+      String sessionRef, String user, String catalog, String database) throws Exception {
+    GatewaySession ctx = resolveSession(sessionRef, user);
+    return engine.catalog(engine.openSession(ctx)).listTables(catalog, database).stream()
+        .map(t -> new TableSummary(t.catalog(), t.database(), t.name(), t.type(), t.isTemporary()))
+        .collect(java.util.stream.Collectors.toList());
   }
 
   // ------------------------------------------------------------- 注册 + 触发

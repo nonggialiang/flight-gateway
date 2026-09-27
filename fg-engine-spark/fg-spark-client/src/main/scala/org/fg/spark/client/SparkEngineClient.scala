@@ -446,18 +446,9 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
     }
   }
 
-  override def catalog(session: EngineSession): EngineCatalog = EmptyEngineCatalog
-
-  /** M1 占位（M2 接 Connect Catalog 服务，design §4.8）。 */
-  object EmptyEngineCatalog extends EngineCatalog {
-    override def listDatabases(): java.util.List[EngineCatalog.EngineDatabase] =
-      java.util.List.of()
-    override def listTables(database: String): java.util.List[EngineCatalog.EngineTable] =
-      java.util.List.of()
-    override def listColumns(
-        database: String,
-        table: String): java.util.List[EngineCatalog.EngineColumn] = java.util.List.of()
-  }
+  /** 目录（D21，M2）：SHOW CATALOGS/SCHEMAS/TABLES/DESCRIBE 经命令管道（动态 catalog）。 */
+  override def catalog(session: EngineSession): EngineCatalog =
+    new SparkEngineCatalog(config, this, session)
 }
 
 private[client] object SparkEngineClient {

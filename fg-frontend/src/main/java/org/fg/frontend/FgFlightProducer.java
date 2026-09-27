@@ -32,10 +32,16 @@ import org.apache.arrow.flight.SetSessionOptionsRequest;
 import org.apache.arrow.flight.SetSessionOptionsResult;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.flight.sql.NoOpFlightSqlProducer;
+import org.apache.arrow.flight.sql.FlightSqlProducer;
 import org.apache.arrow.flight.sql.impl.FlightSql;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.VarBinaryVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.message.IpcOption;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.fg.common.config.GatewayConfig;
+import org.fg.common.sql.SqlPatternMatcher;
 import org.fg.common.sql.StatementClassifier;
 import org.fg.orchestrator.CommandSchemas;
 import org.fg.orchestrator.QueryOrchestrator;
@@ -61,6 +67,8 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   private final ResultRelay relay;
   private final GatewayConfig config;
   private final ExecutorService relayExecutor;
+  /** 元数据目录族 DoGet 组 VectorSchemaRoot 用（D21，M2）。 */
+  private final BufferAllocator allocator;
   /** peerIdentity(user) → user 直通缓存（identity 即用户名；会话语义见 sessionRef） */
   private final Map<String, String> sessions = new ConcurrentHashMap<>();
 
@@ -69,12 +77,14 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       EndpointsAssembler endpoints,
       ResultRelay relay,
       GatewayConfig config,
-      ExecutorService relayExecutor) {
+      ExecutorService relayExecutor,
+      BufferAllocator allocator) {
     this.orchestrator = orchestrator;
     this.endpoints = endpoints;
     this.relay = relay;
     this.config = config;
     this.relayExecutor = relayExecutor;
+    this.allocator = allocator;
   }
 
   // ------------------------------------------------------------- GetFlightInfo（旧客户端）
@@ -295,6 +305,321 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
         .withSqlDdlSchema(true)
         .withSqlDdlTable(true)
         .send(command.getInfoList(), listener);
+  }
+
+  // ------------------- 元数据目录族（D21，M2）：catalog 动态来自引擎（SHOW CATALOGS 实名）
+  //
+  // getFlightInfoX = 静态宣告（FlightSqlProducer.Schemas 预置 schema + 单 endpoint Any 票），
+  // 不碰引擎、不建会话（身份校验留待 DoGet）；getStreamX = sessionRef/user → orchestrator
+  // 目录方法（SHOW/DESCRIBE 经命令管道内联同步）→ gateway 侧 pattern 过滤 → allocator 组
+  // VectorSchemaRoot 直灌（零行也 start——非空 schema 承诺，ADBC 严格校验先例）。约束族
+  // （PK/Imported/Exported/CrossReference）：Spark 无主外键概念 → 空结果 + 正确 schema 即
+  // 正确语义（SqlInfo 不声明约束支持）。GetXdbcTypeInfo 不做（JDBC 驱动 getTypeInfo 根本
+  // 未实现，无消费方）。元数据路径不建 fg_operation 行、不走 relay 池（同步、小结果）。
+
+  @Override
+  public FlightInfo getFlightInfoCatalogs(
+      FlightSql.CommandGetCatalogs command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    return metadataFlightInfo(FlightSqlProducer.Schemas.GET_CATALOGS_SCHEMA, command, descriptor);
+  }
+
+  @Override
+  public void getStreamCatalogs(
+      FlightProducer.CallContext context, FlightProducer.ServerStreamListener listener) {
+    runMetadata(
+        listener,
+        FlightSqlProducer.Schemas.GET_CATALOGS_SCHEMA,
+        root -> {
+          VarCharVector out = (VarCharVector) root.getVector("catalog_name");
+          int i = 0;
+          for (String catalog :
+              orchestrator.catalogCatalogs(sessionRef(context), user(context))) {
+            out.setSafe(i, catalog.getBytes(StandardCharsets.UTF_8));
+            i++;
+          }
+          return i;
+        });
+  }
+
+  @Override
+  public FlightInfo getFlightInfoSchemas(
+      FlightSql.CommandGetDbSchemas command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    return metadataFlightInfo(FlightSqlProducer.Schemas.GET_SCHEMAS_SCHEMA, command, descriptor);
+  }
+
+  @Override
+  public void getStreamSchemas(
+      FlightSql.CommandGetDbSchemas command,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    String filter =
+        command.hasCatalog() ? catalogFilter(command.getCatalog()) : null; // 精确匹配（宽容 %）
+    String dbPattern =
+        command.hasDbSchemaFilterPattern() ? command.getDbSchemaFilterPattern() : null;
+    runMetadata(
+        listener,
+        FlightSqlProducer.Schemas.GET_SCHEMAS_SCHEMA,
+        root -> {
+          String sessionRef = sessionRef(context);
+          String user = user(context);
+          VarCharVector catalogVec = (VarCharVector) root.getVector("catalog_name");
+          VarCharVector dbVec = (VarCharVector) root.getVector("db_schema_name");
+          int i = 0;
+          for (String catalog : targetCatalogs(sessionRef, user, filter)) {
+            for (String db : orchestrator.catalogDatabases(sessionRef, user, catalog)) {
+              if (!SqlPatternMatcher.matches(dbPattern, db)) {
+                continue;
+              }
+              catalogVec.setSafe(i, catalog.getBytes(StandardCharsets.UTF_8));
+              dbVec.setSafe(i, db.getBytes(StandardCharsets.UTF_8));
+              i++;
+            }
+          }
+          return i;
+        });
+  }
+
+  @Override
+  public FlightInfo getFlightInfoTables(
+      FlightSql.CommandGetTables command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    return metadataFlightInfo(
+        command.getIncludeSchema()
+            ? FlightSqlProducer.Schemas.GET_TABLES_SCHEMA
+            : FlightSqlProducer.Schemas.GET_TABLES_SCHEMA_NO_SCHEMA,
+        command,
+        descriptor);
+  }
+
+  @Override
+  public void getStreamTables(
+      FlightSql.CommandGetTables command,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    boolean includeSchema = command.getIncludeSchema();
+    String filter = command.hasCatalog() ? catalogFilter(command.getCatalog()) : null;
+    String dbPattern =
+        command.hasDbSchemaFilterPattern() ? command.getDbSchemaFilterPattern() : null;
+    String tablePattern =
+        command.hasTableNameFilterPattern() ? command.getTableNameFilterPattern() : null;
+    Set<String> typeFilter =
+        command.getTableTypesList().isEmpty()
+            ? null
+            : Set.copyOf(command.getTableTypesList());
+    runMetadata(
+        listener,
+        includeSchema
+            ? FlightSqlProducer.Schemas.GET_TABLES_SCHEMA
+            : FlightSqlProducer.Schemas.GET_TABLES_SCHEMA_NO_SCHEMA,
+        root -> {
+          String sessionRef = sessionRef(context);
+          String user = user(context);
+          VarCharVector catalogVec = (VarCharVector) root.getVector("catalog_name");
+          VarCharVector dbVec = (VarCharVector) root.getVector("db_schema_name");
+          VarCharVector nameVec = (VarCharVector) root.getVector("table_name");
+          VarCharVector typeVec = (VarCharVector) root.getVector("table_type");
+          VarBinaryVector schemaVec =
+              includeSchema ? (VarBinaryVector) root.getVector("table_schema") : null;
+          int i = 0;
+          for (String catalog : targetCatalogs(sessionRef, user, filter)) {
+            for (String db : orchestrator.catalogDatabases(sessionRef, user, catalog)) {
+              if (!SqlPatternMatcher.matches(dbPattern, db)) {
+                continue;
+              }
+              for (QueryOrchestrator.TableSummary table :
+                  orchestrator.catalogTables(sessionRef, user, catalog, db)) {
+                if (!SqlPatternMatcher.matches(tablePattern, table.name())
+                    || (typeFilter != null && !typeFilter.contains(table.type()))) {
+                  continue;
+                }
+                catalogVec.setSafe(i, catalog.getBytes(StandardCharsets.UTF_8));
+                dbVec.setSafe(i, db.getBytes(StandardCharsets.UTF_8));
+                nameVec.setSafe(i, table.name().getBytes(StandardCharsets.UTF_8));
+                typeVec.setSafe(i, table.type().getBytes(StandardCharsets.UTF_8));
+                if (includeSchema) {
+                  // 逐表 AnalyzePlan（plan-only 不执行）；成本 = 匹配表数 × 一次 AnalyzePlan
+                  //（JDBC getColumns 必经，已知成本不设上限，D21）
+                  byte[] schema =
+                      orchestrator.analyzeSchema(
+                          sessionRef,
+                          user,
+                          "SELECT * FROM "
+                              + quoteIdent(catalog) + "." + quoteIdent(db) + "."
+                              + quoteIdent(table.name()));
+                  if (schema != null) {
+                    schemaVec.setSafe(i, schema);
+                  } else {
+                    schemaVec.setNull(i);
+                  }
+                }
+                i++;
+              }
+            }
+          }
+          return i;
+        });
+  }
+
+  @Override
+  public FlightInfo getFlightInfoTableTypes(
+      FlightSql.CommandGetTableTypes command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    return metadataFlightInfo(
+        FlightSqlProducer.Schemas.GET_TABLE_TYPES_SCHEMA, command, descriptor);
+  }
+
+  @Override
+  public void getStreamTableTypes(
+      FlightProducer.CallContext context, FlightProducer.ServerStreamListener listener) {
+    // 静态：SHOW TABLES 的 isTemporary=true → VIEW、否则 TABLE（D21）
+    runMetadata(
+        listener,
+        FlightSqlProducer.Schemas.GET_TABLE_TYPES_SCHEMA,
+        root -> {
+          VarCharVector out = (VarCharVector) root.getVector("table_type");
+          out.setSafe(0, "TABLE".getBytes(StandardCharsets.UTF_8));
+          out.setSafe(1, "VIEW".getBytes(StandardCharsets.UTF_8));
+          return 2;
+        });
+  }
+
+  @Override
+  public FlightInfo getFlightInfoPrimaryKeys(
+      FlightSql.CommandGetPrimaryKeys command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    return metadataFlightInfo(
+        FlightSqlProducer.Schemas.GET_PRIMARY_KEYS_SCHEMA, command, descriptor);
+  }
+
+  /** 约束族：Spark 无主外键概念 → 空结果 + 正确 schema（不查引擎，JDBC 语义正确）。 */
+  @Override
+  public void getStreamPrimaryKeys(
+      FlightSql.CommandGetPrimaryKeys command,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    runMetadata(listener, FlightSqlProducer.Schemas.GET_PRIMARY_KEYS_SCHEMA, root -> 0);
+  }
+
+  @Override
+  public FlightInfo getFlightInfoImportedKeys(
+      FlightSql.CommandGetImportedKeys command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    return metadataFlightInfo(
+        FlightSqlProducer.Schemas.GET_IMPORTED_KEYS_SCHEMA, command, descriptor);
+  }
+
+  @Override
+  public void getStreamImportedKeys(
+      FlightSql.CommandGetImportedKeys command,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    runMetadata(listener, FlightSqlProducer.Schemas.GET_IMPORTED_KEYS_SCHEMA, root -> 0);
+  }
+
+  @Override
+  public FlightInfo getFlightInfoExportedKeys(
+      FlightSql.CommandGetExportedKeys command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    return metadataFlightInfo(
+        FlightSqlProducer.Schemas.GET_EXPORTED_KEYS_SCHEMA, command, descriptor);
+  }
+
+  @Override
+  public void getStreamExportedKeys(
+      FlightSql.CommandGetExportedKeys command,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    runMetadata(listener, FlightSqlProducer.Schemas.GET_EXPORTED_KEYS_SCHEMA, root -> 0);
+  }
+
+  @Override
+  public FlightInfo getFlightInfoCrossReference(
+      FlightSql.CommandGetCrossReference command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    return metadataFlightInfo(
+        FlightSqlProducer.Schemas.GET_CROSS_REFERENCE_SCHEMA, command, descriptor);
+  }
+
+  @Override
+  public void getStreamCrossReference(
+      FlightSql.CommandGetCrossReference command,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    runMetadata(listener, FlightSqlProducer.Schemas.GET_CROSS_REFERENCE_SCHEMA, root -> 0);
+  }
+
+  /** 元数据 getFlightInfoX 共用：静态宣告 schema + 单 endpoint Any 票 + -1/-1 计量。 */
+  private static FlightInfo metadataFlightInfo(
+      Schema schema, com.google.protobuf.Message command, FlightDescriptor descriptor) {
+    return new FlightInfo(
+        schema,
+        descriptor,
+        List.of(new FlightEndpoint(new Ticket(Any.pack(command).toByteArray()))),
+        -1,
+        -1);
+  }
+
+  /** 元数据 DoGet 行填充器：返回行数（0 行也 start——非空 schema 承诺）。 */
+  private interface MetadataFiller {
+    int fill(VectorSchemaRoot root) throws Exception;
+  }
+
+  /**
+   * 元数据 DoGet 通用泵（D21）：同步内联——orchestrator 目录方法（命令管道）→ 填充器 →
+   * start/putNext/completed。错误面 INVALID_ARGUMENT（客户端可见 metadata listing failed）。
+   */
+  private void runMetadata(
+      FlightProducer.ServerStreamListener listener, Schema schema, MetadataFiller filler) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+    try {
+      int rows = filler.fill(root);
+      root.setRowCount(rows);
+      listener.start(root);
+      listener.putNext();
+      listener.completed();
+    } catch (FlightRuntimeException e) {
+      listener.error(e);
+    } catch (Exception e) {
+      listener.error(invalid("metadata listing failed: " + e.getMessage()));
+    } finally {
+      root.close();
+    }
+  }
+
+  /**
+   * catalog 过滤（proto 无 {@code _filter_pattern} 后缀 = 精确匹配）；对 null/""/"%" 宽容为
+   * 不过滤（JDBC 驱动常传 % 作 catalogPattern）。
+   */
+  private static String catalogFilter(String catalog) {
+    if (catalog == null || catalog.isEmpty() || "%".equals(catalog)) {
+      return null;
+    }
+    return catalog;
+  }
+
+  /** 目标 catalog 集：无过滤 → 引擎全部；有 → 精确命中（错名 catalog → 空）。 */
+  private List<String> targetCatalogs(String sessionRef, String user, String filter)
+      throws Exception {
+    List<String> catalogs = orchestrator.catalogCatalogs(sessionRef, user);
+    if (filter == null) {
+      return catalogs;
+    }
+    return catalogs.stream().filter(filter::equals).collect(java.util.stream.Collectors.toList());
+  }
+
+  /** 标识符反引号包裹（内嵌反引号双写转义，Spark SQL 语法）。 */
+  private static String quoteIdent(String name) {
+    return "`" + name.replace("`", "``") + "`";
   }
 
   // ------------------- PreparedStatement（JDBC 兼容垫片；真 prepare + 参数绑定归 M3）：

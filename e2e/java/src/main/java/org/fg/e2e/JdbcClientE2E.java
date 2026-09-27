@@ -37,6 +37,7 @@ public final class JdbcClientE2E {
             "SELECT id % 1000 AS k, count(*) AS cnt FROM range(20000000) GROUP BY id % 1000",
             1000, "[jdbc-legacy-long]");
         case "metadata" -> metadata(conn);
+        case "metadata-browse" -> metadataBrowse(conn);
         case "mode" -> modeUrl(props);
         case "types" -> types(conn);
         case "prepare" -> prepare(conn);
@@ -226,6 +227,92 @@ public final class JdbcClientE2E {
       st.executeUpdate("DROP TABLE fg_e2e_jdbc_t");
     }
     System.out.printf("[jdbc-update] PASS (%.1fs)%n", elapsedSec(t0));
+  }
+
+  /**
+   * D21 元数据浏览（BI 工具通路）：DatabaseMetaData 全族——getCatalogs（动态实名
+   * spark_catalog）/getSchemas（pattern）/getTableTypes/getTables（% pattern）/getColumns
+   * （includeSchema 链路：getTables(true) + 驱动侧解 table_schema VARBINARY 展开列——JDBC
+   * getColumns 的唯一通路）/getPrimaryKeys/getImportedKeys（约束族空结果）。
+   */
+  private static void metadataBrowse(Connection conn) throws Exception {
+    long t0 = System.nanoTime();
+    java.sql.DatabaseMetaData md = conn.getMetaData();
+    try (Statement st = conn.createStatement()) {
+      st.executeUpdate("DROP TABLE IF EXISTS fg_e2e_jdbc_meta_t");
+      st.executeUpdate(
+          "CREATE TABLE fg_e2e_jdbc_meta_t (id BIGINT, val DOUBLE, name STRING) USING PARQUET");
+
+      try (ResultSet rs = md.getCatalogs()) {
+        boolean found = false;
+        while (rs.next()) {
+          found |= "spark_catalog".equals(rs.getString("TABLE_CAT"));
+        }
+        if (!found) {
+          throw new AssertionError("[jdbc-meta-browse] getCatalogs 未含 spark_catalog");
+        }
+      }
+
+      try (ResultSet rs = md.getSchemas(null, "def%")) {
+        boolean found = false;
+        while (rs.next()) {
+          found |= "default".equals(rs.getString("TABLE_SCHEM"));
+        }
+        if (!found) {
+          throw new AssertionError("[jdbc-meta-browse] getSchemas(def%) 未含 default");
+        }
+      }
+
+      try (ResultSet rs = md.getTableTypes()) {
+        boolean found = false;
+        while (rs.next()) {
+          found |= "TABLE".equals(rs.getString("TABLE_TYPE"));
+        }
+        if (!found) {
+          throw new AssertionError("[jdbc-meta-browse] getTableTypes 未含 TABLE");
+        }
+      }
+
+      try (ResultSet rs = md.getTables(null, null, "%", null)) {
+        boolean found = false;
+        while (rs.next()) {
+          if ("fg_e2e_jdbc_meta_t".equals(rs.getString("TABLE_NAME"))) {
+            found = "spark_catalog".equals(rs.getString("TABLE_CAT"))
+                && "default".equals(rs.getString("TABLE_SCHEM"))
+                && "TABLE".equals(rs.getString("TABLE_TYPE"));
+          }
+        }
+        if (!found) {
+          throw new AssertionError("[jdbc-meta-browse] getTables 未命中 (spark_catalog, default, fg_e2e_jdbc_meta_t, TABLE)");
+        }
+      }
+
+      // getColumns：includeSchema 链路（getTables(true) → table_schema → 客户端展开列）
+      java.util.Map<String, String> typeByName = new java.util.LinkedHashMap<>();
+      try (ResultSet rs = md.getColumns(null, null, "fg_e2e_jdbc_meta_t", "%")) {
+        while (rs.next()) {
+          typeByName.put(rs.getString("COLUMN_NAME"), rs.getString("TYPE_NAME"));
+        }
+      }
+      if (!typeByName.equals(java.util.Map.of(
+          "id", "BIGINT", "val", "DOUBLE", "name", "VARCHAR"))) {
+        throw new AssertionError("[jdbc-meta-browse] getColumns 列/类型: " + typeByName);
+      }
+
+      try (ResultSet rs = md.getPrimaryKeys("spark_catalog", "default", "fg_e2e_jdbc_meta_t")) {
+        if (rs.next()) {
+          throw new AssertionError("[jdbc-meta-browse] getPrimaryKeys 应空");
+        }
+      }
+      try (ResultSet rs = md.getImportedKeys("spark_catalog", "default", "fg_e2e_jdbc_meta_t")) {
+        if (rs.next()) {
+          throw new AssertionError("[jdbc-meta-browse] getImportedKeys 应空");
+        }
+      }
+
+      st.executeUpdate("DROP TABLE fg_e2e_jdbc_meta_t");
+    }
+    System.out.printf("[jdbc-meta-browse] PASS (%.1fs)%n", elapsedSec(t0));
   }
 
   /** SET 语句经 JDBC（命令通道 D17/D18）：execute 返回 [key,value] 结果集。 */

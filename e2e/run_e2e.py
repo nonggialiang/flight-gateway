@@ -468,6 +468,107 @@ def session_lifecycle(c):
     print("[lifecycle] PASS（UUID 契约 / close → sticky 拒 → 轮换重建）")
 
 
+# ---------------- D21 元数据目录族（GetCatalogs/DbSchemas/Tables/TableTypes/主外键） ----------------
+
+TYPE_SQL_PREFIX = "type.googleapis.com/arrow.flight.protocol.sql."
+
+
+def metadata_get(c, type_name, value=b""):
+    """元数据命令三步：Any{type_url, value} descriptor → GetFlightInfo（静态宣告）→ 单 endpoint 票 DoGet。"""
+    descr = fl.FlightDescriptor.for_command(
+        f_string(1, TYPE_SQL_PREFIX + type_name) + f_bytes(2, value))
+    info = c.get_flight_info(descr)
+    assert len(info.endpoints) == 1, f"[meta] {type_name} endpoints={len(info.endpoints)}"
+    return c.do_get(info.endpoints[0].ticket).read_all()
+
+
+def metadata(c):
+    """D21 元数据面：catalog 动态来自引擎（SHOW CATALOGS 实名 spark_catalog）；pattern 过滤
+    （%/_ JDBC 语义）；include_schema 经逐表 AnalyzePlan（table_schema = schema message bytes，
+    python 侧 pyarrow.ipc.read_schema 解析）；约束族空结果 + 正确 schema；元数据查询不留
+    fg_operation 行（目录 SQL 直连命令管道，不经 orchestrator 注册）。"""
+    import subprocess
+    import pyarrow.ipc
+
+    command_run(c, "DROP TABLE IF EXISTS fg_e2e_meta_t")
+    command_run(c, "CREATE TABLE fg_e2e_meta_t (id BIGINT, name STRING) USING PARQUET")
+    try:
+        def op_count():
+            return int(subprocess.run(
+                ["docker", "exec", "fg-pg", "psql", "-U", "fg", "-d", "flightgateway", "-tAc",
+                 "SELECT count(*) FROM fg_operation"],
+                capture_output=True, text=True, check=True).stdout.strip())
+
+        before = op_count()
+
+        # GetCatalogs：动态实名（引擎 SHOW CATALOGS）
+        t = metadata_get(c, "CommandGetCatalogs")
+        assert t.column_names == ["catalog_name"], f"[meta-catalogs] cols={t.column_names}"
+        cats = t.column("catalog_name").to_pylist()
+        assert "spark_catalog" in cats, f"[meta-catalogs] {cats}"
+        print(f"[meta-catalogs] {cats} PASS")
+
+        # GetDbSchemas：catalog 精确匹配 + db_schema pattern（def%）
+        t = metadata_get(c, "CommandGetDbSchemas", f_string(1, "spark_catalog"))
+        schemas = t.column("db_schema_name").to_pylist()
+        assert "default" in schemas, f"[meta-schemas] {schemas}"
+        t = metadata_get(c, "CommandGetDbSchemas",
+                         f_string(1, "spark_catalog") + f_string(2, "def%"))
+        assert "default" in t.column("db_schema_name").to_pylist(), "[meta-schemas] def% 未命中"
+        t = metadata_get(c, "CommandGetDbSchemas",
+                         f_string(1, "spark_catalog") + f_string(2, "zzz%"))
+        assert t.num_rows == 0, f"[meta-schemas] zzz% 应 0 行，实得 {t.num_rows}"
+        t = metadata_get(c, "CommandGetDbSchemas", f_string(1, "no_such_catalog"))
+        assert t.num_rows == 0 and t.column_names == ["catalog_name", "db_schema_name"], \
+            f"[meta-schemas] 错名 catalog 应 0 行：rows={t.num_rows}"
+        print("[meta-schemas] catalog 精确 + pattern 过滤 + 错名 0 行 PASS")
+
+        # GetTables：table pattern 命中；include_schema 解析；table_types 过滤
+        base = f_string(1, "spark_catalog") + f_string(3, "%meta%")
+        t = metadata_get(c, "CommandGetTables", base)
+        assert t.column_names == ["catalog_name", "db_schema_name", "table_name", "table_type"], \
+            f"[meta-tables] cols={t.column_names}"
+        rows = [(r["catalog_name"], r["db_schema_name"], r["table_name"], r["table_type"])
+                for r in t.to_pylist()]
+        assert rows == [("spark_catalog", "default", "fg_e2e_meta_t", "TABLE")], rows
+        print(f"[meta-tables] {rows} PASS")
+        t = metadata_get(c, "CommandGetTables", base + tag(5, 0) + varint(1))  # include_schema=true
+        assert "table_schema" in t.column_names, f"[meta-tables] include_schema 列缺席: {t.column_names}"
+        schema_bytes = t.to_pylist()[0]["table_schema"]
+        assert schema_bytes, "[meta-tables] table_schema 空"
+        table_schema = pyarrow.ipc.read_schema(pyarrow.py_buffer(schema_bytes))
+        assert {"id", "name"} <= set(table_schema.names), \
+            f"[meta-tables] schema 列 {table_schema.names} 缺 id/name"
+        print(f"[meta-tables] include_schema 列 {table_schema.names} PASS")
+        t = metadata_get(c, "CommandGetTables", base + f_string(4, "VIEW"))  # table_types=["VIEW"]
+        assert t.num_rows == 0, f"[meta-tables] VIEW 过滤应 0 行（无视图），实得 {t.num_rows}"
+        print("[meta-tables] table_types 过滤 PASS")
+
+        # GetTableTypes：静态 {TABLE, VIEW}
+        t = metadata_get(c, "CommandGetTableTypes")
+        assert {"TABLE", "VIEW"} <= set(t.column("table_type").to_pylist()), t.to_pylist()
+        print("[meta-table-types] PASS")
+
+        # 约束族：空结果 + 正确 schema（Spark 无主外键概念）
+        ref = f_string(1, "spark_catalog") + f_string(2, "default") + f_string(3, "fg_e2e_meta_t")
+        t = metadata_get(c, "CommandGetPrimaryKeys", ref)
+        assert t.num_rows == 0 and t.column_names == [
+            "catalog_name", "db_schema_name", "table_name", "column_name",
+            "key_sequence", "key_name"], f"[meta-pk] {t.column_names}"
+        t = metadata_get(c, "CommandGetImportedKeys", ref)
+        assert t.num_rows == 0 and t.column_names[:4] == [
+            "pk_catalog_name", "pk_db_schema_name", "pk_table_name", "pk_column_name"], \
+            f"[meta-fk] {t.column_names}"
+        print("[meta-keys] PK/ImportedKeys 0 行 + schema 正确 PASS")
+
+        # 元数据查询不留 fg_operation 行（目录 SQL 直连命令管道）
+        assert op_count() == before, "[meta] 元数据查询不应新增 fg_operation 行"
+        print("[meta-no-op-rows] 元数据零操作行 PASS")
+    finally:
+        command_run(c, "DROP TABLE IF EXISTS fg_e2e_meta_t")
+    print("[metadata] ALL PASS")
+
+
 def https_presign(c, sql, expect_rows, do_renew=False):
     import urllib.request
     import pyarrow.ipc
@@ -728,5 +829,8 @@ if __name__ == "__main__":
         session_set_action(c)
     elif which == "session-lifecycle":
         session_lifecycle(c)
+    # ---------------- D21 元数据目录族 ----------------
+    elif which == "metadata":
+        metadata(c)
     else:
         raise SystemExit(f"unknown case {which}")

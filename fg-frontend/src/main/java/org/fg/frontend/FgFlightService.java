@@ -54,7 +54,7 @@ public final class FgFlightService implements Service {
     ResultRelay relay =
         new ResultRelay(orchestrator, objects, ticketCodec, config, allocator);
     FgFlightProducer producer =
-        new FgFlightProducer(orchestrator, endpoints, relay, config, relayExecutor);
+        new FgFlightProducer(orchestrator, endpoints, relay, config, relayExecutor, allocator);
 
     int port = config.getInt(GatewayConfig.FLIGHT_PORT);
     Location listenLocation = Location.forGrpcInsecure("0.0.0.0", port);
