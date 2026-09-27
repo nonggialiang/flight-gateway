@@ -12,10 +12,12 @@
 
   <artifactId>fg-spark-app</artifactId>
   <name>FG Spark Kit :: Engine App (thin shell)</name>
-  <description>Thin engine shell: load fg-result DSv2 + vanilla SparkConnectServer + lifecycle hooks (ZK agent lands in M2).</description>
+  <description>Thin engine shell: load fg-result DSv2 + vanilla SparkConnectServer + lifecycle hooks (ZK agent, idle watchdog). Shaded: fg-ha + curator + zookeeper bundled; sink stays on $SPARK_HOME/jars.</description>
 
   <dependencies>
     <dependency><groupId>org.fg</groupId><artifactId>fg-spark-sink</artifactId></dependency>
+    <!-- ZK 发现契约（D22）：engine 侧 agent 消费；随 shade 打进 app jar -->
+    <dependency><groupId>org.fg</groupId><artifactId>fg-ha</artifactId></dependency>
     <dependency>
       <groupId>org.apache.spark</groupId>
       <artifactId>spark-sql_${scala.binary.version}</artifactId>
@@ -41,6 +43,65 @@
       <executions>
         <execution><id>default-compile</id><phase>none</phase></execution>
         <execution><id>default-testCompile</id><phase>none</phase></execution>
+      </executions>
+    </plugin>
+    <!-- shade（D22）：fg-ha + curator + zookeeper + guava 全部 relocate 打进 app jar。
+         实证（2026-09-27）：Spark 3.5.9 发行包自带 curator 2.13 / zookeeper 3.6 / guava 14，
+         client 模式 $SPARK_HOME/jars 在 app jar 之前——不 relocate 即 NoSuchMethodError
+         （CreateBuilder.creatingParentsIfNeeded）。计划预留的"冲突时回落 relocate"触发。 -->
+    <plugin>
+      <groupId>org.apache.maven.plugins</groupId>
+      <artifactId>maven-shade-plugin</artifactId>
+      <version>3.5.1</version>
+      <executions>
+        <execution>
+          <phase>package</phase>
+          <goals><goal>shade</goal></goals>
+          <configuration>
+            <artifactSet>
+              <includes>
+                <include>org.fg:fg-ha</include>
+                <include>org.apache.curator:*</include>
+                <include>org.apache.zookeeper:zookeeper</include>
+                <include>org.apache.zookeeper:zookeeper-jute</include>
+                <include>com.google.guava:guava</include>
+              </includes>
+            </artifactSet>
+            <relocations>
+              <relocation>
+                <pattern>org.apache.curator</pattern>
+                <shadedPattern>org.fg.shaded.curator.org.apache.curator</shadedPattern>
+              </relocation>
+              <relocation>
+                <pattern>org.apache.zookeeper</pattern>
+                <shadedPattern>org.fg.shaded.zookeeper.org.apache.zookeeper</shadedPattern>
+              </relocation>
+              <relocation>
+                <pattern>com.google.common</pattern>
+                <shadedPattern>org.fg.shaded.guava.com.google.common</shadedPattern>
+              </relocation>
+              <relocation>
+                <pattern>com.google.thirdparty</pattern>
+                <shadedPattern>org.fg.shaded.guava.com.google.thirdparty</shadedPattern>
+              </relocation>
+            </relocations>
+            <filters>
+              <filter>
+                <artifact>*:*</artifact>
+                <excludes>
+                  <exclude>META-INF/*.SF</exclude>
+                  <exclude>META-INF/*.DSA</exclude>
+                  <exclude>META-INF/*.RSA</exclude>
+                  <exclude>module-info.class</exclude>
+                  <exclude>META-INF/versions/*/module-info.class</exclude>
+                </excludes>
+              </filter>
+            </filters>
+            <transformers>
+              <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+            </transformers>
+          </configuration>
+        </execution>
       </executions>
     </plugin>
   </plugins></build>

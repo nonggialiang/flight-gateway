@@ -40,6 +40,7 @@ private[app] object FgSessionAdmin {
 
   /** 化身登记：(userId, sessionId) → 会话创建 eventTime（ms）。引擎重启即清空 → 全量 engine_lost。 */
   private val startedAt = new ConcurrentHashMap[String, java.lang.Long]()
+  private val everConnected = new java.util.concurrent.atomic.AtomicBoolean(false)
 
   private def key(user: String, sessionId: String): String = user + "\u0000" + sessionId
 
@@ -49,6 +50,7 @@ private[app] object FgSessionAdmin {
       override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
         case e: SparkListenerConnectSessionStarted =>
           startedAt.put(key(e.userId, e.sessionId), e.eventTime)
+          everConnected.set(true)
         case e: SparkListenerConnectSessionClosed =>
           startedAt.remove(key(e.userId, e.sessionId))
         case _ =>
@@ -60,6 +62,12 @@ private[app] object FgSessionAdmin {
     val t = startedAt.get(key(user, sessionId))
     if (t == null) (false, 0L) else (true, t.longValue())
   }
+
+  /** 在活 Connect 会话数（graceful stop 排空判定用）。 */
+  def activeSessionCount(): Int = startedAt.size()
+
+  /** 引擎启动以来是否有过任何 Connect 会话（CONNECTION never-connected fast-fail 判定用）。 */
+  def hasEverConnected(): Boolean = everConnected.get()
 
   /**
    * 关闭会话：cache invalidate 触发正规清理路径（removal listener → expireSession）。
@@ -86,7 +94,12 @@ private[app] object FgSessionAdmin {
 
   // ------------------------------------------------------------- HTTP 面向 gateway
 
-  def startHttp(port: Int): Unit = {
+  /**
+   * 启动 admin HTTP。engineStopper（D22）：`POST /engine/stop` —— CONNECTION 引擎随会话下线
+   * 的统一通路（local/cluster 两模式网关均无进程句柄，admin 平面是唯一控制面）。先应答后
+   * 异步执行停机（排空可能耗时，不得占用 handler 线程）。
+   */
+  def startHttp(port: Int, engineStopper: Option[() => Unit]): Unit = {
     val server = HttpServer.create(new InetSocketAddress(port), 0)
     server.createContext("/session/status", exchange => {
       val (user, sessionId) = params(exchange.getRequestURI.getRawQuery)
@@ -97,6 +110,14 @@ private[app] object FgSessionAdmin {
       val (user, sessionId) = params(exchange.getRequestURI.getRawQuery)
       val closed = close(user, sessionId)
       respond(exchange, if (closed) 200 else 404, s"""{"closed":$closed}""")
+    })
+    server.createContext("/engine/stop", exchange => {
+      respond(exchange, 200, """{"stopping":true}""")
+      engineStopper.foreach { stop =>
+        val t = new Thread(() => stop(), "fg-engine-stopper")
+        t.setDaemon(true)
+        t.start()
+      }
     })
     server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(2, r => {
       val t = new Thread(r, "fg-engine-session-admin")
