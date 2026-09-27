@@ -21,15 +21,25 @@ import java.util.concurrent.CompletableFuture
  *       orchestrator 侧经 {@link #releaseExecution}）；流断≠失败（UNKNOWN 由 manifest 对账兜底）；</li>
  *   <li>interrupt：InterruptRequest（不要求 attach）。</li>
  * </ul>
+ *
+ * <p>单引擎客户端（M1 固定模式 / M2 每个被管引擎一个实例——SparkEngineManager 持有多个）。
+ *
+ * @param config     网关配置
+ * @param connectUri 本引擎 Connect 地址（sc://host:port）
+ * @param adminPort  本引擎 FgSessionAdmin HTTP 端口（主机同 connectUri）
  */
-final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
+final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPort: Int) extends SqlEngine {
 
-  private val channel = new ConnectChannel(config.getString("fg.engine.spark.connect.uri"))
+  private val channel = new ConnectChannel(connectUri)
+
+  /** M1 固定引擎模式（fg.zk.addresses 为空）：单固定 URI + 配置端口。 */
+  def this(config: GatewayConfig) =
+    this(config, config.getString("fg.engine.spark.connect.uri"), config.getInt("fg.engine.spark.admin.port"))
 
   override def `type`(): String = "spark"
 
   override def openSession(ctx: GatewaySession): EngineSession =
-    new SparkEngineSession(ctx, channel)
+    new SparkEngineSession(ctx)
 
   override def close(): Unit = channel.close()
 
@@ -266,11 +276,11 @@ final class SparkEngineClient(config: GatewayConfig) extends SqlEngine {
 
   // ------------------------------------------------------------- 会话生命周期（D20）
 
-  /** 会话管理面 HTTP 客户端（fg-spark-app FgSessionAdmin；主机同 connect.uri）。 */
+  /** 会话管理面 HTTP 客户端（fg-spark-app FgSessionAdmin；主机同 connectUri）。 */
   private lazy val adminHttp = java.net.http.HttpClient.newHttpClient()
   private lazy val adminBase = {
-    val (host, _) = ConnectChannel.parse(config.getString("fg.engine.spark.connect.uri"))
-    s"http://$host:${config.getInt("fg.engine.spark.admin.port")}"
+    val (host, _) = ConnectChannel.parse(connectUri)
+    s"http://$host:$adminPort"
   }
   private lazy val confTimeoutMs = config.getDurationMs("fg.query.prepare.timeout")
 
@@ -480,8 +490,9 @@ private[client] object SparkEngineClient {
 
 /** Connect 会话：gateway 会话 ↔ Connect session 一一映射（D20 生命周期绑定）。会话 id
  * 即客户端自报的 {@link GatewaySession#sessionId}（UUID 由网关入口强制，满足 Connect
- * INVALID_HANDLE.FORMAT 校验），零映射透传——化身事实由 fg_session 登记表裁决。 */
-final class SparkEngineSession(val ctx: GatewaySession, channel: ConnectChannel)
+ * INVALID_HANDLE.FORMAT 校验），零映射透传——化身事实由 fg_session 登记表裁决。
+ * 引擎路由由 SparkEngineRouter 按调用重算，会话对象本身不持有 channel。 */
+final class SparkEngineSession(val ctx: GatewaySession)
     extends EngineSession {
   val user: String = ctx.user()
   val gatewaySessionId: String = ctx.sessionId()

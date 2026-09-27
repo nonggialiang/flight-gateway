@@ -98,11 +98,11 @@ class Client:
     D20 会话身份：无 cookie 能力 → 自报 x-fg-session-id 头（每进程随机；sid= 参数
     可显式指定，session-lifecycle 用例轮换/复用）；closed 后须换 id 重建。"""
 
-    def __init__(self, sid=None):
+    def __init__(self, sid=None, user=USER, password=PASSWORD):
         import uuid
         self.session_id = sid or str(uuid.uuid4())
         self.fc = fl.FlightClient(GW)
-        self.token = self.fc.authenticate_basic_token(USER, PASSWORD)
+        self.token = self.fc.authenticate_basic_token(user, password)
         assert self.token[0] == b"authorization" and self.token[1].startswith(b"Bearer "), \
             f"unexpected token header: {self.token!r}"
         self.headers = [self.token, (b"x-fg-session-id", self.session_id.encode())]
@@ -758,6 +758,173 @@ def syntax_error(c):
     print(f"[syntax-error] PASS ({time.time() - t0:.1f}s，错误即刻浮出)")
 
 
+# ---------------- D22 引擎管理族（ZK 模式网关；runbook 见 fg-design.md） ----------------
+# 网关需以 ZK 模式启动（非默认）：
+#   engine-cold/reuse/kill-recovery/user-share：
+#     -Dfg.zk.addresses=localhost:2181 -Dfg.auth.basic.users=fg:fg,fg2:fg2 \
+#     -Dfg.engine.spark.launch.home=$SPARK_HOME \
+#     -Dfg.engine.spark.launch.app-jar=<repo>/fg-engine-spark/fg-spark-app/target/fg-spark-app-0.1.0-SNAPSHOT.jar
+#   engine-group-share 另加：-Dfg.engine.share.level=GROUP -Dfg.engine.share.group-mapping=fg:teamA,fg2:teamA
+#   engine-connection-share 改为：-Dfg.engine.share.level=CONNECTION（去掉 group-mapping）
+# engine-cold 前置清场：pkill -9 -f FgEngineMain；docker rm -f fg-zk && 重启 fg-zk；重启网关。
+
+import subprocess as _sp
+import uuid as _uuid
+
+ZK_NS = "flight-gateway"
+USER_SPACE = f"/{ZK_NS}_v1_USER_spark"
+GROUP_SPACE = f"/{ZK_NS}_v1_GROUP_spark"
+CONN_SPACE = f"/{ZK_NS}_v1_CONNECTION_spark"
+
+
+def zk_ls(path):
+    """docker exec fg-zk zkCli.sh ls → children 列表；路径不存在 → None。"""
+    out = _sp.run(
+        ["docker", "exec", "fg-zk", "zkCli.sh", "-server", "localhost:2181", "ls", path],
+        capture_output=True, text=True)
+    if "Node does not exist" in out.stderr or "NoNode" in out.stderr:
+        return None
+    cand = [l.strip() for l in out.stdout.splitlines()
+            if l.strip().startswith("[") and l.strip().endswith("]")]
+    assert cand, f"zkCli output unrecognized: {out.stdout[-400:]}"
+    inner = cand[-1][1:-1].strip()
+    return [x for x in inner.split(",") if x] if inner else []
+
+
+def zk_nodes(path):
+    ch = zk_ls(path)
+    return ch if ch is not None else []
+
+
+def engine_pids():
+    out = _sp.run(["pgrep", "-f", "FgEngineMain"], capture_output=True, text=True).stdout.split()
+    return [int(p) for p in out]
+
+
+def wait_until(cond, timeout=300, every=3, what="condition"):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = cond()
+        if last:
+            return last
+        time.sleep(every)
+    raise AssertionError(f"timeout waiting for {what}: last={last}")
+
+
+def engine_query(c, rows=10):
+    poll_flight_info(c, f"SELECT id FROM range({rows})", rows, max_polls=240)
+
+
+def engine_cold(c):
+    """空 ZK → 首查自动拉起（znode 0→1，进程存在，查询成功）。"""
+    space = f"{USER_SPACE}/fg/default"
+    assert len(zk_nodes(space)) == 0, f"[engine-cold] 起始 ZK 非空: {zk_nodes(space)}"
+    n0 = len(engine_pids())
+    engine_query(c, 10)
+    wait_until(lambda: len(zk_nodes(space)) == 1, what="engine znode 0→1")
+    assert len(engine_pids()) == n0 + 1, \
+        f"[engine-cold] 引擎进程未增加: {n0} -> {len(engine_pids())}"
+    print("[engine-cold] PASS（冷启动拉起 + 注册 + 查询）")
+
+
+def engine_reuse(c):
+    """同用户二查 → znode 仍 1、serverUri 不变、进程数不变（复用不重拉）。"""
+    space = f"{USER_SPACE}/fg/default"
+    nodes = wait_until(lambda: zk_nodes(space) and zk_nodes(space) or None, what="engine presence")
+    uri, pids = nodes[0], engine_pids()
+    c2 = Client()  # 同用户新会话
+    engine_query(c2, 7)
+    now = zk_nodes(space)
+    assert len(now) == 1 and now[0] == uri, f"[engine-reuse] 引擎被重拉: {now} vs {uri}"
+    assert len(engine_pids()) == len(pids), "[engine-reuse] 进程数变化"
+    print("[engine-reuse] PASS（USER 复用）")
+
+
+def engine_kill_recovery(c):
+    """pkill -9 → 恢复：同用户新 sid 首查重拉；旧 sid 拒 engine_lost（sticky）。"""
+    space = f"{USER_SPACE}/fg/default"
+    wait_until(lambda: len(zk_nodes(space)) == 1, what="engine presence")
+    sid_old = str(_uuid.uuid4())
+    a = Client(sid=sid_old)
+    engine_query(a, 10)
+    uri = zk_nodes(space)[0]
+    _sp.run(["pkill", "-9", "-f", "FgEngineMain"], check=False)
+    wait_until(lambda: not engine_pids(), what="engine death")
+    # 旧 sid：化身校验（恢复路径重拉新引擎后 alive=false）→ engine_lost sticky
+    err = None
+    try:
+        a.get_flight_info(command_descriptor("SELECT id FROM range(10)"))
+    except Exception as e:
+        err = e
+    assert err is not None and "engine_lost" in str(err), \
+        f"[engine-kill-recovery] 旧会话未拒 engine_lost: {type(err).__name__}: {err}"
+    # 恢复后 znode 重现（新引擎实例；端口段随机分配，serverUri 基本必不同）
+    nodes = wait_until(lambda: len(zk_nodes(space)) == 1 and zk_nodes(space) or None,
+                       what="engine re-registration")
+    print(f"[engine-kill-recovery] 引擎替换 {uri[:40]}... -> {nodes[0][:40]}...")
+    b = Client()  # 同用户新 sid：复用恢复后的新引擎
+    engine_query(b, 10)
+    assert len(zk_nodes(space)) == 1, "[engine-kill-recovery] 恢复后引擎数漂移"
+    print("[engine-kill-recovery] PASS（死亡察觉 → 守卫注销 → 重拉 → 旧 sid sticky 拒）")
+
+
+def engine_user_share(c):
+    """fg + fg2 两用户 → 各自路由空间各一引擎；各自复用。"""
+    s1 = f"{USER_SPACE}/fg/default"
+    s2 = f"{USER_SPACE}/fg2/default"
+    engine_query(Client(), 10)
+    wait_until(lambda: len(zk_nodes(s1)) == 1, what="fg engine")
+    engine_query(Client(user="fg2", password="fg2"), 10)
+    wait_until(lambda: len(zk_nodes(s2)) == 1, what="fg2 engine")
+    assert len(engine_pids()) == 2, f"[engine-user-share] 进程数 {len(engine_pids())} != 2"
+    # 各自复用：二查不增引擎
+    engine_query(Client(), 5)
+    engine_query(Client(user="fg2", password="fg2"), 5)
+    assert len(zk_nodes(s1)) == 1 and len(zk_nodes(s2)) == 1
+    assert len(engine_pids()) == 2
+    print("[engine-user-share] PASS（用户隔离 + 各自复用）")
+
+
+def engine_group_share(c):
+    """GROUP：fg/fg2 同映射 teamA → 一台共享引擎。需 GROUP 模式网关。"""
+    space = f"{GROUP_SPACE}/teamA/default"
+    engine_query(Client(), 10)
+    wait_until(lambda: len(zk_nodes(space)) == 1, what="teamA engine")
+    engine_query(Client(user="fg2", password="fg2"), 10)
+    time.sleep(5)  # 若误拉第二台，给注册留窗口
+    assert len(zk_nodes(space)) == 1, \
+        f"[engine-group-share] 组内出现多引擎: {zk_nodes(space)}"
+    assert len(engine_pids()) == 1, f"[engine-group-share] 进程数 {len(engine_pids())} != 1"
+    print("[engine-group-share] PASS（组共享单引擎）")
+
+
+def engine_connection_share(c):
+    """CONNECTION：两会话两引擎（space 尾 refId）；CloseSession A → 其引擎下线；B 存活。
+    需 CONNECTION 模式网关。"""
+    sid_a, sid_b = str(_uuid.uuid4()), str(_uuid.uuid4())
+    sa, sb = f"{CONN_SPACE}/fg/default/{sid_a}", f"{CONN_SPACE}/fg/default/{sid_b}"
+    pids0 = len(engine_pids())
+    a, b = Client(sid=sid_a), Client(sid=sid_b)
+    engine_query(a, 10)
+    wait_until(lambda: len(zk_nodes(sa)) == 1, what="engine A")
+    engine_query(b, 10)
+    wait_until(lambda: len(zk_nodes(sb)) == 1, what="engine B")
+    assert len(engine_pids()) == pids0 + 2, \
+        f"[engine-connection-share] 引擎数 {len(engine_pids())} != {pids0 + 2}"
+
+    # CloseSession A → /session/close 后网关 fire-and-forget /engine/stop → znode 消失 + 进程降
+    results = list(a.do_action(fl.Action("CloseSession", b"")))
+    status = next((v for f, w, v in walk(results[0].body.to_pybytes()) if f == 1), None)
+    assert status == 1, f"[engine-connection-share] CloseSession status={status}"
+    wait_until(lambda: zk_ls(sa) is None, what="engine A znode removal")
+    wait_until(lambda: len(engine_pids()) == pids0 + 1, what="engine A process exit")
+    # B 仍可查（其引擎不受影响）
+    engine_query(b, 10)
+    assert zk_ls(sb) is not None and len(zk_ls(sb)) == 1
+    print("[engine-connection-share] PASS（会话级引擎 + CloseSession 下线 + 邻居存活）")
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "legacy"
     c = client()
@@ -832,5 +999,18 @@ if __name__ == "__main__":
     # ---------------- D21 元数据目录族 ----------------
     elif which == "metadata":
         metadata(c)
+    # ---------------- D22 引擎管理族（ZK 模式网关，见文件头部 runbook 注释） ----------------
+    elif which == "engine-cold":
+        engine_cold(c)
+    elif which == "engine-reuse":
+        engine_reuse(c)
+    elif which == "engine-kill-recovery":
+        engine_kill_recovery(c)
+    elif which == "engine-user-share":
+        engine_user_share(c)
+    elif which == "engine-group-share":
+        engine_group_share(c)
+    elif which == "engine-connection-share":
+        engine_connection_share(c)
     else:
         raise SystemExit(f"unknown case {which}")

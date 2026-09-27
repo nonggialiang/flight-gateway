@@ -9,6 +9,7 @@ import org.fg.common.concurrent.NamedThreadFactory;
 import org.fg.common.config.GatewayConfig;
 import org.fg.common.service.SingletonRegistry;
 import org.fg.frontend.FgFlightService;
+import org.fg.ha.FgZkClient;
 import org.fg.orchestrator.QueryOrchestrator;
 import org.fg.orchestrator.QueryTimeoutSweeper;
 import org.fg.orchestrator.store.OperationStoreService;
@@ -16,6 +17,7 @@ import org.fg.result.store.ObjectStoreService;
 import org.fg.result.store.ObjectStores;
 import org.fg.spi.SqlEngine;
 import org.fg.spark.client.SparkEngineClient;
+import org.fg.spark.client.SparkEngineRouter;
 
 /**
  * 装配模块（design §5/DACDaemonModule 范式）。
@@ -46,7 +48,18 @@ final class GatewayDaemonModule {
       throw new IllegalStateException(
           "fg.engine.spark.route=A (fallback) lands with PoC failure; M1 ships route B only");
     }
-    SqlEngine engine = new SparkEngineClient(config);
+    // M2（D22）：fg.zk.addresses 非空 → ZK 发现 + share level 路由 + 拉起/恢复；
+    // 空（默认）→ M1 固定单引擎（回归门：既有行为零改动）
+    String zkAddresses = config.hasPath("fg.zk.addresses")
+        ? config.getString("fg.zk.addresses").trim() : "";
+    SqlEngine engine;
+    if (!zkAddresses.isEmpty()) {
+      FgZkClient zk = new FgZkClient(zkAddresses, config.getString("fg.zk.namespace"));
+      zk.start();
+      engine = new SparkEngineRouter(config, zk, context.getExecutor(), context.getMeterRegistry());
+    } else {
+      engine = new SparkEngineClient(config);
+    }
     registry.bind(SqlEngine.class, engine);
 
     // 6. Orchestrator + 超时护栏
