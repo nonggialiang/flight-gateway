@@ -10,6 +10,7 @@ import com.typesafe.config.ConfigFactory;
 import com.typesafe.config.ConfigValue;
 import com.typesafe.config.ConfigValueFactory;
 import java.util.List;
+import java.util.Map;
 
 /** Gateway configuration, DremioConfig-style three-layer merge. */
 public final class GatewayConfig {
@@ -95,6 +96,36 @@ public final class GatewayConfig {
 
   public GatewayConfig getConfig(String path) {
     return new GatewayConfig(effective.getConfig(path));
+  }
+
+  /** 字符串列表（D22：group-mapping / auth users / extra-jars 等）。 */
+  public List<String> getStringList(String path) {
+    return effective.getStringList(path);
+  }
+
+  /**
+   * 配置对象的扁平键值展开（D22：{@code fg.engine.spark.launch.conf.*} 透传用）。
+   * HOCON 点号嵌套还原为点号键：{@code launch.conf.spark.driver.memory} →
+   * {@code spark.driver.memory}。叶子非字符串值以 toString 交付。
+   */
+  public Map<String, String> getFlatEntries(String path) {
+    if (!effective.hasPath(path)) {
+      return Map.of();
+    }
+    Map<String, String> out = new java.util.LinkedHashMap<>();
+    flatten(effective.getObject(path).unwrapped(), "", out);
+    return out;
+  }
+
+  @SuppressWarnings("unchecked")
+  private static void flatten(Object node, String prefix, Map<String, String> out) {
+    if (node instanceof Map) {
+      for (Map.Entry<String, Object> e : ((Map<String, Object>) node).entrySet()) {
+        flatten(e.getValue(), prefix.isEmpty() ? e.getKey() : prefix + "." + e.getKey(), out);
+      }
+    } else if (node != null) {
+      out.put(prefix, String.valueOf(node));
+    }
   }
 
   /** A few well-known keys. */

@@ -17,11 +17,20 @@
   <dependencies>
     <dependency><groupId>org.fg</groupId><artifactId>fg-common</artifactId></dependency>
     <dependency><groupId>org.fg</groupId><artifactId>fg-engine-spi</artifactId></dependency>
+    <!-- ZK 发现契约（D22）：路由/管理器/拉起器消费（纯 Java，curator 依赖随之传递） -->
+    <dependency><groupId>org.fg</groupId><artifactId>fg-ha</artifactId></dependency>
 
     <!-- Spark Connect proto (org.apache.spark.sql.connect.proto) -->
     <dependency>
       <groupId>org.apache.spark</groupId>
       <artifactId>spark-connect-common_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
+    </dependency>
+
+    <!-- 引擎拉起（D22）：纯 Java 瘦件，无 spark-core 传递（实证 dependency:tree） -->
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-launcher_${scala.binary.version}</artifactId>
       <version>${spark.version}</version>
     </dependency>
 
