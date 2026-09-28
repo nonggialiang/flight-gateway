@@ -72,6 +72,9 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   /** peerIdentity(user) → user 直通缓存（identity 即用户名；会话语义见 sessionRef） */
   private final Map<String, String> sessions = new ConcurrentHashMap<>();
 
+  private static final org.slf4j.Logger LOGGER =
+      org.slf4j.LoggerFactory.getLogger(FgFlightProducer.class);
+
   FgFlightProducer(
       QueryOrchestrator orchestrator,
       EndpointsAssembler endpoints,
@@ -92,6 +95,7 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   @Override
   public FlightInfo getFlightInfo(
       FlightProducer.CallContext context, FlightDescriptor descriptor) {
+    LOGGER.debug("getFlightInfo: command={} bytes", descriptor.getCommand().length);
     try {
       Any any = Any.parseFrom(descriptor.getCommand());
       if (any.is(FlightSql.CommandStatementQuery.class)) {
@@ -151,6 +155,7 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       FlightProducer.CallContext context, FlightDescriptor descriptor) {
     try {
       Any any = Any.parseFrom(descriptor.getCommand());
+      LOGGER.debug("pollFlightInfo: anyType={}", any.getTypeUrl());
       // CommandPreparedStatementQuery 同 getFlightInfoPreparedStatement 垫片：handle 即 SQL 明文。
       // patched JDBC（PreparedStatement.execute 走 PollFlightInfo）依赖此分支，否则 UNIMPLEMENTED
       // 触发客户端回退 GetFlightInfo → 永远到不了 presign 终态。
@@ -171,6 +176,8 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
               sessionRef(context), user(context), sql, negotiateMode(context),
               scrollRequested(context));
       OperationRow row = reg.row();
+      LOGGER.debug("pollFlightInfo: registered queryId={} isNew={} status={}",
+          row.queryId(), reg.newlyTriggered(), row.status());
 
       // ②…长等待（fg.poll.max-wait 到点返回未完成，客户端续 poll）
       QueryOrchestrator.PollOutcome outcome =
@@ -270,6 +277,7 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     try {
       Any any = Any.parseFrom(ticket.getBytes());
       if (any.getTypeUrl().startsWith("type.googleapis.com/arrow.flight.protocol.sql.")) {
+        LOGGER.debug("getStream: typed ticket typeUrl={}", any.getTypeUrl());
         super.getStream(context, ticket, listener);
         return;
       }
@@ -280,6 +288,7 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     // 经 PagingMiddleware 捕获后随票下发——STREAM 票 + 页头 = scroll 页切片
     PagingMiddleware paging = context.getMiddleware(PagingMiddleware.KEY);
     PagingMiddleware.PageRequest page = paging == null ? null : paging.request();
+    LOGGER.debug("getStream: HMAC relay ticket, paging={}", page == null ? "none" : page);
     relayExecutor.execute(() -> relay.relay(context.peerIdentity(), ticket, listener, page));
   }
 
@@ -724,6 +733,7 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       FlightProducer.CallContext context,
       org.apache.arrow.flight.Action action,
       FlightProducer.StreamListener<org.apache.arrow.flight.Result> listener) {
+    LOGGER.debug("doAction: type={} body={} bytes", action.getType(), action.getBody().length);
     switch (action.getType()) {
       case "CancelFlightInfo", "arrow.flight.protocol.sql.CancelFlightInfo" -> {
         try {

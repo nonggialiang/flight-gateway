@@ -1,10 +1,16 @@
 <configuration>
+  <!-- RPC 调试日志经 -Dfg.log.rpc=DEBUG 开启（RpcTraceMiddleware 每调用一行 +
+       FgFlightProducer 关键分支；常开太吵，默认 INFO）。 -->
+  <property name="rpcLevel" value="${fg.log.rpc:-INFO}"/>
+
   <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
     <encoder>
       <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{24} - %msg%n</pattern>
     </encoder>
   </appender>
 
+  <logger name="org.fg.frontend.RpcTraceMiddleware" level="${rpcLevel}"/>
+  <logger name="org.fg.frontend.FgFlightProducer" level="${rpcLevel}"/>
   <logger name="org.fg" level="INFO"/>
   <logger name="org.apache.arrow.flight" level="DEBUG"/>
   <logger name="org.apache.arrow" level="INFO"/>
