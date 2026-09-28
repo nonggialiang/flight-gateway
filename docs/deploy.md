@@ -195,13 +195,24 @@ cluster 模式 JDK17 `--add-opens` 系列由 FG 自动合并进 `spark.driver.ex
 
 ## 4. 启动
 
+推荐 `-Dfg.config.file` 显式指定 gateway.conf（`-jar` 模式直接可用；文件缺失启动期快败，不静默回落）：
+
 ```bash
 java -Xmx2g \
   --add-opens=java.base/java.nio=ALL-UNNAMED \
   --add-opens=jdk.unsupported/sun.misc=ALL-UNNAMED \
   --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+  -Dfg.config.file=/opt/fg/conf/gateway.conf \
   -jar /opt/fg/lib/fg-dist-0.1.0-SNAPSHOT.jar
 ```
+
+等价方式：`-cp` 把 conf 目录挂进 classpath（main class `org.fg.dist.GatewayDaemon`，文件名必须叫 `gateway.conf`）：
+
+```bash
+java ... -cp /opt/fg/lib/fg-dist-0.1.0-SNAPSHOT.jar:/opt/fg/conf org.fg.dist.GatewayDaemon
+```
+
+未指定 `fg.config.file` 且 classpath 无 gateway.conf 时回落 fg-reference.conf 默认。注意 typesafe 的 `-Dconfig.file` 约定在本实现不生效，用 `fg.config.file`。
 
 systemd 示例：
 
@@ -214,6 +225,7 @@ After=network.target postgresql.service
 User=fg
 ExecStart=/usr/bin/java -Xmx2g --add-opens=java.base/java.nio=ALL-UNNAMED \
   --add-opens=jdk.unsupported/sun.misc=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+  -Dfg.config.file=/opt/fg/conf/gateway.conf \
   -jar /opt/fg/lib/fg-dist-0.1.0-SNAPSHOT.jar
 Restart=on-failure
 LimitNOFILE=65536

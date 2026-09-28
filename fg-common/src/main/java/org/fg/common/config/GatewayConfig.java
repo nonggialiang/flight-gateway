@@ -17,6 +17,8 @@ public final class GatewayConfig {
 
   public static final String REFERENCE_CONF = "fg-reference.conf";
   public static final String CONFIG_FILE = "gateway.conf";
+  /** 显式指定 gateway.conf 路径的系统属性（-jar 模式无需 -cp 挂目录）。 */
+  public static final String CONFIG_FILE_PROPERTY = "fg.config.file";
 
   private final Config effective;
 
@@ -24,10 +26,26 @@ public final class GatewayConfig {
     this.effective = effective;
   }
 
+  /**
+   * 用户配置层装载：{@code -Dfg.config.file} 指定路径则 parseFile（文件必须存在，
+   * 缺失即抛——显式指定路径拼错不应静默回落）；否则回落 classpath 的 gateway.conf
+   * （可缺席）。reference ← user ← -Dfg.* 三层合并不变。
+   */
   public static GatewayConfig create() {
     final Config reference = ConfigFactory.parseResources(REFERENCE_CONF);
-    final Config user = ConfigFactory.parseResources(CONFIG_FILE).withFallback(reference);
-    return new GatewayConfig(applySystemProperties(user).resolve());
+    final String explicitPath = System.getProperty(CONFIG_FILE_PROPERTY, "").trim();
+    final Config user;
+    if (!explicitPath.isEmpty()) {
+      java.io.File file = new java.io.File(explicitPath);
+      if (!file.isFile()) {
+        throw new IllegalStateException(
+            CONFIG_FILE_PROPERTY + " points to a missing file: " + explicitPath);
+      }
+      user = ConfigFactory.parseFile(file);
+    } else {
+      user = ConfigFactory.parseResources(CONFIG_FILE);
+    }
+    return new GatewayConfig(applySystemProperties(user.withFallback(reference)).resolve());
   }
 
   /**
