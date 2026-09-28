@@ -3,7 +3,7 @@ package org.fg.spark.client
 import org.fg.common.config.GatewayConfig
 import org.fg.spi.{CommandOutcome, EngineCatalog, EngineSession}
 
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 
 /**
  * Spark 引擎目录实现（design §4.8/D21，M2）：catalog 完全在引擎侧——四条 SHOW/DESCRIBE

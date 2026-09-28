@@ -6,7 +6,7 @@ import org.apache.spark.connect.proto._
 import org.fg.common.config.GatewayConfig
 import org.fg.spi._
 
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
@@ -431,7 +431,7 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     channel
       .unaryStub[SparkConnectServiceGrpc.SparkConnectServiceBlockingStub](
         ch => SparkConnectServiceGrpc.newBlockingStub(ch),
-        s.user, s.gatewaySessionId, 30_000L)
+        s.user, s.gatewaySessionId, 30000L)
       .withDeadlineAfter(30, java.util.concurrent.TimeUnit.SECONDS)
       .interrupt(request)
   }
@@ -448,7 +448,7 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
       channel
         .unaryStub[SparkConnectServiceGrpc.SparkConnectServiceBlockingStub](
           ch => SparkConnectServiceGrpc.newBlockingStub(ch),
-          "fg-gateway", "", 30_000L)
+          "fg-gateway", "", 30000L)
         .withDeadlineAfter(30, java.util.concurrent.TimeUnit.SECONDS)
         .releaseExecute(request)
     } catch {
@@ -473,7 +473,7 @@ private[client] object SparkEngineClient {
 
   /** 无结果集命令的合成 schema：[ok BOOLEAN]（D17/D18，与网关 CommandSchemas 的 DDL/USE 同形）。 */
   val okSchema: Schema = new Schema(
-    java.util.List.of(new org.apache.arrow.vector.types.pojo.Field(
+    java.util.List.of[org.apache.arrow.vector.types.pojo.Field](new org.apache.arrow.vector.types.pojo.Field(
       "ok",
       org.apache.arrow.vector.types.pojo.FieldType.nullable(
         new org.apache.arrow.vector.types.pojo.ArrowType.Bool()),

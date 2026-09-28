@@ -5,7 +5,7 @@ import org.fg.ha.FgZkClient
 
 import java.net.{InetAddress, NetworkInterface}
 import java.util.concurrent.atomic.AtomicBoolean
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 
 /**
  * 引擎侧 ZK agent（D22，Kyuubi SparkSQLEngine 生命周期范式）：

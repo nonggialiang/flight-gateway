@@ -72,9 +72,9 @@ object FgEngineMain {
         adminPort = adminPort,
         isConnectionShare = sparkProp("fg.engine.share.level").exists(_.equalsIgnoreCase("CONNECTION")),
         maxLifetimeMs = durationProp("fg.engine.max-lifetime", 0L),
-        sessionGraceMs = durationProp("fg.engine.zk.session-grace", 30_000L),
+        sessionGraceMs = durationProp("fg.engine.zk.session-grace", 30000L),
         maxInitialWaitMs = durationProp("fg.engine.max-initial-wait", 10L * 60 * 1000),
-        drainTimeoutMs = 60_000L,
+        drainTimeoutMs = 60000L,
         spark = spark)
       a.start()
       agent = Some(a)

@@ -10,7 +10,7 @@ import java.net.{ConnectException, UnknownHostException}
 import java.time.Duration
 import java.util.Locale
 import java.util.concurrent.{CompletableFuture, Executor}
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 
 /**
  * ZK 模式 SqlEngine 装饰路由（D22 决策 2，SPI 零改动）：
@@ -50,7 +50,7 @@ final class SparkEngineRouter(
   private val openRetryWaitMs = config.getDurationMs("fg.engine.open.retry-wait")
 
   /** opId → engineSpace（releaseExecution 定向；有界防蔓延）。 */
-  private val opBindings = new OperationBindings(10_000)
+  private val opBindings = new OperationBindings(10000)
 
   private lazy val adminHttp = java.net.http.HttpClient.newHttpClient()
 

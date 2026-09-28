@@ -65,12 +65,15 @@ cd arrow-java && mvn -pl flight/flight-sql-jdbc-core,flight/flight-sql-jdbc-driv
 - 网络可达 ZK / PG / MinIO / standalone master
 
 **引擎节点（standalone workers）：**
-- Spark 3.5.x 发行包（集群本身已有）
-- **S3A 两件**：`hadoop-aws-3.3.4.jar` + `aws-java-sdk-bundle-1.12.262.jar`，二选一：
+- Spark 3.5.6 发行包（**Scala 2.12 线**，即 `spark-3.5.6-bin-hadoop3` 无 2.13 后缀的默认构建；项目 Kit 同线编译——`scala.binary.version=2.12`）
+- **S3A 两件**：`hadoop-aws-3.3.4.jar` + `aws-java-sdk-bundle-1.12.262.jar`（完整 280MB，**校验大小防截断拷贝**），二选一：
   - 预放进每个节点的 `$SPARK_HOME/jars/`（推荐，免每次分发）；或
-  - 经 `launch.extra-jars` 携带（每次拉起随 --jars 分发，aws-sdk-bundle ~200MB 时不推荐）
+  - 经 `launch.extra-jars` 携带（每次拉起随 --jars 分发，aws-sdk-bundle ~280MB 时不推荐）
+- **spark-connect_2.12-3.5.6.jar**（发行包不含，需另放入 `$SPARK_HOME/jars/`）
 - fg-spark-sink 同理：预放进 `$SPARK_HOME/jars/` 或经 `extra-jars` 携带
 - 15002/15003 可绑定（引擎侧有 preflight 快败，起不来会反馈到网关拉起失败）
+
+构件获取（华为云镜像，国内快）：dist `https://mirrors.huaweicloud.com/apache/spark/spark-3.5.6/spark-3.5.6-bin-hadoop3.tgz`；maven 构件 `https://repo.huaweicloud.com/repository/maven/`（根 pom 已声明该 repo 优先）。
 
 **基础设施：**
 

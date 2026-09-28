@@ -15,7 +15,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 
 /**
  * 引擎管理器（D22，Kyuubi EngineRef 三段式）：
@@ -110,7 +110,7 @@ private[client] class SparkEngineManager(
       val space = key.space
       Option(engines.remove(space)).foreach { me =>
         recoveriesCounter.increment()
-        log.info("recovering engine space={} stale={}", space, me.node)
+        log.info(s"recovering engine space=$space stale=${me.node}")
         try {
           zk.deregisterIfStale(space, key.lockPath,
             me.node.host(), me.node.connectPort(), lockTimeoutMs)
@@ -178,9 +178,7 @@ private[client] class SparkEngineManager(
     launchesCounter.increment()
     var launched: LaunchedEngine = null
     try {
-      log.info("launching engine space={} refId={} connectPort={} adminPort={} deploy={}",
-        space, refId, connectPort, adminPort,
-        config.getString("fg.engine.spark.launch.deploy-mode"))
+      log.info(s"launching engine space=$space refId=$refId connectPort=$connectPort adminPort=$adminPort deploy=${config.getString("fg.engine.spark.launch.deploy-mode")}")
       launched = launcher.launch(key, space, refId, connectPort, adminPort)
       val deadline = System.currentTimeMillis() + initTimeoutMs
       var result: ManagedEngine = null
@@ -188,7 +186,7 @@ private[client] class SparkEngineManager(
         val found = zk.engineByRefId(space, refId) // java Optional
         if (found.isPresent) {
           result = cache(space, found.get())
-          log.info("engine registered space={} refId={} node={}", space, refId, result.node)
+          log.info(s"engine registered space=$space refId=$refId node=${result.node}")
         } else {
           if (launched.exitedAbnormally) {
             throw new IllegalStateException(
@@ -260,7 +258,7 @@ private[client] class SparkEngineManager(
           engines.remove(me.space, me)
           closeQuietly(me.client)
           evictionsCounter("sweep").increment()
-          log.debug("evicted engine {} (znode gone): {}", me.space, me.node)
+          log.debug(s"evicted engine ${me.space} (znode gone): ${me.node}")
         }
       } catch {
         case _: Exception => // ZK 抖动：本轮跳过

@@ -84,12 +84,18 @@ private[app] object FgSessionAdmin {
     }
   }
 
-  /** 反射取 SparkConnectService$.userSessionMapping（private 静态字段，同 JVM 内可达）。 */
+  /**
+   * 反射取 SparkConnectService$.userSessionMapping（同 JVM 内可达）。字段形态随 Spark 的
+   * Scala 线不同（实证 javap）：2.13 构建的 connect（3.5.9）是 <b>static final</b>——
+   * {@code get(null)} 即得；2.12 构建（3.5.6）是模块<b>实例</b>字段——须传 MODULE$ 实例
+   * （Scala 源码里 {@code SparkConnectService} 引用即该实例）。null 优先、实例兜底。
+   */
   private def sessionCache(): org.sparkproject.connect.guava.cache.Cache[scala.Tuple2[String, String], SessionHolder] = {
     val moduleClass = SparkConnectService.getClass // class org.apache.spark.sql.connect.service.SparkConnectService$
     val field = moduleClass.getDeclaredField("userSessionMapping")
     field.setAccessible(true)
-    field.get(null).asInstanceOf[org.sparkproject.connect.guava.cache.Cache[scala.Tuple2[String, String], SessionHolder]]
+    val value = if (java.lang.reflect.Modifier.isStatic(field.getModifiers)) field.get(null) else field.get(SparkConnectService)
+    value.asInstanceOf[org.sparkproject.connect.guava.cache.Cache[scala.Tuple2[String, String], SessionHolder]]
   }
 
   // ------------------------------------------------------------- HTTP 面向 gateway

@@ -32,11 +32,11 @@
     <!-- arrow-java line tops at 19.0.0 (the "Flight SQL v25 spec" primitives
          PollFlightInfo/RenewFlightEndpoint/CancelFlightInfo/https-location are all present) -->
     <arrow.version>19.0.0</arrow.version>
-    <spark.version>3.5.9</spark.version>
+    <spark.version>3.5.6</spark.version>
     <!-- arrow version bundled in the Spark 3.5.9 distro; sink compiles against it (provided) -->
     <spark.arrow.version>12.0.1</spark.arrow.version>
-    <scala.version>2.13.14</scala.version>
-    <scala.binary.version>2.13</scala.binary.version>
+    <scala.version>2.12.18</scala.version>
+    <scala.binary.version>2.12</scala.binary.version>
 
     <guava.version>33.2.1-jre</guava.version>
     <!-- kit self-managed grpc/protobuf (D3)：与 arrow 19 线统一（spark connect proto 在 4.x 运行时兼容加载） -->
@@ -60,6 +60,16 @@
     <assertj.version>3.26.0</assertj.version>
     <testcontainers.version>1.21.4</testcontainers.version>
   </properties>
+
+  <repositories>
+    <!-- 华为云 maven 镜像（国内拉 spark/scala 构件快；central 仍兜底） -->
+    <repository>
+      <id>huaweicloud</id>
+      <url>https://repo.huaweicloud.com/repository/maven/</url>
+      <releases><enabled>true</enabled></releases>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
 
   <dependencyManagement>
     <dependencies>

@@ -1,7 +1,7 @@
 package org.fg.spark.client
 
 import org.fg.common.config.GatewayConfig
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 
 /**
  * GROUP share level 的路由用户解析（D22，Kyuubi GroupProvider 范式的最小内嵌版）。

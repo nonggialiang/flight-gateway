@@ -5,7 +5,7 @@ import org.apache.spark.launcher.SparkLauncher
 import org.fg.common.config.GatewayConfig
 
 import java.io.File
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 
 /**
  * 引擎拉起器（D22）——Kit 内唯一懂 deploy-mode 的类。SparkLauncher（纯 Java 瘦件，

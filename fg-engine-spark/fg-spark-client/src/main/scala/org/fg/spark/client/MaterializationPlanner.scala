@@ -10,7 +10,7 @@ import org.fg.spi.MaterializationSpec
 
 import java.util
 import scala.collection.mutable
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 
 /**
  * Connect plan 组装与 schema 转换（design §4.4.3）。
