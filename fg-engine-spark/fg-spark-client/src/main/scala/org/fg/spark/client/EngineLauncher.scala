@@ -38,6 +38,35 @@ private[client] object EngineLauncher {
       "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED " +
       "--add-opens=jdk.unsupported/sun.misc=ALL-UNNAMED " +
       "--add-opens=jdk.unsupported/sun.reflect=ALL-UNNAMED"
+
+  /**
+   * 装载 spark-defaults.conf 风格的 properties 文件（D27 后补：公共基础 spark conf）。
+   * 支持 `#`/`!` 注释、`=`/`:`/空白分隔、行续（java.util.Properties 语义）。
+   * 空路径 = 未配置（空表）；文件缺失/不可读 ISE 快败（启动期配置面）。
+   * 优先级：本文件 < fg.engine.spark.launch.conf 对象（后者撞键覆盖）。
+   */
+  private[client] def loadConfFile(path: String): java.util.Map[String, String] = {
+    val out = new java.util.LinkedHashMap[String, String]()
+    val p = if (path == null) "" else path.trim
+    if (p.isEmpty) return out
+    val file = new File(if (p.startsWith("~")) System.getProperty("user.home") + p.substring(1) else p)
+    if (!file.isFile) {
+      throw new IllegalStateException(s"fg.engine.spark.launch.conf-file not a file: $p")
+    }
+    val props = new java.util.Properties()
+    var in: java.io.Reader = null
+    try {
+      in = new java.io.InputStreamReader(new java.io.FileInputStream(file), "UTF-8")
+      props.load(in)
+    } finally {
+      if (in != null) in.close()
+    }
+    props.forEach { (k, v) =>
+      val key = String.valueOf(k).trim
+      if (key.nonEmpty) out.put(key, String.valueOf(v))
+    }
+    out
+  }
 }
 
 private[client] final class EngineLauncher(config: GatewayConfig) {
@@ -102,8 +131,11 @@ private[client] final class EngineLauncher(config: GatewayConfig) {
     config.getStringList("fg.engine.spark.launch.extra-jars").asScala
       .map(_.trim).filter(_.nonEmpty).foreach(launcher.addJar)
 
-    // 任意 spark conf 透传
-    val confPassthrough = config.getFlatEntries("fg.engine.spark.launch.conf")
+    // 任意 spark conf 透传：conf-file（spark-defaults.conf 风格 properties，公共基础配置）
+    // 先装载，launch.conf 对象后应用（撞键时对象覆盖文件）
+    val confPassthrough = new java.util.LinkedHashMap[String, String]()
+    confPassthrough.putAll(EngineLauncher.loadConfFile(config.getString("fg.engine.spark.launch.conf-file")))
+    confPassthrough.putAll(config.getFlatEntries("fg.engine.spark.launch.conf"))
     confPassthrough.forEach { (k, v) =>
       launcher.setConf(k, v)
     }
