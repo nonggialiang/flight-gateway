@@ -423,11 +423,21 @@ final class ResultRelay {
   /**
    * 背压等待（Dremio BackpressureStrategy 骨架）：isReady 不满足则 wait，
    * 被 onReady 唤醒或超时 fail；isCancelled 直接终止。
+   *
+   * <p><b>onReady 回调必须持锁 notify（2026-09-30 DBeaver 实证修复）</b>：回调在 gRPC
+   * serializing executor 线程执行，裸 {@code monitor::notifyAll} 不持 monitor 锁 →
+   * IllegalMonitorStateException——唤醒永远丢失（退化为 1s 轮询）且异常炸进 gRPC 破坏
+   * server call 的 listener 状态机（后续 listener.error() 无法以干净状态送达客户端，
+   * 客户端无 deadline 时 RPC 悬死，UI 一直"进行中"）。handler 内 synchronized 包裹。
    */
   private void putNextWhenClientReady(
       ServerStreamListener listener, long timeoutMs, String queryId) throws InterruptedException {
     Object monitor = new Object();
-    listener.setOnReadyHandler(monitor::notifyAll);
+    listener.setOnReadyHandler(() -> {
+      synchronized (monitor) {
+        monitor.notifyAll();
+      }
+    });
     long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
     synchronized (monitor) {
       while (!listener.isReady()) {
