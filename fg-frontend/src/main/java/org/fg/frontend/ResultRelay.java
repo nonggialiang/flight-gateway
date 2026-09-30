@@ -164,11 +164,12 @@ final class ResultRelay {
 
     BufferAllocator child = allocator.newChildAllocator("fg-relay-" + t.queryId(), 0, Long.MAX_VALUE);
     Pump pump = new Pump();
+    ReadyGate gate = new ReadyGate(listener);
     try {
       for (ResultManifest.Part part : parts) {
         try (InputStream in = objects.getObject(ObjectStoreService.objectName(part.uri()));
             ArrowStreamReader reader = new ArrowStreamReader(in, child)) {
-          pumpReader(reader, pump, child, listener, t.queryId());
+          pumpReader(reader, pump, child, listener, gate, t.queryId());
         }
       }
       logger.info("Relay complete: {} parts={} rows={}", t.queryId(), parts.size(), pump.rows);
@@ -253,8 +254,9 @@ final class ResultRelay {
           t.queryId(), offset, limit, total, emitted);
       if (out.getRowCount() > 0) {
         // 单页单 batch：驱动以整页为装载单元（页 LRU 缓存的原子粒度）；空页只 start+completed
-        putNextWhenClientReady(
-            listener, config.getDurationMs("fg.relay.client.readiness.timeout"), t.queryId());
+        ReadyGate gate = new ReadyGate(listener);
+        gate.await(config.getDurationMs("fg.relay.client.readiness.timeout"), t.queryId());
+        listener.putNext();
       }
       listener.completed();
     } catch (InterruptedException e) {
@@ -359,8 +361,9 @@ final class ResultRelay {
     }
     BufferAllocator child = allocator.newChildAllocator("fg-relay-" + t.queryId(), 0, Long.MAX_VALUE);
     Pump pump = new Pump();
+    ReadyGate gate = new ReadyGate(listener);
     try (ArrowStreamReader reader = new ArrowStreamReader(new ByteArrayInputStream(result), child)) {
-      pumpReader(reader, pump, child, listener, t.queryId());
+      pumpReader(reader, pump, child, listener, gate, t.queryId());
       logger.info("Relay complete: {} command rows={}", t.queryId(), pump.rows);
       listener.completed();
     } catch (InterruptedException e) {
@@ -377,7 +380,7 @@ final class ResultRelay {
   // ------------------------------------------------------------- 共享流式泵
 
   /** 输出状态：单一输出 root（putNext 序列化的是 start() 注册的实例）+ 累计行数。 */
-  private static final class Pump {
+  static final class Pump {
     VectorSchemaRoot out;
     VectorLoader loader;
     long rows;
@@ -387,11 +390,12 @@ final class ResultRelay {
    * 逐批装载 + 背压 putNext（STREAM/PART/COMMAND 共享）：reader 的每批经
    * VectorUnloader/VectorLoader 灌入输出 root；首个 reader 确立输出 root 与 listener.start。
    */
-  private void pumpReader(
+  void pumpReader(
       ArrowStreamReader reader,
       Pump pump,
       BufferAllocator child,
       ServerStreamListener listener,
+      ReadyGate gate,
       String queryId)
       throws Exception {
     VectorSchemaRoot src = reader.getVectorSchemaRoot();
@@ -408,7 +412,8 @@ final class ResultRelay {
       } finally {
         batch.close();
       }
-      putNextWhenClientReady(listener, readinessTimeoutMs, queryId);
+      gate.await(readinessTimeoutMs, queryId);
+      listener.putNext();
       pump.rows += pump.out.getRowCount();
     }
   }
@@ -421,37 +426,48 @@ final class ResultRelay {
   }
 
   /**
-   * 背压等待（Dremio BackpressureStrategy 骨架）：isReady 不满足则 wait，
-   * 被 onReady 唤醒或超时 fail；isCancelled 直接终止。
+   * 流级背压闸门（Dremio BackpressureStrategy 骨架，2026-09-30 DBeaver 实证重构）：
+   * <b>每条流注册一次 onReady handler、单一 monitor 复用到流结束</b>——此前每 batch 重注册
+   * 新 monitor，既有 handler 覆写竞态（gRPC 线程可能持旧 handler 在跑），也依赖 onReady
+   * 仅在 not-ready→ready 跃迁触发、注册时已 ready 不回调的语义（1s isReady 轮询兜底）。
    *
-   * <p><b>onReady 回调必须持锁 notify（2026-09-30 DBeaver 实证修复）</b>：回调在 gRPC
-   * serializing executor 线程执行，裸 {@code monitor::notifyAll} 不持 monitor 锁 →
-   * IllegalMonitorStateException——唤醒永远丢失（退化为 1s 轮询）且异常炸进 gRPC 破坏
-   * server call 的 listener 状态机（后续 listener.error() 无法以干净状态送达客户端，
-   * 客户端无 deadline 时 RPC 悬死，UI 一直"进行中"）。handler 内 synchronized 包裹。
+   * <p>两个实证教训（保留给后人）：① 回调在 gRPC serializing executor 线程执行，
+   * <b>必须持锁 notify</b>——裸 {@code monitor::notifyAll} 即 IllegalMonitorStateException，
+   * 唤醒丢失且异常炸进 gRPC 破坏 listener 状态机（error() 不再可达客户端，RPC 悬死）；
+   * ② 等待本身是<b>合法背压而非故障</b>：客户端（如 DBeaver 翻页浏览）停止拉行时
+   * HTTP/2 窗口不重开、isReady 恒 false——客户端一拉行即恢复；界由
+   * {@code fg.relay.client.readiness.timeout} 兜底（超时 fail，防死客户端占住 relay 线程）。
    */
-  private void putNextWhenClientReady(
-      ServerStreamListener listener, long timeoutMs, String queryId) throws InterruptedException {
-    Object monitor = new Object();
-    listener.setOnReadyHandler(() -> {
+  static final class ReadyGate {
+
+    private final ServerStreamListener listener;
+    private final Object monitor = new Object();
+
+    ReadyGate(ServerStreamListener listener) {
+      this.listener = listener;
+      listener.setOnReadyHandler(() -> {
+        synchronized (monitor) {
+          monitor.notifyAll();
+        }
+      });
+    }
+
+    /** 等待客户端就绪：onReady 即时唤醒 + 1s isReady 轮询兜底；界超时。 */
+    void await(long timeoutMs, String queryId) throws InterruptedException {
+      long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
       synchronized (monitor) {
-        monitor.notifyAll();
-      }
-    });
-    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-    synchronized (monitor) {
-      while (!listener.isReady()) {
-        if (listener.isCancelled()) {
-          throw new InterruptedException("Client cancelled stream: " + queryId);
+        while (!listener.isReady()) {
+          if (listener.isCancelled()) {
+            throw new InterruptedException("Client cancelled stream: " + queryId);
+          }
+          long remaining = deadline - System.nanoTime();
+          if (remaining <= 0) {
+            throw new IllegalStateException(
+                "Client not ready for " + timeoutMs + "ms (backpressure timeout): " + queryId);
+          }
+          monitor.wait(Math.min(remaining, 1000));
         }
-        long remaining = deadline - System.nanoTime();
-        if (remaining <= 0) {
-          throw new IllegalStateException(
-              "Client not ready for " + timeoutMs + "ms (backpressure timeout): " + queryId);
-        }
-        monitor.wait(Math.min(remaining, 1000));
       }
     }
-    listener.putNext();
   }
 }
