@@ -7,10 +7,11 @@ import java.sql.Statement;
 import java.util.Properties;
 
 /**
- * statementDefaultScroll 验证探针（fork 方案 A）： ① 默认连接（无参数）—— 无参
+ * statementDefaultScroll 验证探针（fork 方案 A v2）： ① 默认连接（无参数）—— 无参
  * createStatement 为 FORWARD_ONLY、行为零变化； ② statementDefaultScroll=true —— 无参
  * createStatement/prepareStatement 自动 SCROLL_INSENSITIVE（服务端分页，翻页走短 DoGet），
- * 逐页遍历 500 行逐值；显式 FORWARD_ONLY 语句在开参连接上不受影响（流式自我声明）。
+ * 逐页遍历 500 行逐值；带参重载显式 FORWARD_ONLY 同样被升级（v2 连接级策略：DBeaver
+ * 实证其执行语句经带参重载显式 FORWARD_ONLY，v1 无参覆写盖不住；逃生舱=不开 flag 的连接）。
  */
 public final class StatementDefaultScrollProbe {
   public static void main(String[] args) throws Exception {
@@ -63,12 +64,12 @@ public final class StatementDefaultScrollProbe {
           }
         }
       }
-      // 显式 FORWARD_ONLY 在开参连接上不受影响（流式自我声明）
+      // v2：带参重载显式 FORWARD_ONLY 同样升级（连接级策略，覆盖 DBeaver 的建语句路径）
       try (Statement explicit =
           conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
-        checkType(explicit, ResultSet.TYPE_FORWARD_ONLY, "开参连接显式 FORWARD_ONLY");
+        checkType(explicit, ResultSet.TYPE_SCROLL_INSENSITIVE, "开参连接显式 FORWARD_ONLY（v2 升级）");
       }
-      System.out.println("[sds] ② 开参连接 scroll 升级 + 翻页/反向/显式 FORWARD_ONLY OK");
+      System.out.println("[sds] ② 开参连接 scroll 升级 + 翻页/反向/带参 FORWARD_ONLY 升级 OK");
     }
     System.out.println("[sds] PASS");
   }
