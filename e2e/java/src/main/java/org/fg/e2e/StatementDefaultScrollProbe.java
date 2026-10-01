@@ -71,7 +71,59 @@ public final class StatementDefaultScrollProbe {
       }
       System.out.println("[sds] ② 开参连接 scroll 升级 + 翻页/反向/带参 FORWARD_ONLY 升级 OK");
     }
+
+    // ③ DBeaver 段式取数模式（同一连接）：RS 关闭后同 SQL 重执行（同会话指纹去重回
+    //    queryId——缓存键稳定）+ 从行 1 顺序重读 → 连接级页缓存应全部命中（0 网关页）
+    try (Connection conn = DriverManager.getConnection(scrollUrl, props())) {
+      // 首执行填缓存
+      try (Statement st = conn.createStatement()) {
+        st.setFetchSize(50);
+        try (ResultSet rs = st.executeQuery("SELECT id, id * 2 AS dbl FROM range(500) ORDER BY id")) {
+          while (rs.next()) { /* consume */ }
+        }
+      }
+      long before = fetchCountMetric();
+      try (Statement st = conn.createStatement()) { // 新 statement = DBeaver 段式重执行
+        st.setFetchSize(50);
+        try (ResultSet rs = st.executeQuery("SELECT id, id * 2 AS dbl FROM range(500) ORDER BY id")) {
+          long expect = 0;
+          while (rs.next()) {
+            if (rs.getLong(1) != expect || rs.getLong(2) != expect * 2) {
+              throw new AssertionError("reexec row " + rs.getRow() + ": " + rs.getLong(1));
+            }
+            expect++;
+          }
+          if (expect != 500) {
+            throw new AssertionError("reexec rows=" + expect);
+          }
+        }
+      }
+      long fetched = fetchCountMetric() - before;
+      System.out.println("[sds] ③ 同连接重执行重读网关页 DoGet = " + fetched + "（0=全缓存命中）");
+      if (fetched != 0) {
+        throw new AssertionError("重执行页缓存未命中：网关页 DoGet=" + fetched);
+      }
+    }
     System.out.println("[sds] PASS");
+  }
+
+  /** fg_scroll_pages_total 当前值（本机 :9091；不可达时返回 -1 仅打印不断言）。 */
+  private static long fetchCountMetric() {
+    try {
+      java.io.BufferedReader r =
+          new java.io.BufferedReader(
+              new java.io.InputStreamReader(
+                  new java.net.URL("http://localhost:9091/metrics").openStream()));
+      String line;
+      while ((line = r.readLine()) != null) {
+        if (line.startsWith("fg_scroll_pages_total")) {
+          return (long) Double.parseDouble(line.substring(line.lastIndexOf(' ') + 1));
+        }
+      }
+    } catch (Exception e) {
+      System.out.println("[sds] metrics unavailable: " + e);
+    }
+    return -1;
   }
 
   private static Properties props() {
