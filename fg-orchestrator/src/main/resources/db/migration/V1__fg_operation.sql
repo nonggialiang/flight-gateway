@@ -1,7 +1,9 @@
 -- fg_operation 作业表（design §4.2/D14/D17/D18/D19）：执行状态/operationId/mode/kind 落库，
 -- 跨实例共享。量级 = 在途查询数（retention 清扫）。
 CREATE TABLE fg_operation (
-  query_id               UUID PRIMARY KEY,
+  -- D28 续传协议：queryId 客户端可铸造（x-fg-query-id 头，不透明串 ≤128）或服务端
+  -- 生成（无头路径）——TEXT 主键
+  query_id               TEXT PRIMARY KEY,
   session_ref            TEXT NOT NULL,
   sql_hash               TEXT NOT NULL,
   user_name              TEXT NOT NULL,
@@ -30,11 +32,11 @@ CREATE TABLE fg_operation (
   updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 首 poll 幂等（D19）：唯一约束只作用于 kind='QUERY'——副作用语句（DML/DDL/SET/RESET/USE）
--- 豁免指纹去重，每次执行都是新行（网络重试与幂等冲突时以"可重复执行"为先；只读命令
--- 同例保持一致，避免 SHOW/DESCRIBE 命中陈旧行）。
+-- 首 poll 幂等（D19，D28 修订）：唯一约束收窄到 RUNNING——poll 循环期间（行在途）
+-- 同指纹重复注册收敛到一行；行终态后索引释放，同指纹允许新行（x-fg-query-id 显式
+-- 续传/新执行；无头路径的终态复用由 register 的 getByFingerprint 查询实现，不经此索引）。
 CREATE UNIQUE INDEX uq_fg_operation_query_fingerprint
-  ON fg_operation (session_ref, sql_hash) WHERE kind = 'QUERY';
+  ON fg_operation (session_ref, sql_hash) WHERE kind = 'QUERY' AND status = 'RUNNING';
 
 -- 在途命令幂等（D19 修正）：PollFlightInfo 每次调用都会 register（无 handle 可辨"同一
 -- 次执行"），COMMAND 若完全无约束会逐 poll 重复执行（慢 DML 每 poll 一次 INSERT）。

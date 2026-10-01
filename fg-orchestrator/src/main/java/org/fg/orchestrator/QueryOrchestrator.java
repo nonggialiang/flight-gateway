@@ -262,24 +262,70 @@ public class QueryOrchestrator implements Service {
   public Registration register(
       String sessionRef, String user, String sql, OperationRow.Mode mode, boolean scrollable)
       throws Exception {
+    return register(sessionRef, user, sql, mode, scrollable, null);
+  }
+
+  /**
+   * D28 显式续传协议（x-fg-query-id 头，fork 驱动专用）：
+   *
+   * <pre>
+   * ① requested 存在且 (session, queryId) 命中 + sql_hash 匹配 → 续传该行（终态复用 /
+   *    RUNNING poll 收敛；引擎不跑）
+   * ①' 命中但 sql_hash 不匹配 → INVALID_ARGUMENT（显式报错：旧票配新 SQL 是客户端 bug，
+   *    静默落穿会掩盖）
+   * ② requested 存在但未命中 → 直接新建执行（queryId = 客户端传入值原样存储；指纹去重
+   *    完全不参与——这是 fork 驱动主动重跑 SQL 的手段）
+   * ③ requested 缺失（无头客户端 pyarrow/ADBC）→ 现行指纹去重原样（含终态复用）
+   * </pre>
+   *
+   * <p>queryId 校验：非空、≤128 字符（存 TEXT 的注入面边界）。
+   */
+  public Registration register(
+      String sessionRef,
+      String user,
+      String sql,
+      OperationRow.Mode mode,
+      boolean scrollable,
+      String requestedQueryId)
+      throws Exception {
     GatewaySession ctx = resolveSession(sessionRef, user); // D20：入口必经（CLOSED sticky 即拒）
     StatementClassifier.Kind stmtKind = StatementClassifier.classify(sql);
     if (stmtKind != StatementClassifier.Kind.QUERY) {
-      // scroll 只对 QUERY 有意义（COMMAND 终态恒单 COMMAND endpoint 内联交付）
+      // scroll/续传只对 QUERY 有意义（COMMAND 终态恒单 COMMAND endpoint 内联交付）
       return registerCommand(ctx, sql, mode, stmtKind);
     }
 
     String sqlHash = sha256(sql);
-    OperationRow existing = dao.getByFingerprint(sessionRef, sqlHash).orElse(null);
-    if (existing != null) {
-      return new Registration(existing, false);
+    final String explicitQueryId;
+    if (requestedQueryId != null && !requestedQueryId.isBlank()) {
+      if (requestedQueryId.length() > 128) {
+        throw new IllegalArgumentException("x-fg-query-id too long (max 128): fork driver bug?");
+      }
+      OperationRow byId = dao.getBySessionAndQueryId(sessionRef, requestedQueryId).orElse(null);
+      if (byId != null) { // ① / ①'
+        if (!byId.sqlHash().equals(sqlHash)) {
+          throw new QueryIdMismatchException(
+              "x-fg-query-id " + requestedQueryId + " belongs to a different SQL");
+        }
+        return new Registration(byId, false);
+      }
+      explicitQueryId = requestedQueryId; // ②：新执行，客户端铸造的 id 即行身份
+    } else {
+      explicitQueryId = null; // ③：无头路径
+    }
+
+    if (explicitQueryId == null) { // ③ 指纹去重（含终态复用）
+      OperationRow existing = dao.getByFingerprint(sessionRef, sqlHash).orElse(null);
+      if (existing != null) {
+        return new Registration(existing, false);
+      }
     }
 
     Duration prepareTimeout = Duration.ofMillis(config.getDurationMs("fg.query.prepare.timeout"));
     Schema schema = engine.analyzeSchema(engine.openSession(ctx), sql, prepareTimeout);
     latchEngineStarted(ctx.sessionId(), ctx.user()); // 引擎会话已随 AnalyzePlan 诞生
 
-    String queryId = QueryIdHolder.newQueryId();
+    String queryId = explicitQueryId != null ? explicitQueryId : QueryIdHolder.newQueryId();
     String resultKeyPrefix =
         config.getString("fg.result.prefix") + "/" + engine.type() + "/" + user + "/" + queryId;
     OperationRow row =
@@ -326,7 +372,7 @@ public class QueryOrchestrator implements Service {
     }
     schemaBytes = SchemaSerde.serialize(declared);
 
-    String queryId = QueryIdHolder.newQueryId();
+    String queryId = QueryIdHolder.newQueryId(); // COMMAND 不吃客户端 queryId（内联交付无续传语义）
     OperationRow row =
         new OperationRow()
             .queryId(queryId)

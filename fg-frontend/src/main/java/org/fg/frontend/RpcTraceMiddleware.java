@@ -48,6 +48,7 @@ final class RpcTraceMiddleware implements FlightServerMiddleware {
       // 其余 fg 自定义头（协商/翻页），不存在则省略
       appendIfPresent(sb, incomingHeaders, EndpointModeMiddleware.HEADER);
       appendIfPresent(sb, incomingHeaders, ScrollModeMiddleware.HEADER);
+      appendIfPresent(sb, incomingHeaders, QueryIdMiddleware.HEADER);
       appendIfPresent(sb, incomingHeaders, PagingMiddleware.OFFSET_HEADER);
       appendIfPresent(sb, incomingHeaders, PagingMiddleware.LIMIT_HEADER);
       String line = sb.toString();

@@ -71,6 +71,8 @@ public final class FgFlightService implements Service {
             .middleware(EndpointModeMiddleware.KEY, new EndpointModeMiddleware.Factory())
             // D27 scroll 判据：捕获 x-fg-result-set-type（scroll），注册时落行 + 强制 relay
             .middleware(ScrollModeMiddleware.KEY, new ScrollModeMiddleware.Factory())
+            // D28 显式续传：捕获 x-fg-query-id（命中=续传 / 未命中=新建执行 / 缺失=指纹去重）
+            .middleware(QueryIdMiddleware.KEY, new QueryIdMiddleware.Factory())
             // D27 页头：DoGet 时捕获 x-fg-page-offset/limit（STREAM 票页切片）
             .middleware(PagingMiddleware.KEY, new PagingMiddleware.Factory())
             // RPC 级调试日志（每个 RPC 一行 DEBUG：方法/peer/session/fg 头——调用顺序分析用）

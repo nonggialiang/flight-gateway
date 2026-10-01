@@ -72,18 +72,10 @@ public final class StatementDefaultScrollProbe {
       System.out.println("[sds] ② 开参连接 scroll 升级 + 翻页/反向/带参 FORWARD_ONLY 升级 OK");
     }
 
-    // ③ DBeaver 段式取数模式（同一连接）：RS 关闭后同 SQL 重执行（同会话指纹去重回
-    //    queryId——缓存键稳定）+ 从行 1 顺序重读 → 连接级页缓存应全部命中（0 网关页）
+    // ③ 同连接重执行（无 maxRows 增长）：D28 显式续传协议下 = 新执行（数据正确即可；
+    //    续传判定是 maxRows 增长信号，见 ContinuationProbe——连接级页缓存已按定稿回滚）
     try (Connection conn = DriverManager.getConnection(scrollUrl, props())) {
-      // 首执行填缓存
       try (Statement st = conn.createStatement()) {
-        st.setFetchSize(50);
-        try (ResultSet rs = st.executeQuery("SELECT id, id * 2 AS dbl FROM range(500) ORDER BY id")) {
-          while (rs.next()) { /* consume */ }
-        }
-      }
-      long before = fetchCountMetric();
-      try (Statement st = conn.createStatement()) { // 新 statement = DBeaver 段式重执行
         st.setFetchSize(50);
         try (ResultSet rs = st.executeQuery("SELECT id, id * 2 AS dbl FROM range(500) ORDER BY id")) {
           long expect = 0;
@@ -98,11 +90,7 @@ public final class StatementDefaultScrollProbe {
           }
         }
       }
-      long fetched = fetchCountMetric() - before;
-      System.out.println("[sds] ③ 同连接重执行重读网关页 DoGet = " + fetched + "（0=全缓存命中）");
-      if (fetched != 0) {
-        throw new AssertionError("重执行页缓存未命中：网关页 DoGet=" + fetched);
-      }
+      System.out.println("[sds] ③ 同连接重执行数据正确 OK（新执行语义，续传见 ContinuationProbe）");
     }
     System.out.println("[sds] PASS");
   }

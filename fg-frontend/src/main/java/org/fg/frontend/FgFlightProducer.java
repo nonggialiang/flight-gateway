@@ -133,7 +133,7 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     QueryOrchestrator.Registration reg =
         orchestrator.register(
             sessionRef(context), user(context), sql, negotiateMode(context),
-            scrollRequested(context));
+            scrollRequested(context), requestedQueryId(context));
     OperationRow row = reg.row();
     return flightInfo(
         schemaOf(row.schemaBytes()),
@@ -170,11 +170,12 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
         return super.pollFlightInfo(context, descriptor);
       }
 
-      // ① 幂等注册 + 触发（首个 poll 触发；后续 poll 同 fingerprint 命中在途/终态行）
+      // ① 幂等注册 + 触发（首个 poll 触发；后续 poll 同 fingerprint 命中在途/终态行；
+      //    D28 x-fg-query-id 显式续传：poll 循环期间行 RUNNING，同 id 每次命中①收敛）
       QueryOrchestrator.Registration reg =
           orchestrator.register(
               sessionRef(context), user(context), sql, negotiateMode(context),
-              scrollRequested(context));
+              scrollRequested(context), requestedQueryId(context));
       OperationRow row = reg.row();
       LOGGER.debug("pollFlightInfo: registered queryId={} isNew={} status={}",
           row.queryId(), reg.newlyTriggered(), row.status());
@@ -230,6 +231,9 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       return new PollInfo(info, null, null, null);
     } catch (FlightRuntimeException e) {
       throw e;
+    } catch (org.fg.orchestrator.QueryIdMismatchException e) {
+      // D28 ①'：客户端 bug（旧票配新 SQL）——显式 INVALID_ARGUMENT 而非 INTERNAL
+      throw CallStatus.INVALID_ARGUMENT.withDescription(e.getMessage()).toRuntimeException();
     } catch (Exception e) {
       throw internal("Poll failed: " + e.getMessage());
     }
@@ -964,6 +968,12 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       return declared == null ? null : SchemaSerde.serialize(declared);
     }
     return orchestrator.analyzeSchema(sessionRef(context), user(context), sql);
+  }
+
+  /** D28：x-fg-query-id 头值（null = 无头路径）。 */
+  private String requestedQueryId(FlightProducer.CallContext context) {
+    QueryIdMiddleware mid = context.getMiddleware(QueryIdMiddleware.KEY);
+    return mid == null ? null : mid.queryId();
   }
 
   private String user(FlightProducer.CallContext context) {

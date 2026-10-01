@@ -10,7 +10,6 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.UUID;
 import javax.sql.DataSource;
 import org.fg.common.service.Service;
 
@@ -72,10 +71,10 @@ public class OperationStoreDao implements Service {
             + " result_key_prefix, kind, mode, ordered, scrollable, schema_bytes, status,"
             + " engine_ref, created_at, updated_at)"
             + " VALUES (?, ?, ?, ?, ?, ?, 'QUERY', ?, ?, ?, ?, 'RUNNING', ?, now(), now())"
-            + " ON CONFLICT (session_ref, sql_hash) WHERE kind = 'QUERY' DO NOTHING";
+            + " ON CONFLICT (session_ref, sql_hash) WHERE kind = 'QUERY' AND status = 'RUNNING' DO NOTHING";
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps = c.prepareStatement(insert)) {
-      ps.setObject(1, UUID.fromString(row.queryId()));
+      ps.setString(1, row.queryId());
       ps.setString(2, row.sessionRef());
       ps.setString(3, row.sqlHash());
       ps.setString(4, row.user());
@@ -113,7 +112,7 @@ public class OperationStoreDao implements Service {
             + " AND status = 'RUNNING' DO NOTHING";
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps = c.prepareStatement(insert)) {
-      ps.setObject(1, UUID.fromString(row.queryId()));
+      ps.setString(1, row.queryId());
       ps.setString(2, row.sessionRef());
       ps.setString(3, row.sqlHash());
       ps.setString(4, row.user());
@@ -160,7 +159,7 @@ public class OperationStoreDao implements Service {
             ps -> {
               ps.setBytes(1, schemaBytes);
               ps.setBytes(2, resultBytes);
-              ps.setObject(3, UUID.fromString(queryId));
+              ps.setString(3, queryId);
             });
     if (won) {
       countOutcome("COMPLETED");
@@ -170,17 +169,35 @@ public class OperationStoreDao implements Service {
 
   public Optional<OperationRow> get(String queryId) throws SQLException {
     return queryOne(
-        "SELECT * FROM fg_operation WHERE query_id = ?", ps -> ps.setObject(1, UUID.fromString(queryId)));
+        "SELECT * FROM fg_operation WHERE query_id = ?", ps -> ps.setString(1, queryId));
   }
 
-  /** 指纹查找只看 QUERY 行（D19 防御：COMMAND 行不受唯一索引约束，同名指纹可多行）。 */
+  /**
+   * 指纹查找（D19 防御：只看 QUERY 行；D28 修订：RUNNING-only 唯一索引后同指纹可存在
+   * 多个终态行——取最新，无头路径的"终态复用"语义保持）。RUNNING 中的行天然比任何终态行新。
+   */
   public Optional<OperationRow> getByFingerprint(String sessionRef, String sqlHash)
       throws SQLException {
     return queryOne(
-        "SELECT * FROM fg_operation WHERE session_ref = ? AND sql_hash = ? AND kind = 'QUERY'",
+        "SELECT * FROM fg_operation WHERE session_ref = ? AND sql_hash = ? AND kind = 'QUERY'"
+            + " ORDER BY created_at DESC, query_id DESC LIMIT 1",
         ps -> {
           ps.setString(1, sessionRef);
           ps.setString(2, sqlHash);
+        });
+  }
+
+  /**
+   * D28 续传：按 (session, queryId) 精确查行——x-fg-query-id 头的命中判定（①）。
+   * queryId 为不透明串（客户端铸造），任何状态都可能（RUNNING=poll 收敛、终态=续传）。
+   */
+  public Optional<OperationRow> getBySessionAndQueryId(String sessionRef, String queryId)
+      throws SQLException {
+    return queryOne(
+        "SELECT * FROM fg_operation WHERE session_ref = ? AND query_id = ?",
+        ps -> {
+          ps.setString(1, sessionRef);
+          ps.setString(2, queryId);
         });
   }
 
@@ -190,7 +207,7 @@ public class OperationStoreDao implements Service {
         "UPDATE fg_operation SET connect_operation_id = ?, updated_at = now() WHERE query_id = ?",
         ps -> {
           ps.setString(1, engineHandle);
-          ps.setObject(2, UUID.fromString(queryId));
+          ps.setString(2, queryId);
         });
   }
 
@@ -199,7 +216,7 @@ public class OperationStoreDao implements Service {
         "UPDATE fg_operation SET schema_bytes = ?, updated_at = now() WHERE query_id = ?",
         ps -> {
           ps.setBytes(1, schemaBytes);
-          ps.setObject(2, UUID.fromString(queryId));
+          ps.setString(2, queryId);
         });
   }
 
@@ -208,7 +225,7 @@ public class OperationStoreDao implements Service {
         "UPDATE fg_operation SET ordered = ?, updated_at = now() WHERE query_id = ?",
         ps -> {
           ps.setBoolean(1, ordered);
-          ps.setObject(2, UUID.fromString(queryId));
+          ps.setString(2, queryId);
         });
   }
 
@@ -235,7 +252,7 @@ public class OperationStoreDao implements Service {
             ps -> {
               ps.setString(1, status);
               ps.setString(2, error);
-              ps.setObject(3, UUID.fromString(queryId));
+              ps.setString(3, queryId);
             });
     if (won) {
       countOutcome(status);
@@ -256,7 +273,7 @@ public class OperationStoreDao implements Service {
         ps -> {
           ps.setString(1, ownerId);
           ps.setString(2, toPostgresInterval(lease));
-          ps.setObject(3, UUID.fromString(queryId));
+          ps.setString(3, queryId);
           ps.setString(4, ownerId);
         });
   }
@@ -267,7 +284,7 @@ public class OperationStoreDao implements Service {
         "UPDATE fg_operation SET attach_owner = NULL, attach_lease_until = NULL, updated_at = now()"
             + " WHERE query_id = ? AND attach_owner = ?",
         ps -> {
-          ps.setObject(1, UUID.fromString(queryId));
+          ps.setString(1, queryId);
           ps.setString(2, ownerId);
         });
   }
@@ -288,7 +305,7 @@ public class OperationStoreDao implements Service {
       try (ResultSet rs = ps.executeQuery()) {
         List<String> ids = new ArrayList<>();
         while (rs.next()) {
-          ids.add(rs.getObject(1, UUID.class).toString());
+          ids.add(rs.getString(1));
         }
         return ids;
       }
@@ -297,7 +314,7 @@ public class OperationStoreDao implements Service {
 
   public boolean delete(String queryId) throws SQLException {
     return update(
-        "DELETE FROM fg_operation WHERE query_id = ?", ps -> ps.setObject(1, UUID.fromString(queryId)));
+        "DELETE FROM fg_operation WHERE query_id = ?", ps -> ps.setString(1, queryId));
   }
 
   // ------------------------------------------------------------------ helpers
@@ -340,7 +357,7 @@ public class OperationStoreDao implements Service {
 
   static OperationRow map(ResultSet rs) throws SQLException {
     return new OperationRow()
-        .queryId(rs.getObject("query_id", UUID.class).toString())
+        .queryId(rs.getString("query_id"))
         .sessionRef(rs.getString("session_ref"))
         .sqlHash(rs.getString("sql_hash"))
         .user(rs.getString("user_name"))
