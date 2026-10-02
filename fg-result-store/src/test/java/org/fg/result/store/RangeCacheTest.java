@@ -85,6 +85,33 @@ class RangeCacheTest {
     assertThat(loads.get()).isEqualTo(1);
   }
 
+  @Test
+  void concurrentReadsSingleLoadWithoutMemory() throws Exception {
+    // memory=0（无 Caffeine 去重）时并发 8 线程同 key 读 → inFlight 表保证 loader 恰好 1 次
+    AtomicInteger loads = new AtomicInteger();
+    java.util.concurrent.CountDownLatch startGate = new java.util.concurrent.CountDownLatch(1);
+    RangeCache cache = new RangeCache(0, null, 0, (k, o, l) -> {
+      loads.incrementAndGet();
+      return CompletableFuture.supplyAsync(() -> {
+        try {
+          startGate.await(5, TimeUnit.SECONDS); // 制造加载窗口
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        return data(l, (byte) 5);
+      });
+    });
+    var futures = new java.util.ArrayList<CompletableFuture<byte[]>>();
+    for (int i = 0; i < 8; i++) {
+      futures.add(cache.read("K", 32, 64));
+    }
+    startGate.countDown();
+    for (CompletableFuture<byte[]> f : futures) {
+      assertThat(f.get(5, TimeUnit.SECONDS)).hasSize(64).containsExactly(data(64, (byte) 5));
+    }
+    assertThat(loads.get()).isEqualTo(1);
+  }
+
   /** 写线程异步——轮询等最终文件落定（排除 .tmp 中间态，上限 5s）。 */
   private static void awaitDiskWrite(Path dir) throws Exception {
     long deadline = System.currentTimeMillis() + 5000;

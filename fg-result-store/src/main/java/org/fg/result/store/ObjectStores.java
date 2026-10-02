@@ -22,7 +22,7 @@ public final class ObjectStores {
         diskDir.isEmpty() ? null : Path.of(diskDir),
         config.hasPath("fg.result.range-cache.disk-max-bytes")
             ? Long.parseLong(config.getString("fg.result.range-cache.disk-max-bytes"))
-            : 10L * 1024 * 1024 * 1024,
+            : 512L * 1024 * 1024,
         config.hasPath("fg.result.s3.connect-timeout")
             ? config.getDurationMs("fg.result.s3.connect-timeout") : 10_000L,
         config.hasPath("fg.result.s3.read-timeout")

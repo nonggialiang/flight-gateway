@@ -50,6 +50,13 @@ final class RangeCache {
   private final Loader loader;
 
   private final AsyncCache<RangeKey, byte[]> memory;
+  /**
+   * 无内存层时的加载去重（memory==null 专用；内存层开启时由 Caffeine AsyncCache
+   * 契约保证同 key mapping function 至多一次，叠加本表是纯冗余）。完成（含失败）
+   * 即摘除，与 Caffeine 失败不驻留语义对齐。
+   */
+  private final java.util.concurrent.ConcurrentHashMap<RangeKey, CompletableFuture<byte[]>> inFlight =
+      new java.util.concurrent.ConcurrentHashMap<>();
   private final ExecutorService diskWriter;
   private final AtomicLong diskBytes = new AtomicLong();
   private volatile boolean diskSizeKnown;
@@ -61,10 +68,14 @@ final class RangeCache {
     this.loader = loader;
 
     if (diskDir != null) {
-      this.diskWriter = Executors.newFixedThreadPool(1, r -> {
-        Thread t = new Thread(r, "fg-range-disk-writer");
-        t.setDaemon(true);
-        return t;
+      this.diskWriter = Executors.newFixedThreadPool(2, new java.util.concurrent.ThreadFactory() {
+        private final java.util.concurrent.atomic.AtomicInteger seq =
+            new java.util.concurrent.atomic.AtomicInteger();
+        @Override public Thread newThread(Runnable r) {
+          Thread t = new Thread(r, "fg-range-disk-writer-" + seq.incrementAndGet());
+          t.setDaemon(true);
+          return t;
+        }
       });
     } else {
       this.diskWriter = null;
@@ -82,13 +93,24 @@ final class RangeCache {
     }
   }
 
-  /** 读 [offset, offset+length)：内存 → 磁盘 → S3（S3 成功后异步落盘）。 */
+  /**
+   * 读 [offset, offset+length)：内存 → 磁盘 → S3（S3 成功后异步落盘）。
+   * 去重分治：内存层开启时 Caffeine AsyncCache 契约保证同 key mapping function
+   * 至多一次（in-flight future 即缓存值）；关闭时（max-memory=0）由 {@link #inFlight}
+   * 表承担同一职责——并发同 key 读共享一个 future，完成即摘除（失败不驻留）。
+   */
   CompletableFuture<byte[]> read(String objectKey, long offset, int length) {
+    RangeKey key = new RangeKey(objectKey, offset, length);
     if (memory != null) {
-      return memory.get(new RangeKey(objectKey, offset, length),
-          (key, exec) -> loadFromDiskOrRemote(key));
+      return memory.get(key, (k, exec) -> loadFromDiskOrRemote(k));
     }
-    return loadFromDiskOrRemote(new RangeKey(objectKey, offset, length));
+    // remove 必须挂在 computeIfAbsent 返回之后：磁盘命中时 loadFromDiskOrRemote 返回
+    // 已完成 future，whenComplete 会内联执行——在 mapping function 内 remove 同 map
+    // 触发 ConcurrentHashMap Recursive update 保护（实证 2026-10-02）。挂在外部
+    // 则同线程 remove 安全；两参 remove 防误删后续同 key 的新 in-flight。
+    CompletableFuture<byte[]> f = inFlight.computeIfAbsent(key, this::loadFromDiskOrRemote);
+    f.whenComplete((r, e) -> inFlight.remove(key, f));
+    return f;
   }
 
   private CompletableFuture<byte[]> loadFromDiskOrRemote(RangeKey key) {
@@ -130,16 +152,24 @@ final class RangeCache {
     }
   }
 
-  /** write-behind：S3 数据异步刷盘 + 总量守卫（超限按 lastModified 淘汰最旧）。 */
+  /**
+   * write-behind：S3 数据异步刷盘 + 总量守卫（超限按 lastModified 淘汰最旧）。
+   * tmp 名含线程名（池内唯一命名）：同 key 重复写分属不同写线程也不撞 tmp；
+   * 最终文件名只由 key 决定，atomic move last-writer-wins（同内容幂等）；
+   * 异常路径 finally 清残留 tmp。
+   */
   private void writeDiskAsync(RangeKey key, byte[] bytes) {
     if (diskWriter == null) {
       return;
     }
+    String tmpName =
+        fileFor(key).getFileName() + "." + Thread.currentThread().getName() + ".tmp";
     diskWriter.execute(() -> {
+      Path tmp = null;
       try {
         Path file = fileFor(key);
         Files.createDirectories(file.getParent());
-        Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+        tmp = file.resolveSibling(tmpName);
         try (AsynchronousFileChannel ch = AsynchronousFileChannel.open(tmp,
             StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
           java.util.concurrent.Future<Integer> f = ch.write(ByteBuffer.wrap(bytes), 0);
@@ -152,6 +182,14 @@ final class RangeCache {
         enforceDiskBudget();
       } catch (Exception e) {
         LOGGER.debug("range disk write failed: {} ({})", key, e.toString());
+      } finally {
+        if (tmp != null) {
+          try {
+            Files.deleteIfExists(tmp);
+          } catch (Exception ignored) {
+            // best-effort
+          }
+        }
       }
     });
   }
@@ -198,7 +236,7 @@ final class RangeCache {
     if (diskWriter != null) {
       diskWriter.shutdown();
       try {
-        // 有界等待 write-behind 落定（测试 TempDir 清理与写线程的竞态修复）
+        // 有界等待 write-behind 落定（测试 TempDir 清理与写线程的竞态修复；双写线程）
         diskWriter.awaitTermination(5, TimeUnit.SECONDS);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
