@@ -15,7 +15,11 @@
 
   <dependencies>
     <dependency><groupId>org.fg</groupId><artifactId>fg-common</artifactId></dependency>
-    <dependency><groupId>io.minio</groupId><artifactId>minio</artifactId></dependency>
+    <!-- D28：AWS SDK v2（通用 S3；MinIO 经 endpoint + path-style 兼容）。异步客户端
+         走 netty-nio-client；presign 经 S3Presigner -->
+    <dependency><groupId>software.amazon.awssdk</groupId><artifactId>s3</artifactId></dependency>
+    <dependency><groupId>software.amazon.awssdk</groupId><artifactId>apache-client</artifactId></dependency>
+    <dependency><groupId>com.github.ben-manes.caffeine</groupId><artifactId>caffeine</artifactId></dependency>
     <dependency>
       <groupId>org.apache.arrow</groupId>
       <artifactId>arrow-vector</artifactId>

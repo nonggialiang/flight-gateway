@@ -53,6 +53,9 @@
     <hikaricp.version>5.1.0</hikaricp.version>
     <flyway.version>10.15.2</flyway.version>
     <minio.version>8.5.12</minio.version>
+    <!-- D28 改造：结果存储迁移 AWS SDK v2（S3 通用客户端，MinIO 兼容 endpoint+path-style） -->
+    <awssdk.version>2.30.27</awssdk.version>
+    <caffeine.version>3.1.8</caffeine.version>
     <micrometer.version>1.13.1</micrometer.version>
     <curator.version>5.6.0</curator.version>
 
@@ -100,6 +103,14 @@
       <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId><version>${flyway.version}</version></dependency>
       <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-database-postgresql</artifactId><version>${flyway.version}</version></dependency>
       <dependency><groupId>io.minio</groupId><artifactId>minio</artifactId><version>${minio.version}</version></dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>bom</artifactId>
+        <version>${awssdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency><groupId>com.github.ben-manes.caffeine</groupId><artifactId>caffeine</artifactId><version>${caffeine.version}</version></dependency>
       <dependency><groupId>io.micrometer</groupId><artifactId>micrometer-core</artifactId><version>${micrometer.version}</version></dependency>
       <dependency><groupId>io.micrometer</groupId><artifactId>micrometer-registry-prometheus</artifactId><version>${micrometer.version}</version></dependency>
       <dependency><groupId>org.apache.curator</groupId><artifactId>curator-recipes</artifactId><version>${curator.version}</version></dependency>

@@ -228,7 +228,7 @@ final class ResultRelay {
             for (ScrollPagePlanner.BatchSlice bs
                 : ScrollPagePlanner.planBatches(bidx, ps.offset(), ps.rows())) {
               org.fg.result.manifest.BatchIndex.Batch b = bidx.batches().get(bs.batchIndex());
-              byte[] message = readRange(objectKey, b.offset(), b.length());
+              byte[] message = readRange(objectKey, b.offset(), (int) b.length());
               try (ArrowStreamReader reader = miniStream(schemaMessage, message, child)) {
                 if (!reader.loadNextBatch()) {
                   throw new IllegalStateException(
@@ -324,11 +324,9 @@ final class ResultRelay {
     return count;
   }
 
-  /** Range GET 读取单 encapsulated message 字节。 */
-  private byte[] readRange(String objectKey, long offset, long length) throws Exception {
-    try (InputStream in = objects.getObjectRange(objectKey, offset, length)) {
-      return in.readAllBytes();
-    }
+  /** Range GET 读取单 encapsulated message 字节（D28：经 RangeCache 两级缓存）。 */
+  private byte[] readRange(String objectKey, long offset, int length) throws Exception {
+    return objects.readRange(objectKey, offset, length).join();
   }
 
   /** schema message + 单 batch message + EOS → ArrowStreamReader（可直读的 mini stream）。 */
