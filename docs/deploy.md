@@ -158,9 +158,21 @@ fg {
     bucket = "fg-results"
     prefix = "results"
     s3 {
-      endpoint = "http://minio-host:9000"      # 真 S3 填 https
+      # AWS SDK v2（D28）：MinIO 经 endpoint + path-style 兼容；真 S3/OSS/R2 直接填 https endpoint
+      endpoint = "http://minio-host:9000"
+      region = "us-east-1"                     # 签名 region（MinIO 任意值；真 S3 填实际 region）
       access-key = "..."
       secret-key = "..."
+      connect-timeout = 10s                    # 对象 HTTP 超时（read=socket 级慢读安全；call=整请求护栏）
+      read-timeout = 60s
+      call-timeout = 600s
+    }
+    # Range 读两级缓存（D28，scroll 翻页/bidx 重复读零网络）：
+    # Caffeine 内存（字节计重）+ 异步磁盘 write-behind（超预算按最旧淘汰）；快照不可变无需失效
+    range-cache {
+      max-memory = 64m                         # 0 = 关内存层
+      disk-dir = "/var/lib/fg/range-cache"     # "" = 关磁盘层（默认）
+      disk-max-bytes = 10737418240             # 10G
     }
     retention = 24h
     endpoint.mode = "relay"                    # 默认 relay；https 需客户端协商
