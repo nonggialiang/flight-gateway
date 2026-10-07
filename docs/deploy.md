@@ -294,3 +294,60 @@ jdbc:arrow-flight://gw-host:32010?useEncryption=true&user=alice&password=pass1
 2. **拉起超时的卡死引擎**：网关无进程句柄，靠引擎侧 idle 看门狗 / max-lifetime 自愈。
 3. **conf 值含逗号**：走 conf-file / gateway.conf，勿走 `-D`（会被切 list）。
 4. **`spark.fg.*` 前缀保留**：网关运行时下发域，勿在 conf-file/launch.conf 里覆盖。
+5. **VPN/LB 路径 MTU 黑洞**：客户端按本机网卡宣告 MSS（约 1460），VPN 隧道封装后有效 MTU 更小 → 满尺寸 TCP 段在隧道中被丢，PMTUD 的 ICMP need-frag 常被吞 → 无自愈。症状：小 RPC（poll/DDL）全通、大结果集 DoGet 卡死，网关 ~50s 后报 `Client not ready for 50000ms (backpressure timeout)`，**关流瞬间客户端才收到首批**（实证 2026-10-07，同机部署复测消失定性）。处方：开启 `net.ipv4.tcp_mtu_probing=1`（容器化见 §7；裸机 `sysctl -w` + `/etc/sysctl.d/` 持久化）；根治在 VPN 网关做 MSS clamping 或放行 ICMP；iptables `TCPMSS --set-mss 1300` 只适用于裸机直连部署（容器默认无 CAP_NET_ADMIN，且 docker-proxy/SNAT 使容器 netns 内看不到客户端原始 MSS）。
+
+## 7. 容器化部署（Docker）
+
+**镜像内容按引擎装配模式取舍**：
+
+| 模式 | 镜像需要 |
+|---|---|
+| 默认固定引擎（`fg.zk.addresses` 空） | 仅 JDK17 + fg-dist jar（引擎独立部署在 15002 机器） |
+| ZK local / cluster 拉起 | 追加完整 `$SPARK_HOME`（spark-submit）+ `jars` 四件：`spark-connect_2.12-3.5.6`、`hadoop-aws-3.3.4`、`aws-java-sdk-bundle`、`fg-spark-sink`；`fg.engine.spark.launch.home` 指向容器内路径 |
+
+Dockerfile 示例（默认模式）：
+
+```dockerfile
+FROM eclipse-temurin:17-jre
+COPY fg-dist-0.1.0-SNAPSHOT.jar /opt/fg/lib/
+COPY gateway.conf /opt/fg/conf/gateway.conf
+# ENTRYPOINT 含 MTU 探测断言：没注入 sysctl 就启动期告警（见 §6 已知边界 5）
+ENTRYPOINT ["/bin/sh", "-c", \
+  "if [ \"$(cat /proc/sys/net/ipv4/tcp_mtu_probing)\" != \"1\" ]; then \
+     echo '[fg] WARNING: net.ipv4.tcp_mtu_probing != 1 —— 经 VPN/LB 暴露时大结果集 DoGet 会 MTU 黑洞卡死' >&2; \
+   fi; \
+   exec java -Xmx2g \
+     --add-opens=java.base/java.nio=ALL-UNNAMED \
+     --add-opens=jdk.unsupported/sun.misc=ALL-UNNAMED \
+     --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+     -Dfg.config.file=/opt/fg/conf/gateway.conf \
+     -jar /opt/fg/lib/fg-dist-0.1.0-SNAPSHOT.jar"]
+```
+
+**关键：`net.ipv4.tcp_mtu_probing=1` 必须运行时注入，Dockerfile 的 `RUN sysctl` 无效**（改的是构建期临时 netns）。`net.*` 是网络命名空间级 sysctl——容器自己的 netns 恰好就是 FG 全部 socket 所在，只作用于自身连接、天然隔离。三种注入方式：
+
+```bash
+# docker run
+docker run --sysctl net.ipv4.tcp_mtu_probing=1 -p 32010:32010 -p 9091:9091 fg:0.1.0
+
+# docker-compose
+services:
+  flight-gateway:
+    image: fg:0.1.0
+    sysctls:
+      - net.ipv4.tcp_mtu_probing=1
+    ports: ["32010:32010", "9091:9091"]
+    volumes:
+      - ./gateway.conf:/opt/fg/conf/gateway.conf:ro
+
+# Kubernetes（kubelet 默认 safe sysctls 白名单内，无需额外配置）
+spec:
+  securityContext:
+    sysctls:
+      - name: net.ipv4.tcp_mtu_probing
+        value: "1"
+```
+
+**iptables TCPMSS 钳制不要试图进镜像**：默认容器无 `CAP_NET_ADMIN`，且 `-p` 端口发布（docker-proxy/conntrack）与 k8s NodePort/LB 的 SNAT 使进入容器 netns 的 SYN 已不是客户端原始 MSS——容器内钳了也钳不到。该层必须放在宿主机 / LB / VPN 网关；对已开 `tcp_mtu_probing` 的部署通常也不再需要。
+
+其余注意：PG/ZK/MinIO 地址经挂载的 gateway.conf 注入（容器内无法依赖 `-D` 之外的本地文件约定）；多实例照旧共享全局状态，LB 要求同 §4（HTTP/2 长连接 + idle timeout > keepalive）。
