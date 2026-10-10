@@ -493,7 +493,7 @@ public class QueryOrchestrator implements Service {
               new MaterializationSpec(
                   // s3a：Hadoop FileSystem 的实际 scheme（s3:// 无 FS 实现）
                   "s3a://" + objects.bucket() + "/" + row.resultKeyPrefix() + "/",
-                  true,
+                  config.getString("fg.result.compression"),
                   config.getInt("fg.result.batch.max.records"),
                   partitionsHint);
 

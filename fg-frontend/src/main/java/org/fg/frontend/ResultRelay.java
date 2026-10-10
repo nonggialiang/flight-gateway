@@ -5,6 +5,7 @@ import java.io.InputStream;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import org.apache.arrow.compression.CommonsCompressionFactory;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.FlightProducer.ServerStreamListener;
 import org.apache.arrow.flight.Ticket;
@@ -34,6 +35,10 @@ import org.slf4j.LoggerFactory;
  * {@link #pumpReader} 装载/背压管线（单一输出 root + VectorLoader 逐批装载 + putNext）。
  */
 final class ResultRelay {
+
+  /** D33：结果 part 的 IPC body 压缩（zstd/lz4/none 由 fg.result.compression 决定）——读端 codec 工厂（消息级属性，透明解压；none 对象同样可读）。 */
+  private static final org.apache.arrow.vector.compression.CompressionCodec.Factory COMPRESSION =
+      CommonsCompressionFactory.INSTANCE;
 
   private static final Logger logger = LoggerFactory.getLogger(ResultRelay.class);
 
@@ -168,7 +173,7 @@ final class ResultRelay {
     try {
       for (ResultManifest.Part part : parts) {
         try (InputStream in = objects.getObject(ObjectStoreService.objectName(part.uri()));
-            ArrowStreamReader reader = new ArrowStreamReader(in, child)) {
+            ArrowStreamReader reader = new ArrowStreamReader(in, child, COMPRESSION)) {
           pumpReader(reader, pump, child, listener, gate, t.queryId());
         }
       }
@@ -286,7 +291,7 @@ final class ResultRelay {
     long cursor = 0;
     long need = rows;
     try (InputStream in = objects.getObject(objectKey);
-        ArrowStreamReader reader = new ArrowStreamReader(in, child)) {
+        ArrowStreamReader reader = new ArrowStreamReader(in, child, COMPRESSION)) {
       VectorSchemaRoot src = reader.getVectorSchemaRoot();
       while (need > 0 && reader.loadNextBatch()) {
         int batchRows = src.getRowCount();
@@ -336,7 +341,7 @@ final class ResultRelay {
     mini.writeBytes(schemaMessage);
     mini.writeBytes(message);
     mini.write(eos, 0, eos.length);
-    return new ArrowStreamReader(new java.io.ByteArrayInputStream(mini.toByteArray()), a);
+    return new ArrowStreamReader(new java.io.ByteArrayInputStream(mini.toByteArray()), a, COMPRESSION);
   }
 
   /** manifest.schemaBase64（schema IPC message）→ Schema。 */

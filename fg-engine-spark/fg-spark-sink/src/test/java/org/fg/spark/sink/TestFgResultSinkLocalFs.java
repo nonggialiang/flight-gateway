@@ -64,7 +64,7 @@ class TestFgResultSinkLocalFs {
         .mode("overwrite")
         .option(
             "spec",
-            "{\"objectUri\":\"" + dir + "\",\"zstdCompression\":false,\"maxRecordsPerBatchHint\":256}")
+            "{\"objectUri\":\"" + dir + "\",\"compression\":\"none\",\"maxRecordsPerBatchHint\":256}")
         .save(dir);
   }
 

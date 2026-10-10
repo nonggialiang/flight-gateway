@@ -12,19 +12,27 @@ package org.fg.spi;
  */
 public record MaterializationSpec(
     String objectUri,
-    boolean zstdCompression,
+    String compression,
     int maxRecordsPerBatchHint,
     Integer partitionsHint) {
+
+  /** IPC body 压缩编码（D33）：none | zstd | lz4——sink 写端 codec，读端透明解压。 */
+  public static final String COMPRESSION_NONE = "none";
+  public static final String COMPRESSION_ZSTD = "zstd";
+  public static final String COMPRESSION_LZ4 = "lz4";
 
   /** e.g. s3://bucket/prefix/{user}/{queryId}/ (always ends with '/') */
   public MaterializationSpec {
     if (objectUri == null || !objectUri.endsWith("/")) {
       throw new IllegalArgumentException("objectUri must end with '/': " + objectUri);
     }
+    if (compression == null) {
+      compression = COMPRESSION_NONE;
+    }
   }
 
   public static MaterializationSpec of(
-      String objectUri, boolean zstdCompression, int maxRecordsPerBatchHint) {
-    return new MaterializationSpec(objectUri, zstdCompression, maxRecordsPerBatchHint, null);
+      String objectUri, String compression, int maxRecordsPerBatchHint) {
+    return new MaterializationSpec(objectUri, compression, maxRecordsPerBatchHint, null);
   }
 }

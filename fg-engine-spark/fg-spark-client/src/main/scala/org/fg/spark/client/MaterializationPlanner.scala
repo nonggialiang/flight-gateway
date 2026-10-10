@@ -27,7 +27,7 @@ object MaterializationPlanner {
   def specJson(spec: MaterializationSpec): String = {
     val node = MAPPER.createObjectNode()
     node.put("objectUri", spec.objectUri())
-    node.put("zstdCompression", spec.zstdCompression())
+    node.put("compression", spec.compression())
     node.put("maxRecordsPerBatchHint", spec.maxRecordsPerBatchHint())
     if (spec.partitionsHint() != null) {
       node.put("partitionsHint", spec.partitionsHint())

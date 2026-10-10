@@ -8,8 +8,11 @@ import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.arrow.compression.CommonsCompressionFactory;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.ipc.message.IpcOption;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -33,13 +36,31 @@ import org.slf4j.LoggerFactory;
  * 跟踪，对齐 padding 天然含在 length 内）——网关据此对 MinIO 做 Range GET 取单 message。
  * 边车是优化不是正确性依赖（缺席时网关回落整 part 顺序读）。
  *
- * <p>M1 注：Spark 3.5 发行版内嵌 Arrow 12 的 ArrowStreamWriter 不支持 IPC body 压缩，
- * zstd 标志暂不生效（保留 spec 字段，升级引擎 Arrow 后启用）。
+ * <p>M1 注 → D33 落地：Spark 3.5 内嵌 Arrow 12.0.1 的 ArrowStreamWriter 支持压缩构造器
+ * （CompressionCodec.Factory + CodecType），codec 实现在 arrow-compression（commons-compress
+ * 后端，需随部署放入 $SPARK_HOME/jars）——spec.compression（none|zstd|lz4）即开即用。
  */
 public final class FgArrowPartWriter implements DataWriter<InternalRow> {
 
   private static final Logger logger = LoggerFactory.getLogger(FgArrowPartWriter.class);
   private static final String TIMEZONE = "UTC";
+
+  /**
+   * D33：LZ4 写端 factory——arrow-compression 12 的 commons-compress 纯 Java LZ4 实测
+   * 9.4s/MiB（不可用），换 aircompressor 后端的手写 frame 封装（executor 自带依赖）。
+   */
+  private static final org.apache.arrow.vector.compression.CompressionCodec.Factory FG_LZ4_FACTORY =
+      new org.apache.arrow.vector.compression.CompressionCodec.Factory() {
+        @Override
+        public org.apache.arrow.vector.compression.CompressionCodec createCodec(
+            CompressionUtil.CodecType codecType) {
+          if (codecType == CompressionUtil.CodecType.LZ4_FRAME) {
+            return new FgLz4FrameCodec();
+          }
+          return CommonsCompressionFactory.INSTANCE.createCodec(codecType);
+        }
+
+      };
 
   private final SpecOptions spec;
   private final int partitionId;
@@ -81,7 +102,21 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
       aw = ArrowWriter.create(schema, TIMEZONE, true);
       VectorSchemaRoot r = aw.root();
       ch = new PositionTrackingChannel(Channels.newChannel(o));
-      sw = new ArrowStreamWriter(r, null, ch);
+      // D33：IPC body 压缩（Arrow BodyCompression——Spark 3.5 内嵌 Arrow 12.0.1 的
+      // ArrowStreamWriter 自带压缩构造器，codec 实现 arrow-compression[commons-compress 后端]
+      // 需随部署放入 $SPARK_HOME/jars）。压缩按 encapsulated message 级生效，bidx 的
+      // (offset,length) 跟踪的是压缩后字节——Range GET/miniStream 重组不受影响，读端
+      // （网关/驱动/pyarrow）透明解压。
+      switch (spec.compression()) {
+        case "zstd" ->
+            sw = new ArrowStreamWriter(
+                r, null, ch, IpcOption.DEFAULT,
+                CommonsCompressionFactory.INSTANCE, CompressionUtil.CodecType.ZSTD);
+        case "lz4" ->
+            sw = new ArrowStreamWriter(
+                r, null, ch, IpcOption.DEFAULT, FG_LZ4_FACTORY, CompressionUtil.CodecType.LZ4_FRAME);
+        default -> sw = new ArrowStreamWriter(r, null, ch);
+      }
       sw.start();
     } catch (Exception e) {
       closeQuietly(sw, o, aw == null ? null : aw.root());
@@ -93,8 +128,8 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
     this.channel = ch;
     this.out = o;
     this.fs = f;
-    if (spec.zstdCompression()) {
-      logger.warn("zstdCompression requested but engine Arrow (12.x) cannot compress IPC bodies; writing uncompressed part: {}", partUri);
+    if (!spec.compression().equals("none")) {
+      logger.info("Part compression enabled: codec={} part={}", spec.compression(), partUri);
     }
   }
 
