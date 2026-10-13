@@ -5,7 +5,6 @@ import java.io.InputStream;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
-import org.apache.arrow.compression.CommonsCompressionFactory;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.FlightProducer.ServerStreamListener;
 import org.apache.arrow.flight.Ticket;
@@ -36,9 +35,13 @@ import org.slf4j.LoggerFactory;
  */
 final class ResultRelay {
 
-  /** D33：结果 part 的 IPC body 压缩（zstd/lz4/none 由 fg.result.compression 决定）——读端 codec 工厂（消息级属性，透明解压；none 对象同样可读）。 */
+  /**
+   * D33：结果 part 的 IPC body 压缩（zstd/lz4/none 由 fg.result.compression 决定）——读端
+   * codec 工厂（消息级属性，透明解压；none 对象同样可读）。D34：换 {@link ResilientCompressionFactory}
+   * ——上游 apache/arrow-java#1116 写端 bug 产出的"前缀 0 + 完好 zstd frame"对象可兜底读回。
+   */
   private static final org.apache.arrow.vector.compression.CompressionCodec.Factory COMPRESSION =
-      CommonsCompressionFactory.INSTANCE;
+      ResilientCompressionFactory.INSTANCE;
 
   private static final Logger logger = LoggerFactory.getLogger(ResultRelay.class);
 
@@ -186,7 +189,7 @@ final class ResultRelay {
       logger.warn("Relay failed for {}: {}", t.queryId(), e.toString());
       fail(listener, CallStatus.INTERNAL, "Relay failed: " + e.getMessage());
     } finally {
-      closePump(pump, child);
+      closePump(pump, child, t.queryId());
     }
   }
 
@@ -274,7 +277,22 @@ final class ResultRelay {
       if (out != null) {
         out.close();
       }
+      closeChildQuietly(child, "scroll page " + t.queryId());
+    }
+  }
+
+  /**
+   * D34：防御性子分配器关闭。上游 VectorLoader 异常路径（apache/arrow-java#1116 损坏对象 →
+   * loadFieldBuffers 抛错）会漏 ownBuffers，child.close() 随之抛"Memory was leaked"并
+   * <b>掩盖已回写客户端的原始异常</b>——这里吞掉泄漏异常、原样记日志（原始异常已在上方
+   * catch 中 fail() 给客户端 + logger.warn），让 relay 线程干净收尾。
+   */
+  private static void closeChildQuietly(BufferAllocator child, String context) {
+    try {
       child.close();
+    } catch (IllegalStateException e) {
+      logger.error("Child allocator leaked for {} (upstream #1116 chain; see warn above): {}",
+          context, e.toString());
     }
   }
 
@@ -376,7 +394,7 @@ final class ResultRelay {
       logger.warn("Relay failed for {}: {}", t.queryId(), e.toString());
       fail(listener, CallStatus.INTERNAL, "Relay failed: " + e.getMessage());
     } finally {
-      closePump(pump, child);
+      closePump(pump, child, t.queryId());
     }
   }
 
@@ -421,11 +439,11 @@ final class ResultRelay {
     }
   }
 
-  private static void closePump(Pump pump, BufferAllocator child) {
+  private static void closePump(Pump pump, BufferAllocator child, String queryId) {
     if (pump.out != null) {
       pump.out.close();
     }
-    child.close();
+    closeChildQuietly(child, "relay " + queryId); // D34：同 scrollPage，防泄漏异常掩盖原始错误
   }
 
   /**

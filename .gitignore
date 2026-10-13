@@ -13,3 +13,6 @@ metastore_db/
 __pycache__/
 .venv/
 *.arrows
+
+# 会话导出（Claude Code /resume 原始记录）
+*-implement-the-following-plan.txt

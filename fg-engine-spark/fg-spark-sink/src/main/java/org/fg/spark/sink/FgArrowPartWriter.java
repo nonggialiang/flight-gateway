@@ -111,10 +111,14 @@ public final class FgArrowPartWriter implements DataWriter<InternalRow> {
         case "zstd" ->
             sw = new ArrowStreamWriter(
                 r, null, ch, IpcOption.DEFAULT,
-                CommonsCompressionFactory.INSTANCE, CompressionUtil.CodecType.ZSTD);
+                // D34：写端前缀加固（上游 apache/arrow-java#1116/#1119 的 sink 侧移植）
+                FgPrefixHardenedFactory.wrap(CommonsCompressionFactory.INSTANCE),
+                CompressionUtil.CodecType.ZSTD);
         case "lz4" ->
             sw = new ArrowStreamWriter(
-                r, null, ch, IpcOption.DEFAULT, FG_LZ4_FACTORY, CompressionUtil.CodecType.LZ4_FRAME);
+                r, null, ch, IpcOption.DEFAULT,
+                FgPrefixHardenedFactory.wrap(FG_LZ4_FACTORY),
+                CompressionUtil.CodecType.LZ4_FRAME);
         default -> sw = new ArrowStreamWriter(r, null, ch);
       }
       sw.start();
