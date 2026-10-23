@@ -401,14 +401,7 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
       }
 
       override def onError(t: Throwable): Unit = {
-        val code = t match {
-          case e: io.grpc.StatusRuntimeException => e.getStatus.getCode
-          case _ => io.grpc.Status.Code.UNKNOWN
-        }
-        val outcome =
-          if (code == io.grpc.Status.Code.CANCELLED) ExecutionOutcome.cancelled()
-          else ExecutionOutcome.unknown(s"reattach stream closed: $t")
-        future.complete(outcome)
+        future.complete(SparkEngineClient.classifyAttachError(t))
       }
 
       override def onCompleted(): Unit = {
@@ -462,6 +455,42 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
 }
 
 private[client] object SparkEngineClient {
+
+  /**
+   * attach 流 onError 的终态分流（D35）：
+   *
+   * <ul>
+   *   <li>CANCELLED —— 被 interrupt（CancelFlightInfo/interrupt 路径）→ cancelled；</li>
+   *   <li>UNAVAILABLE / DEADLINE_EXCEEDED —— 传输类（连接断/引擎不可达/超时），执行状态
+   *       不可判定 → unknown，交 manifest 对账兜底（D7 真相源，行为与 D35 前一致）；</li>
+   *   <li>其余（INTERNAL / UNKNOWN / RESOURCE_EXHAUSTED…）—— 执行类：Spark 经
+   *       GrpcExceptionConverter 把运行时异常作为流尾错误状态投递，且对已失败 operation 的
+   *       reattach 重放恒复现同一错误 → 判定失败，<b>真实异常直达客户端</b>。修复此前
+   *       "执行失败被归 UNKNOWN → 无 manifest → 反复重挂 → 600s sweeper 兜底且报 query
+   *       timeout"的缺口（ExecutionOutcome.failed 此前是 SPI 死代码）。</li>
+   * </ul>
+   *
+   * <p>安全性（双挂竞态）：releaseExecution 切断他人 attach 流的时序发生在持有者 casComplete
+   * <b>之后</b>（whenComplete 的 switch 先于 finally release）——被切流者按本分流若判
+   * failed，其 casFail 撞终态行条件更新 no-op，无误迁。
+   */
+  def classifyAttachError(t: Throwable): ExecutionOutcome = {
+    t match {
+      case e: io.grpc.StatusRuntimeException =>
+        e.getStatus.getCode match {
+          case io.grpc.Status.Code.CANCELLED =>
+            ExecutionOutcome.cancelled()
+          case io.grpc.Status.Code.UNAVAILABLE | io.grpc.Status.Code.DEADLINE_EXCEEDED =>
+            ExecutionOutcome.unknown(
+              s"reattach transport error: ${e.getStatus.getCode}: ${e.getStatus.getDescription}")
+          case code =>
+            ExecutionOutcome.failed(
+              s"engine execution failed: $code: ${e.getStatus.getDescription}")
+        }
+      case _ =>
+        ExecutionOutcome.unknown(s"reattach stream closed: $t")
+    }
+  }
 
   /** 命令超时守护线程（daemon 单线程：命令并发低，到点任务只做 cancel+complete）。 */
   private lazy val commandTimeoutScheduler =
