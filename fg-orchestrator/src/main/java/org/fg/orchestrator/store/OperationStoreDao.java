@@ -5,7 +5,6 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
-import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,9 +19,11 @@ import org.fg.common.service.Service;
  *
  * <ul>
  *   <li>幂等首 poll：INSERT ... ON CONFLICT (session_ref, sql_hash) DO NOTHING，0 行即已存在；
- *   <li>行迁移 CAS：UPDATE ... WHERE query_id=? AND status='RUNNING'——完成/取消双写者互斥；
- *   <li>attach 租约仲裁：条件 UPDATE（owner 为空/过期/本人可获），租约过期可接管。
+ *   <li>行迁移 CAS：UPDATE ... WHERE query_id=? AND status='RUNNING'——完成/取消双写者互斥。
  * </ul>
+ *
+ * <p>D36：attach 租约仲裁已移除（每网关实例各自 attach，attach_owner 列仅作滚动升级期旧实例
+ * 残留清理的过渡——casTerminal 顺带置 NULL，列本身随 V2 删除）。
  */
 public class OperationStoreDao implements Service {
 
@@ -66,11 +67,13 @@ public class OperationStoreDao implements Service {
    * 注册即报 "no unique or exclusion constraint matching the ON CONFLICT specification"）。
    */
   public OperationRow insertOrGet(OperationRow row) throws SQLException {
+    // D36：connect_operation_id 随 INSERT 落库（编排层预生成 UUID，Spark Connect 客户端可
+    // 指定 operation_id）——行存在即可 attach/interrupt/release，消除"提交在途 opId 未知"窗口。
     String insert =
         "INSERT INTO fg_operation (query_id, session_ref, sql_hash, user_name, sql_text,"
             + " result_key_prefix, kind, mode, ordered, scrollable, schema_bytes, status,"
-            + " engine_ref, created_at, updated_at)"
-            + " VALUES (?, ?, ?, ?, ?, ?, 'QUERY', ?, ?, ?, ?, 'RUNNING', ?, now(), now())"
+            + " connect_operation_id, engine_ref, created_at, updated_at)"
+            + " VALUES (?, ?, ?, ?, ?, ?, 'QUERY', ?, ?, ?, ?, 'RUNNING', ?, ?, now(), now())"
             + " ON CONFLICT (session_ref, sql_hash) WHERE kind = 'QUERY' AND status = 'RUNNING' DO NOTHING";
     try (Connection c = dataSource.getConnection();
         PreparedStatement ps = c.prepareStatement(insert)) {
@@ -84,7 +87,8 @@ public class OperationStoreDao implements Service {
       ps.setBoolean(8, row.ordered());
       ps.setBoolean(9, row.scrollable());
       ps.setBytes(10, row.schemaBytes());
-      ps.setString(11, row.engineRef());
+      ps.setString(11, row.connectOperationId());
+      ps.setString(12, row.engineRef());
       if (ps.executeUpdate() == 1) {
         countRegistered("QUERY");
         return row.status(OperationRow.Status.RUNNING);
@@ -244,6 +248,8 @@ public class OperationStoreDao implements Service {
   }
 
   private boolean casTerminal(String queryId, String status, String error) throws SQLException {
+    // D36：清列子句保留——滚动升级期旧实例仍写 attach_owner，终态顺带清掉防观测僵尸；
+    // 列本身随 V2 删除（届时去掉本子句）。
     boolean won =
         update(
             "UPDATE fg_operation SET status = ?, error = ?, terminal_at = now(), updated_at = now(),"
@@ -258,35 +264,6 @@ public class OperationStoreDao implements Service {
       countOutcome(status);
     }
     return won;
-  }
-
-  /**
-   * attach 租约仲裁：owner 为空/已过期/本人续持 时获得（赢家 true）。行 RUNNING 才可 attach。
-   */
-  public boolean tryAcquireAttachLease(String queryId, String ownerId, Duration lease)
-      throws SQLException {
-    return update(
-        "UPDATE fg_operation SET attach_owner = ?, attach_lease_until = now() + ?::interval,"
-            + " updated_at = now()"
-            + " WHERE query_id = ? AND status = 'RUNNING'"
-            + " AND (attach_owner IS NULL OR attach_owner = ? OR attach_lease_until < now())",
-        ps -> {
-          ps.setString(1, ownerId);
-          ps.setString(2, toPostgresInterval(lease));
-          ps.setString(3, queryId);
-          ps.setString(4, ownerId);
-        });
-  }
-
-  /** attach 者主动释放租约（终态后清理）。 */
-  public boolean clearAttach(String queryId, String ownerId) throws SQLException {
-    return update(
-        "UPDATE fg_operation SET attach_owner = NULL, attach_lease_until = NULL, updated_at = now()"
-            + " WHERE query_id = ? AND attach_owner = ?",
-        ps -> {
-          ps.setString(1, queryId);
-          ps.setString(2, ownerId);
-        });
   }
 
   /** 超时护栏（D9）：RUNNING 且 created_at 早于 cutoff 的行。 */
@@ -318,10 +295,6 @@ public class OperationStoreDao implements Service {
   }
 
   // ------------------------------------------------------------------ helpers
-
-  private static String toPostgresInterval(Duration d) {
-    return d.toMillis() + " milliseconds";
-  }
 
   private boolean update(String sql, Binder binder) throws SQLException {
     try (Connection c = dataSource.getConnection();

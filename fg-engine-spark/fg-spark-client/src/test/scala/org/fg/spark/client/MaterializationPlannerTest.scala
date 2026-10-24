@@ -1,10 +1,15 @@
 package org.fg.spark.client
 
 import org.apache.spark.connect.proto.Plan
+import org.fg.spi.MaterializationSpec
+
+import scala.collection.JavaConverters._
+
+
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertTrue}
 import org.junit.jupiter.api.Test
 
-/** commandPlanRequest（D17）：Plan.root=SQL 关系，无 WriteOperation、无 ReattachOptions。 */
+/** commandPlanRequest（D17）/ executePlanRequest（D36 预生成 operationId）。 */
 class MaterializationPlannerTest {
 
   @Test
@@ -22,5 +27,22 @@ class MaterializationPlannerTest {
     assertTrue(
       request.getRequestOptionsList.isEmpty,
       "command plan must not request ReattachOptions (gateway holds stream to terminal)")
+  }
+
+  /** D36：executePlan 请求携带编排层预生成 operationId（客户端可指定，引擎 UUID 规范化作执行身份）。 */
+  @Test
+  def executePlanRequestCarriesPregeneratedOperationId(): Unit = {
+    val spec = new MaterializationSpec("s3a://b/p/", "zstd", 16384, null)
+    val opId = java.util.UUID.randomUUID().toString
+    val request =
+      MaterializationPlanner.executePlanRequest("alice", "s-1", "SELECT 1", spec, opId)
+
+    assertTrue(request.hasOperationId, "executePlan must carry client operationId")
+    assertEquals(opId, request.getOperationId)
+    assertTrue(
+      request.getRequestOptionsList.asScala.exists(
+        (o: org.apache.spark.connect.proto.ExecutePlanRequest.RequestOption) =>
+          o.hasReattachOptions && o.getReattachOptions.getReattachable),
+      "executePlan must stay reattachable")
   }
 }

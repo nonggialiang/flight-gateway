@@ -40,7 +40,8 @@ object MaterializationPlanner {
       user: String,
       sessionId: String,
       sqlText: String,
-      spec: MaterializationSpec): ExecutePlanRequest = {
+      spec: MaterializationSpec,
+      clientOperationId: String): ExecutePlanRequest = {
     val base = Relation.newBuilder().setSql(SQL.newBuilder().setQuery(sqlText)).build()
     val wrapped = if (spec.partitionsHint() == null) {
       base
@@ -69,6 +70,9 @@ object MaterializationPlanner {
       .setUserContext(UserContext.newBuilder().setUserId(user))
       .setClientType("fg-gateway")
       .setPlan(plan)
+      // D36：编排层预生成 operationId 随请求下发（3.5+ 客户端可指定；引擎 UUID 规范化后作
+      // 执行身份）——行 INSERT 即可 attach/interrupt/release，消除"提交在途 opId 未知"窗口
+      .setOperationId(clientOperationId)
       .addRequestOptions(
         ExecutePlanRequest.RequestOption.newBuilder()
           .setReattachOptions(

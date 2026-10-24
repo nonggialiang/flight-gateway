@@ -84,9 +84,10 @@ final class SparkEngineRouter(
     SqlOrderHeuristics.isOrderSensitive(sql) // 纯 SQL 启发式，无引擎接触
 
   override def submit(session: EngineSession, sql: String, spec: MaterializationSpec,
+      clientHandle: EngineExecutionHandle,
       listener: SqlEngine.SubmitListener): CompletableFuture[EngineExecutionHandle] = {
     val me = manager.ensureEngine(keyOf(cast(session)))
-    me.client.submit(session, sql, spec, bindListener(me.space, listener))
+    me.client.submit(session, sql, spec, clientHandle, bindListener(me.space, listener))
   }
 
   override def executeCommand(session: EngineSession, sql: String,

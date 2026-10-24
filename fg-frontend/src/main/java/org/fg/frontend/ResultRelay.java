@@ -98,30 +98,38 @@ final class ResultRelay {
     if (paged) {
       metrics.counter("fg.scroll.pages").increment(); // D27：页 DoGet 量（驱动翻页频率）
     }
-    // 在途等待，预算按票 kind 分策略（D15/D18/设计 §4.7）：
+    // 在途等待，按票 kind 分策略（D15/D18/设计 §4.7；D36 预算统一行级 deadline）：
     //   STREAM（legacy GetFlightInfo 快返票）——票可能在查询 RUNNING 时就到 DoGet，且 legacy
-    //     客户端没有 poll 循环可退避，等待预算 = fg.query.timeout（D9 唯一护栏），挂满查询全程；
+    //     客户端没有 poll 循环可退避——挂到行级 deadline（created_at + fg.query.timeout，
+    //     与 sweeper 同值同时到点）；内部等 attach future，毫秒级唤醒；
     //   COMMAND（非 SELECT 快返票）——同 STREAM：legacy 快返的命令票无 poll 侧兜底可退避，
     //     挂满命令全程（fg.command.timeout 先行熔断 + sweeper 兜底，此预算只是上限）；
     //   PART（poll 终态票）——铸造时行已 CAS 终态（单向），到达 DoGet 时必然 COMPLETED，
     //     零等待；若见 RUNNING 即异常态，快速 UNAVAILABLE 暴露而非长等掩盖。
     //   分页 STREAM（D27）——同 PART：页只服务终态数据（驱动先拿 total_records 才翻页），
     //     RUNNING 即 UNAVAILABLE，不占 relay 池长挂。
-    // 长等待传入 listener::isCancelled：客户端断流后在一个 fg.poll.db.interval 内释放
-    // 有界 relay 池线程（否则 600s 预算下废弃流会占满池）。
-    Duration waitBudget =
-        t.kind() == TicketKind.PART || paged
-            ? Duration.ZERO
-            : Duration.ofMillis(config.getDurationMs("fg.query.timeout"));
+    // 长等待传入 listener::isCancelled：客户端断流后在一个 tick（fg.poll.db.interval）内
+    // 释放有界 relay 池线程（否则 600s 预算下废弃流会占满池）。
+    boolean zeroWait = t.kind() == TicketKind.PART || paged;
     QueryOrchestrator.PollOutcome outcome;
-    try {
-      outcome = orchestrator.poll(t.queryId(), waitBudget, listener::isCancelled);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      return; // 客户端已断流，流已死，无需回写
-    } catch (Exception e) {
-      fail(listener, CallStatus.INTERNAL, "Poll failed: " + e.getMessage());
-      return;
+    if (zeroWait) {
+      // PART/页票零等待语义：只查一次，不进入 poll 长等待
+      try {
+        outcome = orchestrator.pollOnce(t.queryId());
+      } catch (Exception e) {
+        fail(listener, CallStatus.INTERNAL, "Poll failed: " + e.getMessage());
+        return;
+      }
+    } else {
+      try {
+        outcome = orchestrator.poll(t.queryId(), listener::isCancelled);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return; // 客户端已断流，流已死，无需回写
+      } catch (Exception e) {
+        fail(listener, CallStatus.INTERNAL, "Poll failed: " + e.getMessage());
+        return;
+      }
     }
     if (!outcome.done()) {
       fail(listener, CallStatus.UNAVAILABLE, "Result not ready yet; re-poll");

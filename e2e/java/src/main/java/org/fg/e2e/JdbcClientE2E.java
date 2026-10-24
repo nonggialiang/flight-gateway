@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>用法：{@code java -cp target/fg-e2e-java-0.1.0-SNAPSHOT.jar org.fg.e2e.JdbcClientE2E
  * {legacy|legacy-long|metadata|cancel|cancel-poll|mode|types|prepare|update}}（网关默认
- * relay 模式；cancel-poll 需 {@code -Dfg.poll.max-wait=2s}；用例间 TRUNCATE fg_operation）。
+ * relay 模式；cancel-poll 需 {@code -Dfg.query.timeout=2s}；用例间 TRUNCATE fg_operation）。
  */
 public final class JdbcClientE2E {
 
@@ -403,7 +403,7 @@ public final class JdbcClientE2E {
    * 方案②验证（poll 阻塞期取消 → CancelFlightInfo）：fg-p1-patch② 给驱动接线了
    * Statement.cancel() → CancelFlightInfo——首 poll 返回时凭证（FlightInfo.appMetadata=queryId）
    * 经 listener 存入 statement，阻塞轮询期间的 st.cancel() 即触发服务端取消，随后 poll 收到
-   * CANCELLED 以 SQLException 浮出。需 {@code -Dfg.poll.max-wait=2s} 网关（缩短首 poll 服务端
+   * CANCELLED 以 SQLException 浮出。需 {@code -Dfg.query.timeout=2s} 网关（缩短首 poll 服务端
    * 等待，凭证 ~2s 即可达）；400M join 物化远超 3s，保证取消落在 poll 阻塞期（早于任何取数）。
    */
   private static void cancelPoll(Connection conn) throws Exception {

@@ -180,10 +180,9 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
       LOGGER.debug("pollFlightInfo: registered queryId={} isNew={} status={}",
           row.queryId(), reg.newlyTriggered(), row.status());
 
-      // ②…长等待（fg.poll.max-wait 到点返回未完成，客户端续 poll）
-      QueryOrchestrator.PollOutcome outcome =
-          orchestrator.poll(
-              row.queryId(), Duration.ofMillis(config.getDurationMs("fg.poll.max-wait")));
+      // ②…长等待（D36：行级 deadline = created_at + fg.query.timeout，挂到查询生死——
+      // 与 sweeper 同值同时到点，客户端零续期；内部等 attach future，毫秒级唤醒）
+      QueryOrchestrator.PollOutcome outcome = orchestrator.poll(row.queryId());
 
       if (!outcome.done()) {
         // not-done PollOutcome.row 按契约为 null；schema 取 register 行（行带 schema 出生）

@@ -56,8 +56,10 @@ public final class OperationRow {
   private byte[] schemaBytes;
   private Status status;
   private String connectOperationId;
-  private String attachOwner;
-  private OffsetDateTime attachLeaseUntil;
+  /** @deprecated D36：attach 租约已移除（各实例各自 attach）；列仅滚动升级期残留清理用，随 V2 删。 */
+  @Deprecated private String attachOwner;
+  /** @deprecated D36：同 {@link #attachOwner}。 */
+  @Deprecated private OffsetDateTime attachLeaseUntil;
   private String engineRef;
   private String error;
   private OffsetDateTime terminalAt;

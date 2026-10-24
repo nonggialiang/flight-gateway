@@ -4,7 +4,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -95,6 +94,37 @@ class OperationStoreDaoIT {
     assertThat(dao.casComplete(row2.queryId())).isFalse(); // 取消写者已迁移
   }
 
+  /** D36：casTerminal 顺带清租约列——滚动升级期旧实例写的 owner 残留在终态时被清。 */
+  @Test
+  void casTerminalClearsLegacyAttachOwner() throws Exception {
+    OperationRow row = dao.insertOrGet(newRow("s-cas-owner", "SELECT casOwner"));
+    // 模拟旧版本实例写的租约残留
+    try (var c = ds.getConnection();
+        var ps = c.prepareStatement(
+            "UPDATE fg_operation SET attach_owner = 'legacy-instance' WHERE query_id = ?::text")) {
+      ps.setString(1, row.queryId());
+      ps.executeUpdate();
+    }
+    assertThat(dao.get(row.queryId()).orElseThrow().attachOwner()).isEqualTo("legacy-instance");
+    assertThat(dao.casComplete(row.queryId())).isTrue();
+    OperationRow after = dao.get(row.queryId()).orElseThrow();
+    assertThat(after.attachOwner()).isNull(); // 终态清列：观测不残留僵尸 owner
+    assertThat(after.attachLeaseUntil()).isNull();
+  }
+
+  /** D36：新行 INSERT 即带预生成 operationId（attach 抢跑/跨实例接手的前提）。 */
+  @Test
+  void insertOrGetCarriesPregeneratedOperationId() throws Exception {
+    String handle = "spark:0d94b4e6-1a2b-4c3d-9e8f-7a6b5c4d3e2f";
+    OperationRow row =
+        dao.insertOrGet(newRow("s-opid", "SELECT opid").connectOperationId(handle));
+    assertThat(row.connectOperationId()).isEqualTo(handle);
+    assertThat(dao.get(row.queryId()).orElseThrow().connectOperationId()).isEqualTo(handle);
+    // 兼容：不传 opId 的调用（COMMAND/旧路径）插入 NULL 不报错
+    OperationRow cmd = dao.insertCommandOrGet(newCommandRow("s-opid-cmd", "SET k = v"));
+    assertThat(dao.get(cmd.queryId()).orElseThrow().connectOperationId()).isNull();
+  }
+
   @Test
   void concurrentCasOnlyOneWinner() throws Exception {
     OperationRow row = dao.insertOrGet(newRow("s-race", "SELECT race"));
@@ -125,22 +155,8 @@ class OperationStoreDaoIT {
     }
   }
 
-  @Test
-  void attachLeaseArbitrationAndTakeover() throws Exception {
-    OperationRow row = dao.insertOrGet(newRow("s-lease", "SELECT lease"));
-    assertThat(dao.tryAcquireAttachLease(row.queryId(), "owner-a", Duration.ofSeconds(60))).isTrue();
-    assertThat(dao.tryAcquireAttachLease(row.queryId(), "owner-b", Duration.ofSeconds(60))).isFalse();
-    assertThat(dao.tryAcquireAttachLease(row.queryId(), "owner-a", Duration.ofSeconds(60))).isTrue(); // 本人续持
-    // 租约过期接管：直接用过期租约回填模拟
-    try (var c = ds.getConnection();
-        var ps = c.prepareStatement(
-            "UPDATE fg_operation SET attach_lease_until = now() - interval '1 second' WHERE query_id = ?")) {
-      ps.setObject(1, UUID.fromString(row.queryId()));
-      ps.executeUpdate();
-    }
-    assertThat(dao.tryAcquireAttachLease(row.queryId(), "owner-b", Duration.ofSeconds(60))).isTrue();
-    assertThat(dao.clearAttach(row.queryId(), "owner-b")).isTrue();
-  }
+  // D36：attach 租约仲裁已移除（原 attachLeaseArbitrationAndTakeover 删）——
+  // 终态清列（滚动升级期旧实例残留 owner 的清理）由 casTerminal 顺带完成，见下用例断言。
 
   // ------------------------------------------------------------- D18/D19：COMMAND 行
 

@@ -725,15 +725,15 @@ def backpressure_timeout(c):
 
 
 def legacy_long_wait(c):
-    """STREAM 票 DoGet 等待预算与 fg.poll.max-wait 解耦（= fg.query.timeout）：
-    网关须以 -Dfg.poll.max-wait=2s 启动——旧实现（DoGet 同 poll 预算）在查询 >2s 时
+    """STREAM 票 DoGet 等待预算（D36 前与 fg.poll.max-wait 解耦，D36 起同源 query.timeout）：
+    网关须以 -Dfg.query.timeout=2s 启动——旧实现（DoGet 同 poll 预算）在查询 >2s 时
     DoGet 报 UNAVAILABLE；新实现 STREAM 票挂满查询全程直至终态。"""
     t0 = time.time()
     legacy_get_flight_info(
         c,
         "SELECT id % 1000 AS k, count(*) AS cnt FROM range(50000000) GROUP BY id % 1000",
         1000)
-    print(f"[legacy-long] DoGet held {time.time() - t0:.1f}s under poll.max-wait=2s: PASS")
+    print(f"[legacy-long] DoGet held {time.time() - t0:.1f}s under query.timeout=2s: PASS")
 
 
 def adbc_query(c, sql, expect_rows, tag="adbc", extra_db_kwargs=None):
@@ -1189,7 +1189,7 @@ if __name__ == "__main__":
     elif which == "poll":
         poll_flight_info(c, "SELECT id FROM range(1000)", 1000)
     elif which == "poll-pending":
-        # pending（not-done）路径回归：与 cancel-poll 同款 -Dfg.poll.max-wait=2s 网关 +
+        # pending（not-done）路径回归：与 cancel-poll 同款 -Dfg.query.timeout=2s 网关 +
         # 物化 >2s 的查询。恒慢的只有"物理物化"（sink 写不可被优化器折叠；count(*) 类
         # 会被代数折叠、聚合/纯计算随引擎热度从 2s 掉到 0.5s）→ 200M 物化 ~4s，且不取数
         # （fetch_data=False，以 total_records 断言，避免 relay 全量回流）。SQL 与 cancel

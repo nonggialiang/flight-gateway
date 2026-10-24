@@ -38,15 +38,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 查询编排层（design §4.2/F2）。
+ * 查询编排层（design §4.2/F2；D36 去 attach 租约）。
  *
  * <ul>
  *   <li>首个 poll/GetFlightInfo = 注册 + 触发（lazy）：指纹查行 miss → 同步 AnalyzePlan（有界，
- *       行带 schema 出生）→ 幂等 INSERT → 异步提交（提交即 detach）；
- *   <li>后续 poll = 长等待：attach 租约仲裁，赢家 Reattach 挂执行流、输家有界查行；
- *       fg.poll.max-wait 到点返回未完成；
+ *       行带 schema 出生）→ 幂等 INSERT（<b>行带预生成 operationId 出生</b>——D36：Spark
+ *       Connect 客户端可指定 operation_id，submit 随请求下发）→ 异步提交（提交即 detach）；
+ *   <li>后续 poll = 长等待：等本实例 attach future（D36 无跨实例租约——各实例各自 attach 同一
+ *       operationId、实例内去重；同实例所有 poll 共享 get 同一 future，毫秒级唤醒）。等待预算
+ *       为行级 deadline：row.created_at + fg.query.timeout（与 sweeper 同值同时到点，客户端零
+ *       续期）；
  *   <li>取消：Interrupt（不要求 attach）+ CAS 行迁移（"B 下杀手 A 收尸"）；
- *   <li>对账兜底：等待超时且行 RUNNING → 查 manifest 存在性，存在即自助作答并修行为
+ *   <li>对账兜底：等待到点且行 RUNNING → 查 manifest 存在性，存在即自助作答并修行为
  *       COMPLETED（状态以 manifest 为准，D7）。
  * </ul>
  */
@@ -62,11 +65,16 @@ public class QueryOrchestrator implements Service {
   private final ObjectStoreService objects;
   private final GatewayConfig config;
   private final ExecutorService controlExecutor;
-  private final String instanceId;
 
-  /** attach 者内存态：queryId → 在挂的 attach future（不跨实例、不持久）。 */
+  /** attach 者内存态：queryId → 在挂的 attach future（不跨实例、不持久；D36 各实例各自建）。 */
   private final Map<String, CompletableFuture<ExecutionOutcome>> activeAttaches =
       new ConcurrentHashMap<>();
+
+  /**
+   * D36：UNKNOWN 后的重试冷却表（queryId → epoch millis 之前不可重建 attach）。防引擎死/
+   * 抢跑窗口的 tight loop；不进 activeAttaches（占位 future 会与 poll 的 get 语义混淆）。
+   */
+  private final Map<String, Long> attachRetryNotBefore = new ConcurrentHashMap<>();
 
   public QueryOrchestrator(
       OperationStoreDao dao,
@@ -81,16 +89,6 @@ public class QueryOrchestrator implements Service {
     this.objects = objects;
     this.config = config;
     this.controlExecutor = controlExecutor;
-    this.instanceId =
-        UUID.randomUUID().toString().substring(0, 8) + "@" + hostName();
-  }
-
-  private static String hostName() {
-    try {
-      return java.net.InetAddress.getLocalHost().getHostName();
-    } catch (Exception e) {
-      return "localhost";
-    }
   }
 
   @Override
@@ -98,7 +96,10 @@ public class QueryOrchestrator implements Service {
 
   @Override
   public void close() {
+    // D36：中断 join 线程加速关停（cancel(true) 令 supplyAsync 内 join 抛 CancellationException）
+    activeAttaches.values().forEach(f -> f.cancel(true));
     activeAttaches.clear();
+    attachRetryNotBefore.clear();
   }
 
   // ------------------------------------------------------------- 会话生命周期（D20）
@@ -328,6 +329,11 @@ public class QueryOrchestrator implements Service {
     String queryId = explicitQueryId != null ? explicitQueryId : QueryIdHolder.newQueryId();
     String resultKeyPrefix =
         config.getString("fg.result.prefix") + "/" + engine.type() + "/" + user + "/" + queryId;
+    // D36：预生成 operationId 随行出生——Spark Connect 客户端可指定 operation_id（引擎按
+    // UUID 规范化作执行身份），行 INSERT 起即可 attach/interrupt/release，消除"提交在途
+    // opId 未知"窗口（UUID 标准形态保证引擎规范化 round-trip 无歧义）。
+    EngineExecutionHandle clientHandle =
+        new EngineExecutionHandle(engine.type(), UUID.randomUUID().toString());
     OperationRow row =
         new OperationRow()
             .queryId(queryId)
@@ -339,6 +345,7 @@ public class QueryOrchestrator implements Service {
             .mode(mode)
             .scrollable(scrollable) // D27：注册时落行（同 mode 的"注册时协商"语义）
             .schemaBytes(schema == null ? null : SchemaSerde.serialize(schema))
+            .connectOperationId(clientHandle.encode())
             .engineRef(engine.type());
     OperationRow stored = dao.insertOrGet(row);
     boolean isNew = stored.queryId().equals(queryId);
@@ -497,12 +504,17 @@ public class QueryOrchestrator implements Service {
                   config.getInt("fg.result.batch.max.records"),
                   partitionsHint);
 
+          // D36：预生成句柄随请求下发（行 INSERT 已带）；回显校验在 engine 侧（不一致仅 warn）。
+          EngineExecutionHandle clientHandle =
+              EngineExecutionHandle.parse(row.connectOperationId());
           CompletableFuture<EngineExecutionHandle> submitted =
               engine.submit(
                   session,
                   row.sqlText(),
                   spec,
+                  clientHandle,
                   handle -> {
+                    // 行已带同值 opId；此写为幂等兜底（滚动升级期旧版本行/异常路径）。
                     try {
                       dao.setOperationId(row.queryId(), handle.encode());
                     } catch (Exception e) {
@@ -540,22 +552,45 @@ public class QueryOrchestrator implements Service {
 
   // ------------------------------------------------------------- poll 长等待
 
-  /**
-   * 后续 poll：长等待至终态或 maxWait 到点。返回的 PollOutcome.done=false 表示仍未完成
-   * （客户端续 poll）。
-   */
-  public PollOutcome poll(String queryId, Duration maxWait) throws Exception {
-    return poll(queryId, maxWait, () -> false);
+  /** 后续 poll（无取消感知）：见 {@link #poll(String, java.util.function.BooleanSupplier)}。 */
+  public PollOutcome poll(String queryId) throws Exception {
+    return poll(queryId, () -> false);
   }
 
   /**
-   * 带取消感知的 poll：cancelled 为 true（如 DoGet 客户端断流）时立即以 InterruptedException
-   * 退出，释放有界 relay 池线程；每轮 DB 轮询间隙检查一次（粒度 fg.poll.db.interval）。
+   * 零等待单查（PART 票/scroll 页票，D15/D27 语义）：查行一次——终态即返；RUNNING 则做一次
+   * manifest 对账（触发实例死亡的修复路径）后仍非终态即 not-done（调用方转 UNAVAILABLE
+   * 快速暴露，不占 relay 池长挂）。不建 attach、不等待。
    */
-  public PollOutcome poll(
-      String queryId, Duration maxWait, java.util.function.BooleanSupplier cancelled)
+  public PollOutcome pollOnce(String queryId) throws Exception {
+    Optional<OperationRow> rowOpt = dao.get(queryId);
+    if (rowOpt.isEmpty()) {
+      throw new IllegalArgumentException("Unknown query: " + queryId);
+    }
+    OperationRow row = rowOpt.get();
+    if (row.status().terminal()) {
+      return terminalOutcome(row);
+    }
+    if (reconcile(queryId)) {
+      return terminalOutcome(dao.get(queryId).orElseThrow());
+    }
+    return new PollOutcome(false, null, null);
+  }
+
+  /**
+   * D36：poll 长等待——预算为<b>行级</b> deadline（row.created_at + fg.query.timeout，与
+   * sweeper 同值同时到点；任何实例算出同一 deadline，客户端零续期），返回条件：终态 / 行级
+   * deadline 到点（sweeper 届时已/正迁 FAILED，返终态或 not-done 由客户端重 poll 即见）。
+   *
+   * <p>等待机制：等本实例 attach future（{@link CompletableFuture#get(long, TimeUnit)} 毫秒级
+   * 唤醒；同实例所有 poll 共享同一 future）。TimeoutException 不是失败，是<b>心跳</b>——回圈
+   * 重读行，tick（fg.poll.db.interval）作为安全网上限同时承担：① cancelled（DoGet 断流）
+   * 检查粒度；② 引擎 wedge（attach 流永不完成）时经重读行感知 sweeper 迁移；③ 行被旁路
+   * 迁移（cancel RPC/他实例 reconcile）的兜底可见性。
+   */
+  public PollOutcome poll(String queryId, java.util.function.BooleanSupplier cancelled)
       throws Exception {
-    long deadline = System.nanoTime() + maxWait.toNanos();
+    long deadlineEpochMs = Long.MIN_VALUE; // 首轮读到行后初始化（行级 deadline）
     while (true) {
       if (cancelled.getAsBoolean()) {
         throw new InterruptedException("Poll caller cancelled: " + queryId);
@@ -568,23 +603,45 @@ public class QueryOrchestrator implements Service {
       if (row.status().terminal()) {
         return terminalOutcome(row);
       }
-      // RUNNING：尝试成为 attach 者（赢家挂流，输家查行等待）
+      if (deadlineEpochMs == Long.MIN_VALUE) {
+        deadlineEpochMs =
+            row.createdAt().toInstant().toEpochMilli()
+                + config.getDurationMs("fg.query.timeout");
+      }
+      // RUNNING：确保本实例有 attach 在挂（D36 各实例各自建，实例内 putIfAbsent 去重）
       maybeAttach(row);
-      long remaining = deadline - System.nanoTime();
-      if (remaining <= 0) {
-        // 对账兜底：等待到点仍 RUNNING → 查 manifest（触发实例死亡的修复路径）
+      long remainingMs = deadlineEpochMs - System.currentTimeMillis();
+      if (remainingMs <= 0) {
+        // 对账兜底：行级 deadline 到点仍 RUNNING → 查 manifest（触发实例死亡的修复路径）；
+        // manifest 不在则 not-done（sweeper 与本 deadline 同值，客户端重 poll 即见 FAILED）
         if (reconcile(queryId)) {
           return terminalOutcome(dao.get(queryId).orElseThrow());
         }
         return new PollOutcome(false, null, null);
       }
-      // 单位统一到毫秒再取小（曾纳秒/毫秒错配：min 几乎恒取 interval → 固定睡一个
-      // interval、max-wait 被 overshoot 一整个 interval，醒来先查终态常直接终态返回）
-      long sleep =
-          Math.min(
-              TimeUnit.NANOSECONDS.toMillis(remaining),
-              config.getDurationMs("fg.poll.db.interval"));
-      TimeUnit.MILLISECONDS.sleep(sleep);
+      long waitMs = Math.min(remainingMs, config.getDurationMs("fg.poll.db.interval"));
+
+      CompletableFuture<ExecutionOutcome> attach = activeAttaches.get(queryId);
+      if (attach == null) {
+        // maybeAttach 刚拒绝建（非"没去 attach"）。新行 opId 随 INSERT 存在，只剩：①滚动升级
+        // 期旧实例建的行 opId null（maybeAttach 拒建，退回 D36 前行为：tick+sweeper）；②
+        // cooldown 未到（UNKNOWN 后主动不建）；③COMMAND 行（无 attach 语义）。
+        // 良性竞态：future 建后瞬间完成已被 whenComplete 移除 → 本轮 sleep，下圈重读行即见结果。
+        TimeUnit.MILLISECONDS.sleep(waitMs);
+        continue;
+      }
+      try {
+        attach.get(waitMs, TimeUnit.MILLISECONDS); // ★ 毫秒级唤醒；返回值丢弃——响应以重读行为准
+        OperationRow after = dao.get(queryId).orElseThrow();
+        if (after.status().terminal()) {
+          return terminalOutcome(after);
+        }
+        // 行仍 RUNNING = UNKNOWN 且 reconcile 未修 → 回圈，受 cooldown 节流
+      } catch (java.util.concurrent.TimeoutException te) {
+        // tick 心跳：回圈重读行（兜底对账由行级 deadline 分支负责）
+      } catch (java.util.concurrent.ExecutionException ee) {
+        // supplyAsync 已兜异常转 UNKNOWN，理论不可达；防御性回圈
+      }
     }
   }
 
@@ -605,75 +662,107 @@ public class QueryOrchestrator implements Service {
     return new PollOutcome(true, row, null);
   }
 
-  /** attach 租约仲裁 + 挂流。赢家：流终→CAS 迁移；UNKNOWN→manifest 对账。 */
+  /**
+   * D36：确保本实例有 attach 在挂（无跨实例租约——各实例各自 attach 同一 operationId，多挂
+   * 由 CAS 条件更新幂等收敛；被 release 切流者经 UNKNOWN→reconcile 归位）。实例内去重：
+   * putIfAbsent 防双 poll 并发建。UNKNOWN 后进 cooldown 防引擎死/抢跑窗口的 tight loop。
+   */
   private void maybeAttach(OperationRow row) {
     if (row.kind() == OperationRow.Kind.COMMAND) {
       return; // D18：命令由触发实例持流至终态，无 attach 语义（也无 manifest 可对账）
     }
     if (row.connectOperationId() == null) {
-      return; // 触发尚未捕获 operationId（提交在途）
+      return; // 滚动升级兼容：旧实例建的行无 opId（新行随 INSERT 带）——退回 tick+sweeper
     }
-    if (activeAttaches.containsKey(row.queryId())) {
-      return; // 本实例已有在挂 attach
-    }
-    try {
-      boolean won =
-          dao.tryAcquireAttachLease(
-              row.queryId(), instanceId, Duration.ofMillis(config.getDurationMs("fg.poll.max-wait") * 2));
-      if (!won) {
+    Long notBefore = attachRetryNotBefore.get(row.queryId());
+    if (notBefore != null) {
+      if (System.currentTimeMillis() < notBefore) {
         return;
       }
-    } catch (Exception e) {
-      logger.warn("Lease acquire failed for {}: {}", row.queryId(), e.toString());
-      return;
+      attachRetryNotBefore.remove(row.queryId(), notBefore); // CAS remove 防并发重复清理
     }
 
-    CompletableFuture<ExecutionOutcome> future =
-        CompletableFuture.supplyAsync(
-            () -> {
-              try {
-                EngineSession session = openEngineSession(row);
-                EngineExecutionHandle handle =
-                    EngineExecutionHandle.parse(row.connectOperationId());
-                return engine.attach(session, handle).join();
-              } catch (Exception e) {
-                return ExecutionOutcome.unknown(e.toString());
-              }
-            },
-            controlExecutor);
-    activeAttaches.put(row.queryId(), future);
-    future.whenComplete(
-        (outcome, err) -> {
-          activeAttaches.remove(row.queryId());
-          try {
-            if (err != null || outcome == null) {
-              outcome = ExecutionOutcome.unknown(String.valueOf(err));
-            }
-            switch (outcome.status()) {
-              case COMPLETED -> dao.casComplete(row.queryId());
-              case FAILED -> dao.casFail(row.queryId(), outcome.error());
-              case CANCELLED -> dao.casCancel(row.queryId());
-              case UNKNOWN -> {
-                // 状态以 manifest 为准（D7）：流断≠失败
-                if (!reconcile(row.queryId())) {
-                  logger.info(
-                      "Attach UNKNOWN for {} (lease released, next poll re-attaches)", row.queryId());
+    // computeIfAbsent：原子单建（putIfAbsent + 急切 supplyAsync 会令并发双 poll 各自启动
+    // attach 任务，后来者的流成引擎侧孤儿）；善后 handler 由创建者恰好注册一次
+    activeAttaches.computeIfAbsent(
+        row.queryId(),
+        k -> {
+          CompletableFuture<ExecutionOutcome> future =
+              CompletableFuture.supplyAsync(
+                  () -> {
+                    try {
+                      EngineSession session = openEngineSession(row);
+                      EngineExecutionHandle handle =
+                          EngineExecutionHandle.parse(row.connectOperationId());
+                      return engine.attach(session, handle).join();
+                    } catch (Exception e) {
+                      return ExecutionOutcome.unknown(e.toString()); // supplyAsync 永不异常完成
+                    }
+                  },
+                  controlExecutor);
+          future.whenComplete(
+              (outcome, err) -> {
+                try {
+                  if (err != null || outcome == null) {
+                    outcome = ExecutionOutcome.unknown(String.valueOf(err));
+                  }
+                  switch (outcome.status()) {
+                    case COMPLETED -> dao.casComplete(row.queryId());
+                    case FAILED -> dao.casFail(row.queryId(), outcome.error());
+                    case CANCELLED -> dao.casCancel(row.queryId());
+                    case UNKNOWN -> {
+                      // 状态以 manifest 为准（D7）：流断/not-found ≠失败，先对账
+                      if (reconcile(row.queryId())) {
+                        break;
+                      }
+                      // D36 抢跑宽限：预生成 opId 的 attach 可能早于 submit 到达引擎
+                      // （"operation not found"类 UNKNOWN）——行龄 < orphan-grace 视为在途，
+                      // cooldown 重试不误杀；≥ grace 仍 not-found 且无 manifest = 从未提交
+                      // 成功，快败（原为 sweeper 600s）。
+                      String error = outcome.error() == null ? "" : outcome.error();
+                      if (error.startsWith("operation not found")
+                          && row.createdAt() != null
+                          && System.currentTimeMillis()
+                                  - row.createdAt().toInstant().toEpochMilli()
+                              >= config.getDurationMs("fg.attach.orphan-grace")) {
+                        dao.casFail(row.queryId(), "operation not found: never submitted");
+                        break;
+                      }
+                      attachRetryNotBefore.put(
+                          row.queryId(),
+                          System.currentTimeMillis() + attachRetryCooldownMs());
+                      logger.info(
+                          "Attach UNKNOWN for {} (cooldown {}ms before re-attach): {}",
+                          row.queryId(),
+                          attachRetryCooldownMs(),
+                          error);
+                    }
+                  }
+                } catch (Exception e) {
+                  logger.error("Post-attach row migration failed for {}", row.queryId(), e);
+                } finally {
+                  // 先 CAS 后 release（顺序不可换——双挂竞态安全前提：release 切断他人流时
+                  // 行已终态，被切流者的误判 CAS 撞终态行 no-op）
+                  try {
+                    engine.releaseExecution(
+                        EngineExecutionHandle.parse(row.connectOperationId()));
+                  } catch (Exception e) {
+                    logger.debug("ReleaseExecution failed for {}: {}", row.queryId(), e.toString());
+                  }
+                  // 【remove 必须最后】若先 remove：完成与 poller 重建之间存在"map 空且
+                  // cooldown 空/行未终态"窗口 → 无谓重建 attach（实证测试踩中）。先 CAS/
+                  // cooldown 落定再摘除，醒来者要么见行终态、要么被 map/冷却拦下。
+                  activeAttaches.remove(row.queryId(), future); // 带 value：不误删后来重建的
                 }
-                dao.clearAttach(row.queryId(), instanceId);
-              }
-            }
-          } catch (Exception e) {
-            logger.error("Post-attach row migration failed for {}", row.queryId(), e);
-          } finally {
-            try {
-              if (row.connectOperationId() != null) {
-                engine.releaseExecution(EngineExecutionHandle.parse(row.connectOperationId()));
-              }
-            } catch (Exception e) {
-              logger.debug("ReleaseExecution failed for {}: {}", row.queryId(), e.toString());
-            }
-          }
+              });
+          return future;
         });
+  }
+
+  private long attachRetryCooldownMs() {
+    return config.hasPath("fg.attach.retry.cooldown")
+        ? config.getDurationMs("fg.attach.retry.cooldown")
+        : config.getDurationMs("fg.poll.db.interval");
   }
 
   /** 对账兜底：行 RUNNING 但 manifest 在 → 修行为 COMPLETED（manifest 是真相源）。 */

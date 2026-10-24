@@ -13,12 +13,14 @@ import org.apache.arrow.vector.types.pojo.Schema;
  * <p>语义按 v0.13+ reattachable 主路径建模（设计 §2.2/§4.4.3）：
  *
  * <ul>
- *   <li>{@link #submit}：提交即 detach——触发执行，首响应捕获 {@link EngineExecutionHandle}
- *       后回调 {@link SubmitListener#onHandle} 并立即断流，触发实例自此对查询无状态；
- *   <li>{@link #attach}：经 DB attach 租约仲裁后的赢家挂执行流直至终态；attach 不承载正确性
- *       （持久事实是 manifest），流断返回 UNKNOWN 由对账兜底；
+ *   <li>{@link #submit}：提交即 detach——携带编排层预生成的 {@link EngineExecutionHandle}
+ *       （Spark Connect 3.5+ 支持客户端指定 operation_id，服务端按 UUID 规范化后作执行身份）
+ *       随 executePlan 下发，首响应回显句柄后立即断流，触发实例自此对查询无状态；
+ *   <li>{@link #attach}：挂执行流直至终态。D36 起无跨实例租约——各网关实例可各自 attach
+ *       同一 operationId（实例内去重），attach 不承载正确性（持久事实是 manifest），流断
+ *       返回 UNKNOWN 由对账兜底；
  *   <li>{@link #interrupt}：取消，不要求 attach（陪伴的 attach 者不受影响）；
- *   <li>{@link #releaseExecution}：attach 者终态后的释放义务。
+ *   <li>{@link #releaseExecution}：attach 者终态后的释放义务（幂等）。
  * </ul>
  *
  * <p>边界原则：gateway 只认识 sql + {@link MaterializationSpec}；"怎么执行、怎么写、元数据从哪来"
@@ -39,9 +41,18 @@ public interface SqlEngine extends AutoCloseable {
    */
   boolean isOrderSensitive(EngineSession session, String sql) throws Exception;
 
-  /** 提交即 detach（见接口 javadoc）。返回的 future 在 detach 完成时完成（不代表执行完成）。 */
+  /**
+   * 提交即 detach（见接口 javadoc）。{@code clientHandle} 为编排层预生成的执行句柄——随
+   * executePlan 的 operation_id 下发（引擎按其规范化后作执行身份），行上自 INSERT 起即可
+   * attach/interrupt/release，消除"提交在途、operationId 未知"窗口。返回的 future 在 detach
+   * 完成时完成（不代表执行完成），完成值即 {@code clientHandle}（首响应回显一致时）。
+   */
   CompletableFuture<EngineExecutionHandle> submit(
-      EngineSession session, String sql, MaterializationSpec spec, SubmitListener listener);
+      EngineSession session,
+      String sql,
+      MaterializationSpec spec,
+      EngineExecutionHandle clientHandle,
+      SubmitListener listener);
 
   /**
    * 命令执行（D17/D18，非 SELECT：SET/SHOW/DESCRIBE/EXPLAIN/USE/DDL/DML）：无物化、结果

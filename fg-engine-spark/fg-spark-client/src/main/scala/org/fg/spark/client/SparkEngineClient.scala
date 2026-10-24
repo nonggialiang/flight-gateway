@@ -11,6 +11,8 @@ import scala.collection.JavaConverters._
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
 
+import org.slf4j.LoggerFactory
+
 /**
  * Spark Engine Kit 的 gateway 侧 SqlEngine 实现（薄 stub，design §4.4.3）：
  *
@@ -29,6 +31,8 @@ import java.util.concurrent.CompletableFuture
  * @param adminPort  本引擎 FgSessionAdmin HTTP 端口（主机同 connectUri）
  */
 final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPort: Int) extends SqlEngine {
+
+  private val logger = LoggerFactory.getLogger(classOf[SparkEngineClient])
 
   private val channel = new ConnectChannel(connectUri)
 
@@ -71,9 +75,12 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
       session: EngineSession,
       sql: String,
       spec: MaterializationSpec,
+      clientHandle: EngineExecutionHandle,
       listener: SqlEngine.SubmitListener): CompletableFuture[EngineExecutionHandle] = {
     val s = session.asInstanceOf[SparkEngineSession]
-    val request = MaterializationPlanner.executePlanRequest(s.user, s.gatewaySessionId, sql, spec)
+    // D36：预生成 operationId 随请求下发（引擎 UUID 规范化后作执行身份）；行上自 INSERT 起即带
+    val request = MaterializationPlanner.executePlanRequest(
+      s.user, s.gatewaySessionId, sql, spec, clientHandle.handle())
     val future = new CompletableFuture[EngineExecutionHandle]()
     val capture = new CancelCapture
     val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
@@ -88,12 +95,16 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
         val opId = value.getOperationId
         if (opId != null && !opId.isEmpty && !future.isDone) {
           done = true
-          val handle = new EngineExecutionHandle("spark", opId)
-          try listener.onHandle(handle)
+          // 回显校验：预生成 id 与引擎回显不一致 = 引擎侧异常形态，warn 供排查（行上仍以预生成值为准）
+          if (!opId.equalsIgnoreCase(clientHandle.handle())) {
+            logger.warn(
+              s"engine echoed different operationId: echoed=$opId pregenerated=${clientHandle.handle()}")
+          }
+          try listener.onHandle(clientHandle)
           catch {
             case _: Throwable => // 触发实例回调异常不阻断 detach
           }
-          future.complete(handle)
+          future.complete(clientHandle)
           // 提交即 detach（⑤ 主路径）：引擎照常执行、manifest 照落
           capture.cancel("fg: detached after operationId capture")
         }
@@ -463,6 +474,9 @@ private[client] object SparkEngineClient {
    *   <li>CANCELLED —— 被 interrupt（CancelFlightInfo/interrupt 路径）→ cancelled；</li>
    *   <li>UNAVAILABLE / DEADLINE_EXCEEDED —— 传输类（连接断/引擎不可达/超时），执行状态
    *       不可判定 → unknown，交 manifest 对账兜底（D7 真相源，行为与 D35 前一致）；</li>
+   *   <li>NOT_FOUND / INVALID_ARGUMENT —— reattach 寻址不到该 operationId（D36 预生成 id 后
+   *       可达）：可能是 submit 尚未到达引擎（attach 抢跑）或引擎重启清空——不可判定 →
+   *       unknown（前缀 "operation not found"，orchestrator 侧按 orphan-grace 宽限后判死）；</li>
    *   <li>其余（INTERNAL / UNKNOWN / RESOURCE_EXHAUSTED…）—— 执行类：Spark 经
    *       GrpcExceptionConverter 把运行时异常作为流尾错误状态投递，且对已失败 operation 的
    *       reattach 重放恒复现同一错误 → 判定失败，<b>真实异常直达客户端</b>。修复此前
@@ -483,6 +497,9 @@ private[client] object SparkEngineClient {
           case io.grpc.Status.Code.UNAVAILABLE | io.grpc.Status.Code.DEADLINE_EXCEEDED =>
             ExecutionOutcome.unknown(
               s"reattach transport error: ${e.getStatus.getCode}: ${e.getStatus.getDescription}")
+          case io.grpc.Status.Code.NOT_FOUND | io.grpc.Status.Code.INVALID_ARGUMENT =>
+            ExecutionOutcome.unknown(
+              s"operation not found: ${e.getStatus.getCode}: ${e.getStatus.getDescription}")
           case code =>
             ExecutionOutcome.failed(
               s"engine execution failed: $code: ${e.getStatus.getDescription}")

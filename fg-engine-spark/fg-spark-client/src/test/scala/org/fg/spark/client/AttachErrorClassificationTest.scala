@@ -50,6 +50,21 @@ class AttachErrorClassificationTest {
   }
 
   @Test
+  def notFoundMapsToUnknownWithOperationNotFoundPrefix(): Unit = {
+    // D36：reattach 寻址不到 operationId（submit 未达引擎/引擎重启清空）→ unknown（前缀
+    // "operation not found"），orchestrator 侧按 orphan-grace 宽限后判死
+    val o = SparkEngineClient
+      .classifyAttachError(grpcError(io.grpc.Status.Code.NOT_FOUND, "no such operation"))
+    assertEquals(OutcomeStatus.UNKNOWN, o.status())
+    assertTrue(o.error().startsWith("operation not found"), o.error())
+
+    val o2 = SparkEngineClient
+      .classifyAttachError(grpcError(io.grpc.Status.Code.INVALID_ARGUMENT, "unknown operation id"))
+    assertEquals(OutcomeStatus.UNKNOWN, o2.status())
+    assertTrue(o2.error().startsWith("operation not found"), o2.error())
+  }
+
+  @Test
   def nonGrpcThrowableMapsToUnknown(): Unit = {
     assertEquals(
       OutcomeStatus.UNKNOWN,
