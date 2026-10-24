@@ -408,6 +408,11 @@ public class QueryOrchestrator implements Service {
    * INSERT 实际 schema 可能比静态宣告宽）；FAILED/CANCELLED 走 casFail/casCancel。
    */
   private void triggerCommand(OperationRow row) {
+    // D37：命令 future（唤醒信号）同步挂入 activeAttaches——命令非 reattachable、协议上
+    // 不可 attach，同实例 poll 经此 future 毫秒级感知完成（与 QUERY 的 attach future 同构
+    // 等待面）；跨实例 poll 走 poll 的 COMMAND 周期兜底分支。
+    CompletableFuture<ExecutionOutcome> signal = new CompletableFuture<>();
+    activeAttaches.put(row.queryId(), signal); // 同步注册：首个 poll 不落无信号分支
     controlExecutor.submit(
         () -> {
           try {
@@ -444,6 +449,10 @@ public class QueryOrchestrator implements Service {
                     }
                   } catch (Exception e) {
                     logger.error("Failed to finalize command {}", row.queryId(), e);
+                  } finally {
+                    // 唤醒等待者（仅作信号，poll 响应一律以重读行为准）+ 摘除
+                    signal.complete(ExecutionOutcome.completed());
+                    activeAttaches.remove(row.queryId(), signal);
                   }
                 });
           } catch (Exception e) {
@@ -452,6 +461,9 @@ public class QueryOrchestrator implements Service {
               dao.casFail(row.queryId(), "command trigger failed: " + e);
             } catch (Exception e2) {
               logger.error("Failed to mark {} failed", row.queryId(), e2);
+            } finally {
+              signal.complete(ExecutionOutcome.completed());
+              activeAttaches.remove(row.queryId(), signal);
             }
           }
         });
@@ -552,9 +564,9 @@ public class QueryOrchestrator implements Service {
 
   // ------------------------------------------------------------- poll 长等待
 
-  /** 后续 poll（无取消感知）：见 {@link #poll(String, java.util.function.BooleanSupplier)}。 */
+  /** 后续 poll（无取消感知）：见 {@link #poll(String, CompletableFuture)}。 */
   public PollOutcome poll(String queryId) throws Exception {
-    return poll(queryId, () -> false);
+    return poll(queryId, new CompletableFuture<>()); // 永不完成的哑信号
   }
 
   /**
@@ -578,21 +590,29 @@ public class QueryOrchestrator implements Service {
   }
 
   /**
-   * D36：poll 长等待——预算为<b>行级</b> deadline（row.created_at + fg.query.timeout，与
-   * sweeper 同值同时到点；任何实例算出同一 deadline，客户端零续期），返回条件：终态 / 行级
-   * deadline 到点（sweeper 届时已/正迁 FAILED，返终态或 not-done 由客户端重 poll 即见）。
+   * D37：poll 长等待——预算为<b>行级</b> deadline（row.created_at + fg.query.timeout，与
+   * sweeper 同值同时到点；任何实例算出同一 deadline，客户端零续期）。等待<b>全事件驱动</b>，
+   * 按 kind 分支：
    *
-   * <p>等待机制：等本实例 attach future（{@link CompletableFuture#get(long, TimeUnit)} 毫秒级
-   * 唤醒；同实例所有 poll 共享同一 future）。TimeoutException 不是失败，是<b>心跳</b>——回圈
-   * 重读行，tick（fg.poll.db.interval）作为安全网上限同时承担：① cancelled（DoGet 断流）
-   * 检查粒度；② 引擎 wedge（attach 流永不完成）时经重读行感知 sweeper 迁移；③ 行被旁路
-   * 迁移（cancel RPC/他实例 reconcile）的兜底可见性。
+   * <ul>
+   *   <li><b>QUERY（reattachable）</b>：等本实例 attach future（毫秒级唤醒；同实例所有
+   *       poll 共享）。cancel 经 interrupt 广播到所有 attach 流 → future 以 CANCELLED 醒；
+   *       引擎死 → 流以 error 终结 → future 醒；行级 deadline 到点 → 本地时钟即检测器。
+   *       cooldown 窗口内（attach 暂缺）预约醒在冷却到期，非周期。QUERY 全路径<b>零周期
+   *       唤醒</b>；</li>
+   *   <li><b>COMMAND（非 reattachable，无法 attach）</b>：触发实例经 triggerCommand 在
+   *       activeAttaches 挂命令 future（同实例 poll 直等，毫秒级）；<b>跨实例</b> poll 无
+   *       本地信号且协议上不可 attach——唯一完成信号是 DB 行，按
+   *       {@code fg.command.poll.interval} 有界轮询（本方法中唯一的周期兜底，仅此分支）。</li>
+   * </ul>
+   *
+   * <p>{@code cancelSignal}（DoGet 客户端断流）：经 ServerStreamListener.setOnCancelHandler
+   * complete——所有分支参与 anyOf 等待，断流毫秒级释放 relay 线程。
    */
-  public PollOutcome poll(String queryId, java.util.function.BooleanSupplier cancelled)
-      throws Exception {
+  public PollOutcome poll(String queryId, CompletableFuture<Void> cancelSignal) throws Exception {
     long deadlineEpochMs = Long.MIN_VALUE; // 首轮读到行后初始化（行级 deadline）
     while (true) {
-      if (cancelled.getAsBoolean()) {
+      if (cancelSignal.isDone()) {
         throw new InterruptedException("Poll caller cancelled: " + queryId);
       }
       Optional<OperationRow> rowOpt = dao.get(queryId);
@@ -608,39 +628,55 @@ public class QueryOrchestrator implements Service {
             row.createdAt().toInstant().toEpochMilli()
                 + config.getDurationMs("fg.query.timeout");
       }
-      // RUNNING：确保本实例有 attach 在挂（D36 各实例各自建，实例内 putIfAbsent 去重）
+      // RUNNING：QUERY 确保本实例有 attach 在挂（D36 各实例各自建，实例内 computeIfAbsent 去重）
       maybeAttach(row);
       long remainingMs = deadlineEpochMs - System.currentTimeMillis();
       if (remainingMs <= 0) {
-        // 对账兜底：行级 deadline 到点仍 RUNNING → 查 manifest（触发实例死亡的修复路径）；
-        // manifest 不在则 not-done（sweeper 与本 deadline 同值，客户端重 poll 即见 FAILED）
+        // 行级 deadline 到点（与 sweeper 同值同刻）：对账兜底仍 RUNNING 的触发实例死亡路径；
+        // manifest 不在则 not-done（客户端重 poll 即见 sweeper 的 FAILED）
         if (reconcile(queryId)) {
           return terminalOutcome(dao.get(queryId).orElseThrow());
         }
         return new PollOutcome(false, null, null);
       }
-      long waitMs = Math.min(remainingMs, config.getDurationMs("fg.poll.db.interval"));
 
-      CompletableFuture<ExecutionOutcome> attach = activeAttaches.get(queryId);
-      if (attach == null) {
-        // maybeAttach 刚拒绝建（非"没去 attach"）。新行 opId 随 INSERT 存在，只剩：①滚动升级
-        // 期旧实例建的行 opId null（maybeAttach 拒建，退回 D36 前行为：tick+sweeper）；②
-        // cooldown 未到（UNKNOWN 后主动不建）；③COMMAND 行（无 attach 语义）。
-        // 良性竞态：future 建后瞬间完成已被 whenComplete 移除 → 本轮 sleep，下圈重读行即见结果。
-        TimeUnit.MILLISECONDS.sleep(waitMs);
-        continue;
-      }
-      try {
-        attach.get(waitMs, TimeUnit.MILLISECONDS); // ★ 毫秒级唤醒；返回值丢弃——响应以重读行为准
-        OperationRow after = dao.get(queryId).orElseThrow();
-        if (after.status().terminal()) {
-          return terminalOutcome(after);
+      CompletableFuture<ExecutionOutcome> local = activeAttaches.get(queryId);
+      long waitMs = remainingMs;
+      if (row.kind() == OperationRow.Kind.COMMAND && local == null) {
+        // ★ COMMAND 跨实例（非 reattachable 协议上不可 attach，触发实例之外无本地信号）：
+        // 唯一的周期兜底分支——有界轮询 DB 行；cancelSignal 同参等待，断流不受此粒度影响
+        waitMs = Math.min(remainingMs, config.getDurationMs("fg.command.poll.interval"));
+      } else if (row.kind() != OperationRow.Kind.COMMAND && local == null) {
+        // QUERY cooldown 窗口：预约醒在冷却到期（下一轮 maybeAttach 重建），非周期；
+        // 无冷却条目（attach 刚被摘除的良性竞态）则醒在 deadline
+        Long notBefore = attachRetryNotBefore.get(queryId);
+        if (notBefore != null) {
+          waitMs = Math.min(remainingMs, Math.max(1L, notBefore - System.currentTimeMillis()));
         }
-        // 行仍 RUNNING = UNKNOWN 且 reconcile 未修 → 回圈，受 cooldown 节流
+      }
+      // local != null（QUERY 的 attach / COMMAND 的触发实例命令 future）：anyOf 毫秒级唤醒，
+      // 返回值丢弃——响应以重读行为准
+      try {
+        CompletableFuture<Object> waitOn =
+            local != null
+                ? CompletableFuture.anyOf(local, cancelSignal)
+                : CompletableFuture.anyOf(cancelSignal);
+        waitOn.get(waitMs, TimeUnit.MILLISECONDS);
+        if (cancelSignal.isDone()) {
+          throw new InterruptedException("Poll caller cancelled: " + queryId);
+        }
+        if (local != null) {
+          OperationRow after = dao.get(queryId).orElseThrow();
+          if (after.status().terminal()) {
+            return terminalOutcome(after);
+          }
+          // 行仍 RUNNING = UNKNOWN 且 reconcile 未修 → 回圈（QUERY 受 cooldown 节流）
+        }
+        // 等待超时（预约事件到点）→ 回圈
       } catch (java.util.concurrent.TimeoutException te) {
-        // tick 心跳：回圈重读行（兜底对账由行级 deadline 分支负责）
+        // 预约上界到点：回圈（deadline 分支负责终局）
       } catch (java.util.concurrent.ExecutionException ee) {
-        // supplyAsync 已兜异常转 UNKNOWN，理论不可达；防御性回圈
+        // future 已兜异常（UNKNOWN），理论不可达；防御性回圈
       }
     }
   }
@@ -670,9 +706,6 @@ public class QueryOrchestrator implements Service {
   private void maybeAttach(OperationRow row) {
     if (row.kind() == OperationRow.Kind.COMMAND) {
       return; // D18：命令由触发实例持流至终态，无 attach 语义（也无 manifest 可对账）
-    }
-    if (row.connectOperationId() == null) {
-      return; // 滚动升级兼容：旧实例建的行无 opId（新行随 INSERT 带）——退回 tick+sweeper
     }
     Long notBefore = attachRetryNotBefore.get(row.queryId());
     if (notBefore != null) {
@@ -762,7 +795,7 @@ public class QueryOrchestrator implements Service {
   private long attachRetryCooldownMs() {
     return config.hasPath("fg.attach.retry.cooldown")
         ? config.getDurationMs("fg.attach.retry.cooldown")
-        : config.getDurationMs("fg.poll.db.interval");
+        : config.getDurationMs("fg.command.poll.interval");
   }
 
   /** 对账兜底：行 RUNNING 但 manifest 在 → 修行为 COMPLETED（manifest 是真相源）。 */
@@ -802,7 +835,12 @@ public class QueryOrchestrator implements Service {
 
   // ------------------------------------------------------------- 取消
 
-  /** CancelFlightInfo："B 下杀手"。引擎不可达=UNSPECIFIED（客户端可重试）。 */
+  /**
+   * CancelFlightInfo（D37 语义收紧）：先 interrupt 引擎（广播 CANCELLED 到所有 attach），
+   * <b>成功后</b>才 CAS 迁行——引擎不可达时取消<b>失败</b>（UNSPECIFIED，客户端可重试），
+   * <b>绝不</b>在不确定执行已终止的情况下改行（否则执行仍在跑而行已 CANCELLED，状态与
+   * 事实脱节；行由 sweeper 兜底或引擎恢复后重试取消）。
+   */
   public CancelOutcome cancel(String queryId) {
     try {
       Optional<OperationRow> rowOpt = dao.get(queryId);
@@ -813,15 +851,16 @@ public class QueryOrchestrator implements Service {
       if (row.status().terminal()) {
         return CancelOutcome.NOT_CANCELLABLE;
       }
-      if (row.connectOperationId() != null) {
-        try {
-          EngineSession session = openEngineSession(row);
-          engine.interrupt(session, EngineExecutionHandle.parse(row.connectOperationId()));
-        } catch (Exception e) {
-          // 引擎不可达：CAS 迁移仍尝试；返回 UNSPECIFIED 由调用方决定
-          boolean migrated = dao.casCancel(queryId);
-          return migrated ? CancelOutcome.CANCELLED : CancelOutcome.NOT_CANCELLABLE;
-        }
+      if (row.connectOperationId() == null) {
+        return CancelOutcome.NOT_CANCELLABLE; // 理论不可达（行带 opId 出生）
+      }
+      try {
+        EngineSession session = openEngineSession(row);
+        engine.interrupt(session, EngineExecutionHandle.parse(row.connectOperationId()));
+      } catch (Exception e) {
+        // D37：引擎不可达 = 取消失败（不改行）——执行状态未知，宁失败勿谎报
+        logger.warn("Cancel failed (engine unreachable) for {}: {}", queryId, e.toString());
+        return CancelOutcome.UNSPECIFIED;
       }
       boolean migrated = dao.casCancel(queryId);
       return migrated ? CancelOutcome.CANCELLED : CancelOutcome.NOT_CANCELLABLE;

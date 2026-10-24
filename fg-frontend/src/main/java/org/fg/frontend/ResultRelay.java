@@ -98,7 +98,7 @@ final class ResultRelay {
     if (paged) {
       metrics.counter("fg.scroll.pages").increment(); // D27：页 DoGet 量（驱动翻页频率）
     }
-    // 在途等待，按票 kind 分策略（D15/D18/设计 §4.7；D36 预算统一行级 deadline）：
+    // 在途等待，按票 kind 分策略（D15/D18/设计 §4.7；D37 等待全事件驱动）：
     //   STREAM（legacy GetFlightInfo 快返票）——票可能在查询 RUNNING 时就到 DoGet，且 legacy
     //     客户端没有 poll 循环可退避——挂到行级 deadline（created_at + fg.query.timeout，
     //     与 sweeper 同值同时到点）；内部等 attach future，毫秒级唤醒；
@@ -108,8 +108,8 @@ final class ResultRelay {
     //     零等待；若见 RUNNING 即异常态，快速 UNAVAILABLE 暴露而非长等掩盖。
     //   分页 STREAM（D27）——同 PART：页只服务终态数据（驱动先拿 total_records 才翻页），
     //     RUNNING 即 UNAVAILABLE，不占 relay 池长挂。
-    // 长等待传入 listener::isCancelled：客户端断流后在一个 tick（fg.poll.db.interval）内
-    // 释放有界 relay 池线程（否则 600s 预算下废弃流会占满池）。
+    // D37：客户端断流经 setOnCancelHandler → cancelSignal 参与 poll 的 anyOf 等待——
+    // 断流毫秒级释放有界 relay 池线程（不再依赖轮询粒度）。
     boolean zeroWait = t.kind() == TicketKind.PART || paged;
     QueryOrchestrator.PollOutcome outcome;
     if (zeroWait) {
@@ -121,8 +121,12 @@ final class ResultRelay {
         return;
       }
     } else {
+      java.util.concurrent.CompletableFuture<Void> cancelSignal =
+          new java.util.concurrent.CompletableFuture<>();
+      listener.setOnCancelHandler(
+          () -> cancelSignal.complete(null)); // gRPC 回调线程；complete 线程安全
       try {
-        outcome = orchestrator.poll(t.queryId(), listener::isCancelled);
+        outcome = orchestrator.poll(t.queryId(), cancelSignal);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         return; // 客户端已断流，流已死，无需回写

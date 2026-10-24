@@ -8,6 +8,7 @@ import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
 
 import java.time.OffsetDateTime;
@@ -43,7 +44,8 @@ import org.mockito.invocation.InvocationOnMock;
 class QueryOrchestratorTest {
 
   private static final String[] KEYS = {
-    "fg.poll.db.interval", "fg.query.timeout", "fg.attach.retry.cooldown", "fg.attach.orphan-grace"
+    "fg.command.poll.interval", "fg.query.timeout", "fg.attach.retry.cooldown",
+    "fg.attach.orphan-grace"
   };
 
   private OperationStoreDao dao;
@@ -67,7 +69,7 @@ class QueryOrchestratorTest {
 
   @BeforeEach
   void setUp() throws Exception {
-    System.setProperty("fg.poll.db.interval", "10s"); // tick 设大：任何 <10s 的返回都证明是 future 唤醒
+    System.setProperty("fg.command.poll.interval", "10s"); // 兜底节拍设大：任何 <10s 的返回都证明是 future 唤醒
     System.setProperty("fg.query.timeout", "300s");
     System.setProperty("fg.attach.retry.cooldown", "50ms");
     System.setProperty("fg.attach.orphan-grace", "500ms");
@@ -303,13 +305,41 @@ class QueryOrchestratorTest {
     assertThat(attachCalls.get()).isEqualTo(1);
   }
 
-  /** 7：cancelled → InterruptedException。 */
+  /** 7：cancelSignal 完成 → InterruptedException（anyOf 立即醒）。 */
   @Test
   void cancelledPollThrows() {
     rowState.set(runningRow(OffsetDateTime.now(), "spark:op-7"));
     attachFuture = new CompletableFuture<>();
-    assertThatThrownBy(() -> orchestrator.poll("q-1", () -> true))
+    CompletableFuture<Void> cancelSignal = new CompletableFuture<>();
+    cancelSignal.complete(null); // 循环头快路径:已取消立即抛
+    assertThatThrownBy(() -> orchestrator.poll("q-1", cancelSignal))
         .isInstanceOf(InterruptedException.class);
+  }
+
+  /** 7b：等待中途 cancelSignal 完成 → 毫秒级醒（非等 deadline）。 */
+  @Test
+  void cancelSignalWakesWaitingPoll() throws Exception {
+    rowState.set(runningRow(OffsetDateTime.now(), "spark:op-7b"));
+    attachFuture = new CompletableFuture<>(); // 永不完成
+    CompletableFuture<Void> cancelSignal = new CompletableFuture<>();
+    AtomicReference<Throwable> thrown = new AtomicReference<>();
+    Thread poller =
+        new Thread(
+            () -> {
+              try {
+                orchestrator.poll("q-1", cancelSignal);
+              } catch (Throwable e) {
+                thrown.set(e);
+              }
+            });
+    poller.start();
+    awaitAttachEstablished();
+    long t0 = System.nanoTime();
+    cancelSignal.complete(null);
+    poller.join(2000);
+    assertThat(thrown.get()).isInstanceOf(InterruptedException.class);
+    long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+    assertThat(ms).as("cancelSignal 应毫秒级唤醒").isLessThan(1000);
   }
 
   /**
@@ -363,5 +393,63 @@ class QueryOrchestratorTest {
     QueryOrchestrator.PollOutcome done = orchestrator.pollOnce("q-1");
     assertThat(done.done()).isTrue();
     assertThat(done.row().status()).isEqualTo(OperationRow.Status.CANCELLED);
+  }
+
+  /**
+   * 10（D37）：COMMAND 跨实例（无本地命令 future、不可 attach）——唯一周期兜底分支；
+   * 行迁终态后 poll 在一个 fg.command.poll.interval 内感知。
+   */
+  @Test
+  void commandCrossInstancePollWakesWithinInterval() throws Exception {
+    System.setProperty("fg.command.poll.interval", "300ms");
+    config = GatewayConfig.create();
+    orchestrator = new QueryOrchestrator(dao, sessions, engine, objects, config, executor);
+
+    rowState.set(runningRow(OffsetDateTime.now(), "spark:cmd-10").kind(OperationRow.Kind.COMMAND));
+    when(dao.casCompleteCommand(anyString(), any(), any()))
+        .thenAnswer(inv -> migrate(OperationRow.Status.COMPLETED));
+
+    AtomicReference<QueryOrchestrator.PollOutcome> result = new AtomicReference<>();
+    Thread poller =
+        new Thread(
+            () -> {
+              try {
+                result.set(orchestrator.poll("q-1"));
+              } catch (Exception e) {
+                throw new RuntimeException(e);
+              }
+            });
+    poller.start();
+    Thread.sleep(150); // poll 已进入 300ms 兜底睡眠
+    rowState.set(rowState.get().status(OperationRow.Status.COMPLETED)); // "触发实例"CAS 落行
+    poller.join(3000);
+
+    assertThat(result.get()).isNotNull();
+    assertThat(result.get().done()).isTrue();
+    verify(engine, never()).attach(any(), any()); // COMMAND 永不 attach
+  }
+
+  /** 11（D37）：cancel 引擎不可达 → UNSPECIFIED 且不改行（宁失败勿谎报）。 */
+  @Test
+  void cancelWithEngineUnreachableFailsWithoutTouchingRow() throws Exception {
+    rowState.set(runningRow(OffsetDateTime.now(), "spark:op-11"));
+    doThrow(new RuntimeException("conn refused"))
+        .when(engine)
+        .interrupt(any(), any());
+
+    QueryOrchestrator.CancelOutcome outcome = orchestrator.cancel("q-1");
+    assertThat(outcome).isEqualTo(QueryOrchestrator.CancelOutcome.UNSPECIFIED);
+    verify(dao, never()).casCancel(anyString());
+    assertThat(rowState.get().status()).isEqualTo(OperationRow.Status.RUNNING); // 行不动
+  }
+
+  /** 12（D37）：cancel 引擎可达 → interrupt 后 CAS 迁行。 */
+  @Test
+  void cancelWithEngineReachableMigratesRow() throws Exception {
+    rowState.set(runningRow(OffsetDateTime.now(), "spark:op-12"));
+    QueryOrchestrator.CancelOutcome outcome = orchestrator.cancel("q-1");
+    assertThat(outcome).isEqualTo(QueryOrchestrator.CancelOutcome.CANCELLED);
+    verify(engine).interrupt(any(), any());
+    assertThat(rowState.get().status()).isEqualTo(OperationRow.Status.CANCELLED);
   }
 }
