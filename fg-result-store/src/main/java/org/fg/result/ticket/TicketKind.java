@@ -10,11 +10,15 @@ package org.fg.result.ticket;
  *       单分片可重试；</li>
  *   <li>COMMAND：命令级定位器（D18）——SET/SHOW/DESCRIBE/EXPLAIN/USE/DDL/DML 非 SELECT
  *       语句；结果内联 fg_operation.command_result（无 manifest、无 part），票只定位
- *       queryId、无 partIndex；DoGet 等待预算同 STREAM（挂 fg.query.timeout）。</li>
+ *       queryId、无 partIndex；DoGet 等待预算同 STREAM（挂 fg.query.timeout）；</li>
+ *   <li>INLINE：流式取数定位器（D38）——SELECT 不物化，DoGet 经 ReattachExecute
+ *       (last_response_id) 增量拉取引擎响应流逐批转发；断线续传经
+ *       x-fg-resume-response-id 头（app_metadata 盖 responseId）；无 partIndex。</li>
  * </ul>
  */
 public enum TicketKind {
   STREAM,
   PART,
-  COMMAND
+  COMMAND,
+  INLINE
 }

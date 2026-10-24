@@ -94,6 +94,11 @@ final class EndpointsAssembler {
    * 快返 STREAM endpoint（H1：GetFlightInfo / PollFlightInfo 首响应即签发）。查询仍在途即返回，
    * schema 可能为空、无 records/bytes——客户端语义是"先拿票，DoGet 时再等"（relay 挂等待）。
    */
+  /** D38：inline 流式票（DoGet 增量取数 + resume 头续传）。 */
+  FlightEndpoint inlineEndpoint(OperationRow row) {
+    return relayEndpoint(TicketKind.INLINE, row, null);
+  }
+
   FlightEndpoint streamEndpoint(OperationRow row) {
     return relayEndpoint(TicketKind.STREAM, row, null);
   }

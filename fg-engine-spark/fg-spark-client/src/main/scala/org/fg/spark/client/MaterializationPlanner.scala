@@ -81,6 +81,29 @@ object MaterializationPlanner {
       .build()
   }
 
+  /** D38 inline 执行请求：裸 SQL 关系（无 WriteOperation/repartition）+ 预生成 operationId + REATTACHABLE（result_complete 门控必须）。 */
+  def inlinePlanRequest(
+      user: String,
+      sessionId: String,
+      sqlText: String,
+      clientOperationId: String): ExecutePlanRequest = {
+    val plan = Plan.newBuilder()
+      .setRoot(Relation.newBuilder().setSql(SQL.newBuilder().setQuery(sqlText)))
+      .build()
+    ExecutePlanRequest.newBuilder()
+      .setSessionId(sessionId)
+      .setUserContext(UserContext.newBuilder().setUserId(user))
+      .setClientType("fg-gateway")
+      .setPlan(plan)
+      .setOperationId(clientOperationId)
+      .addRequestOptions(
+        ExecutePlanRequest.RequestOption.newBuilder()
+          .setReattachOptions(
+            org.apache.spark.connect.proto.ReattachOptions.newBuilder()
+              .setReattachable(true)))
+      .build()
+  }
+
   /** AnalyzePlan 请求：SQL 关系的 schema 分析。 */
   def analyzePlanRequest(user: String, sessionId: String, sqlText: String): AnalyzePlanRequest = {
     val queryPlan = Plan.newBuilder()

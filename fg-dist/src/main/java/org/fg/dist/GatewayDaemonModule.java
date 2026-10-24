@@ -78,7 +78,7 @@ final class GatewayDaemonModule {
             operationStore.dao(), operationStore.sessionDao(), engine, objects, config,
             context.getExecutor());
     registry.bindSelf(orchestrator);
-    registry.bindSelf(new QueryTimeoutSweeper(operationStore.dao(), config));
+    registry.bindSelf(new QueryTimeoutSweeper(operationStore.dao(), config, engine));
 
     // relay 有界池（fg.executor.relay.size；SynchronousQueue=真有界并发）
     int relaySize = config.getInt("fg.executor.relay.size");

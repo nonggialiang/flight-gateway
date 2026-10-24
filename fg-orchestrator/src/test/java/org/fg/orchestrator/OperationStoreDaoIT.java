@@ -94,23 +94,7 @@ class OperationStoreDaoIT {
     assertThat(dao.casComplete(row2.queryId())).isFalse(); // 取消写者已迁移
   }
 
-  /** D36：casTerminal 顺带清租约列——滚动升级期旧实例写的 owner 残留在终态时被清。 */
-  @Test
-  void casTerminalClearsLegacyAttachOwner() throws Exception {
-    OperationRow row = dao.insertOrGet(newRow("s-cas-owner", "SELECT casOwner"));
-    // 模拟旧版本实例写的租约残留
-    try (var c = ds.getConnection();
-        var ps = c.prepareStatement(
-            "UPDATE fg_operation SET attach_owner = 'legacy-instance' WHERE query_id = ?::text")) {
-      ps.setString(1, row.queryId());
-      ps.executeUpdate();
-    }
-    assertThat(dao.get(row.queryId()).orElseThrow().attachOwner()).isEqualTo("legacy-instance");
-    assertThat(dao.casComplete(row.queryId())).isTrue();
-    OperationRow after = dao.get(row.queryId()).orElseThrow();
-    assertThat(after.attachOwner()).isNull(); // 终态清列：观测不残留僵尸 owner
-    assertThat(after.attachLeaseUntil()).isNull();
-  }
+  // D36 的 casTerminalClearsLegacyAttachOwner 随 V2 删列移除（attach_owner 已不存在）。
 
   /** D36：新行 INSERT 即带预生成 operationId（attach 抢跑/跨实例接手的前提）。 */
   @Test

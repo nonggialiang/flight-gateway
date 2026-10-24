@@ -66,6 +66,46 @@ public interface SqlEngine extends AutoCloseable {
   /** attach 挂执行流；返回终态快速结果。 */
   CompletableFuture<ExecutionOutcome> attach(EngineSession session, EngineExecutionHandle handle);
 
+  /**
+   * D38 inline 提交：同 {@link #submit} 的提交即 detach，但 plan 为裸 SQL 关系（无
+   * WriteOperation/无物化）+ ReattachOptions——结果经 {@link #attachInline} 增量消费。
+   */
+  CompletableFuture<EngineExecutionHandle> submitInline(
+      EngineSession session, String sql, EngineExecutionHandle clientHandle, SubmitListener listener);
+
+  /**
+   * D38 inline 消费 attach：{@code ReattachExecute(last_response_id)}——{@code lastResponseId}
+   * 为 null 从头消费。逐批回调 {@link InlineConsumer}（回调线程=attach 流的 onNext 线程，
+   * 实现必须非阻塞或自行转交；观察者绝不抛）。返回 future 终态语义同 {@link #attach}。
+   */
+  CompletableFuture<ExecutionOutcome> attachInline(
+      EngineSession session,
+      EngineExecutionHandle handle,
+      String lastResponseId,
+      InlineConsumer consumer);
+
+  /**
+   * D38 前向单游标释放：earliest_unreleased 前推到 {@code responseId} 之后（该 id 之前的
+   * 缓存响应永久不可再读——续传请求落在已释放区间由引擎报 INVALID_CURSOR，实现侧幂等）。
+   */
+  void releaseUntil(EngineExecutionHandle handle, String responseId);
+
+  /**
+   * D38：inline 逐批消费者。
+   *
+   * <p>{@code ipcStreamBytes} = Spark Connect ArrowBatch.data 的完整 Arrow IPC stream
+   * bytes（pyspark 同款消费方式：{@code pa.ipc.open_stream(batch.data)}——自含 framing，
+   * ArrowStreamReader 可直读）。responseId = 引擎响应流位置标识（客户端续传游标，经
+   * app_metadata 回传）。
+   */
+  interface InlineConsumer {
+    void onSchema(org.apache.arrow.vector.types.pojo.Schema schema);
+
+    void onBatch(String responseId, byte[] ipcStreamBytes);
+
+    void onResultComplete();
+  }
+
   /** Interrupt：取消执行；不要求 attach。引擎不可达抛异常（调用方转 UNSPECIFIED）。 */
   void interrupt(EngineSession session, EngineExecutionHandle handle) throws Exception;
 

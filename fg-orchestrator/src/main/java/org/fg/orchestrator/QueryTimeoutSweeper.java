@@ -7,7 +7,10 @@ import java.util.concurrent.TimeUnit;
 import org.fg.common.concurrent.NamedThreadFactory;
 import org.fg.common.config.GatewayConfig;
 import org.fg.common.service.Service;
+import org.fg.orchestrator.store.OperationRow;
 import org.fg.orchestrator.store.OperationStoreDao;
+import org.fg.spi.EngineExecutionHandle;
+import org.fg.spi.SqlEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,11 +24,13 @@ public class QueryTimeoutSweeper implements Service {
 
   private final OperationStoreDao dao;
   private final GatewayConfig config;
+  private final SqlEngine engine;
   private ScheduledExecutorService scheduler;
 
-  public QueryTimeoutSweeper(OperationStoreDao dao, GatewayConfig config) {
+  public QueryTimeoutSweeper(OperationStoreDao dao, GatewayConfig config, SqlEngine engine) {
     this.dao = dao;
     this.config = config;
+    this.engine = engine;
   }
 
   @Override
@@ -51,6 +56,17 @@ public class QueryTimeoutSweeper implements Service {
                 try {
                   if (dao.casFail(row.queryId(), "query timeout after " + timeoutMs + "ms")) {
                     logger.info("Query {} timed out", row.queryId());
+                    if (row.mode() == OperationRow.Mode.INLINE
+                        && row.connectOperationId() != null) {
+                      // D38：inline 缓存只在 driver 内存——终态必须释放（幂等，任意实例可发）
+                      try {
+                        engine.releaseExecution(
+                            EngineExecutionHandle.parse(row.connectOperationId()));
+                      } catch (Exception re) {
+                        logger.debug("Inline release on timeout failed for {}: {}",
+                            row.queryId(), re.toString());
+                      }
+                    }
                   }
                 } catch (Exception e) {
                   logger.warn("Timeout sweep failed for {}: {}", row.queryId(), e.toString());

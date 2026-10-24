@@ -45,4 +45,22 @@ class MaterializationPlannerTest {
           o.hasReattachOptions && o.getReattachOptions.getReattachable),
       "executePlan must stay reattachable")
   }
+
+  /** D38：inline 请求 = 裸 SQL Relation + 预生成 operationId + reattachable（无 WriteOperation）。 */
+  @Test
+  def inlinePlanRequestIsBareSqlRelationWithOperationId(): Unit = {
+    val opId = java.util.UUID.randomUUID().toString
+    val request = MaterializationPlanner.inlinePlanRequest("alice", "s-1", "SELECT 1", opId)
+
+    assertEquals(opId, request.getOperationId)
+    val plan: Plan = request.getPlan
+    assertTrue(plan.hasRoot, "inline plan must be bare SQL relation")
+    assertFalse(plan.hasCommand, "inline plan must not carry WriteOperation/Command")
+    assertTrue(plan.getRoot.hasSql)
+    assertTrue(
+      request.getRequestOptionsList.asScala.exists(
+        (o: org.apache.spark.connect.proto.ExecutePlanRequest.RequestOption) =>
+          o.hasReattachOptions && o.getReattachOptions.getReattachable),
+      "inline must be reattachable (result_complete 门控)")
+  }
 }

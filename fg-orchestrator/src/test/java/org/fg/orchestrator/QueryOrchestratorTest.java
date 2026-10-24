@@ -452,4 +452,39 @@ class QueryOrchestratorTest {
     verify(engine).interrupt(any(), any());
     assertThat(rowState.get().status()).isEqualTo(OperationRow.Status.CANCELLED);
   }
+
+  /** 13（D38）：INLINE 行 poll 不 attach（空消费 attach 会吞 arrow_batch，正确性危害）。 */
+  @Test
+  void inlineRowNeverAttachesViaPoll() throws Exception {
+    System.setProperty("fg.query.timeout", "200ms");
+    config = GatewayConfig.create();
+    orchestrator = new QueryOrchestrator(dao, sessions, engine, objects, config, executor);
+    rowState.set(runningRow(OffsetDateTime.now(), "spark:op-13").mode(OperationRow.Mode.INLINE));
+    attachFuture = new CompletableFuture<>();
+
+    QueryOrchestrator.PollOutcome out = orchestrator.poll("q-1");
+    assertThat(out.done()).isFalse();
+    verify(engine, never()).attach(any(), any()); // 信号 attach 排除
+    verify(engine, never()).attachInline(any(), any(), any(), any()); // 消费 attach 只在 DoGet
+  }
+
+  /** 14（D38）：INLINE 行 cancel 成功后补 releaseExecution（driver 内存义务）。 */
+  @Test
+  void inlineCancelReleasesEngineCache() throws Exception {
+    rowState.set(runningRow(OffsetDateTime.now(), "spark:op-14").mode(OperationRow.Mode.INLINE));
+    QueryOrchestrator.CancelOutcome outcome = orchestrator.cancel("q-1");
+    assertThat(outcome).isEqualTo(QueryOrchestrator.CancelOutcome.CANCELLED);
+    verify(engine).releaseExecution(any());
+  }
+
+  /** 15（D38）：INLINE 终态 terminalOutcome 不 readManifest。 */
+  @Test
+  void inlineTerminalOutcomeSkipsManifest() throws Exception {
+    rowState.set(
+        runningRow(OffsetDateTime.now(), "spark:op-15")
+            .mode(OperationRow.Mode.INLINE).status(OperationRow.Status.COMPLETED));
+    QueryOrchestrator.PollOutcome out = orchestrator.pollOnce("q-1");
+    assertThat(out.done()).isTrue();
+    verify(objects, never()).readManifest(anyString());
+  }
 }

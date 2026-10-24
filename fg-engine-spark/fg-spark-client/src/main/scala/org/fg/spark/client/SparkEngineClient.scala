@@ -128,6 +128,115 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     future
   }
 
+  // ------------------------------------------------------------- D38 inline（流式取数）
+
+  override def submitInline(
+      session: EngineSession,
+      sql: String,
+      clientHandle: EngineExecutionHandle,
+      listener: SqlEngine.SubmitListener): CompletableFuture[EngineExecutionHandle] = {
+    val s = session.asInstanceOf[SparkEngineSession]
+    val request = MaterializationPlanner.inlinePlanRequest(
+      s.user, s.gatewaySessionId, sql, clientHandle.handle())
+    val future = new CompletableFuture[EngineExecutionHandle]()
+    val capture = new CancelCapture
+    val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
+      ch => SparkConnectServiceGrpc.newStub(ch),
+      s.user, s.gatewaySessionId, capture)
+    async.executePlan(request, new StreamObserver[ExecutePlanResponse] {
+      private var done = false
+      override def onNext(value: ExecutePlanResponse): Unit = synchronized {
+        if (done) return
+        val opId = value.getOperationId
+        if (opId != null && !opId.isEmpty && !future.isDone) {
+          done = true
+          try listener.onHandle(clientHandle)
+          catch { case _: Throwable => }
+          future.complete(clientHandle)
+          capture.cancel("fg: detached after operationId capture") // 提交即 detach（同 submit）
+        }
+      }
+      override def onError(t: Throwable): Unit = synchronized {
+        if (!future.isDone) future.completeExceptionally(t)
+      }
+      override def onCompleted(): Unit = synchronized {
+        if (!future.isDone) {
+          future.completeExceptionally(
+            new IllegalStateException("inline execute stream completed without operationId"))
+        }
+      }
+    })
+    future
+  }
+
+  override def attachInline(
+      session: EngineSession,
+      handle: EngineExecutionHandle,
+      lastResponseId: String,
+      consumer: SqlEngine.InlineConsumer): CompletableFuture[ExecutionOutcome] = {
+    val s = session.asInstanceOf[SparkEngineSession]
+    val future = new CompletableFuture[ExecutionOutcome]()
+    val b = ReattachExecuteRequest.newBuilder()
+      .setSessionId(s.gatewaySessionId)
+      .setUserContext(UserContext.newBuilder().setUserId(s.user))
+      .setClientType("fg-gateway")
+      .setOperationId(handle.handle())
+    if (lastResponseId != null) {
+      b.setLastResponseId(lastResponseId) // D38:断线续传游标(空=从头消费)
+    }
+    val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
+      ch => SparkConnectServiceGrpc.newStub(ch),
+      s.user, s.gatewaySessionId, new CancelCapture)
+    async.reattachExecute(b.build(), new StreamObserver[ExecutePlanResponse] {
+      override def onNext(value: ExecutePlanResponse): Unit = {
+        // 观察者绝不抛（executeCommand 同款教训：抛=grpc 吞异常伪装 CANCELLED）
+        try {
+          if (value.hasSchema && value.getSchema.hasStruct) {
+            consumer.onSchema(
+              MaterializationPlanner.toArrowSchema(value.getSchema.getStruct))
+          } else if (value.hasArrowBatch) {
+            val batch = value.getArrowBatch
+            consumer.onBatch(value.getResponseId, batch.getData.toByteArray)
+          } else if (value.hasResultComplete) {
+            consumer.onResultComplete()
+          }
+          // 其余（ObservedMetrics 等）忽略
+        } catch {
+          case t: Throwable =>
+            if (!future.isDone) {
+              future.complete(ExecutionOutcome.unknown("inline consumer failed: " + t))
+            }
+        }
+      }
+      override def onError(t: Throwable): Unit = {
+        future.complete(SparkEngineClient.classifyInlineAttachError(t))
+      }
+      override def onCompleted(): Unit = {
+        future.complete(ExecutionOutcome.completed())
+      }
+    })
+    future
+  }
+
+  override def releaseUntil(handle: EngineExecutionHandle, responseId: String): Unit = {
+    val request = ReleaseExecuteRequest.newBuilder()
+      .setUserContext(UserContext.newBuilder().setUserId("fg-gateway"))
+      .setClientType("fg-gateway")
+      .setOperationId(handle.handle())
+      .setReleaseUntil(ReleaseExecuteRequest.ReleaseUntil.newBuilder().setResponseId(responseId))
+      .build()
+    try {
+      channel
+        .unaryStub[SparkConnectServiceGrpc.SparkConnectServiceBlockingStub](
+          ch => SparkConnectServiceGrpc.newBlockingStub(ch),
+          "fg-gateway", "", 30000L)
+        .withDeadlineAfter(30, java.util.concurrent.TimeUnit.SECONDS)
+        .releaseExecute(request)
+    } catch {
+      case _: Exception => // 幂等：已释放/不存在忽略
+    }
+  }
+
   // ------------------------------------------------------------- 命令执行（D17/D18）
 
   /**
@@ -488,6 +597,33 @@ private[client] object SparkEngineClient {
    * <b>之后</b>（whenComplete 的 switch 先于 finally release）——被切流者按本分流若判
    * failed，其 casFail 撞终态行条件更新 no-op，无误迁。
    */
+  /**
+   * D38:inline 消费 attach 的错误分流(与信号 attach 的 classifyAttachError 不同——
+   * inline 错误直达客户端,INVALID_CURSOR 族是确定性失败而非 unknown):
+   *   - INVALID_CURSOR.POSITION_NOT_AVAILABLE —— 游标已释放(前向单游标协议核心错误)
+   *   - INVALID_CURSOR.POSITION_NOT_FOUND / NOT_REATTACHABLE / INVALID_CURSOR.DISCONNECTED
+   *     —— 游标非法/操作不可重挂(被抢占),均为确定性失败
+   *   - NOT_FOUND —— operation 不存在(submit 未达/已终态释放)→ unknown 交 FG 翻译 NOT_FOUND
+   *   - UNAVAILABLE/DEADLINE_EXCEEDED —— 传输,可续传 → unknown(UNKNOWN 分支带 lastAcked 提示)
+   *   - 其余 —— 引擎执行错 → failed(真实异常透传)
+   */
+  def classifyInlineAttachError(t: Throwable): ExecutionOutcome = {
+    val message = if (t == null) "" else t.toString
+    t match {
+      case e: io.grpc.StatusRuntimeException =>
+        val desc = Option(e.getStatus.getDescription).getOrElse("")
+        val full = s"${e.getStatus.getCode}: $desc"
+        if (full.contains("INVALID_CURSOR") || full.contains("NOT_REATTACHABLE")) {
+          ExecutionOutcome.failed(s"invalid cursor: $full")
+        } else if (full.contains("operation not found") || e.getStatus.getCode == io.grpc.Status.Code.NOT_FOUND) {
+          ExecutionOutcome.unknown(s"operation not found: $full")
+        } else {
+          SparkEngineClient.classifyAttachError(t) // 其余沿用 D35 分流(传输→unknown/执行→failed)
+        }
+      case _ => ExecutionOutcome.unknown(s"reattach stream closed: $t")
+    }
+  }
+
   def classifyAttachError(t: Throwable): ExecutionOutcome = {
     t match {
       case e: io.grpc.StatusRuntimeException =>

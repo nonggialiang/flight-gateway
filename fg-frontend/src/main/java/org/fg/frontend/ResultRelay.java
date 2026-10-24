@@ -16,6 +16,7 @@ import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.fg.common.config.GatewayConfig;
 import org.fg.orchestrator.QueryOrchestrator;
+import org.fg.orchestrator.SchemaSerde;
 import org.fg.orchestrator.store.OperationRow;
 import org.fg.result.manifest.ResultManifest;
 import org.fg.result.store.ObjectStoreService;
@@ -74,14 +75,15 @@ final class ResultRelay {
   }
 
   void relay(String user, Ticket ticket, ServerStreamListener listener) {
-    relay(user, ticket, listener, null);
+    relay(user, ticket, listener, null, null);
   }
 
   void relay(
       String user,
       Ticket ticket,
       ServerStreamListener listener,
-      PagingMiddleware.PageRequest paging) {
+      PagingMiddleware.PageRequest paging,
+      String lastResponseId) { // D38:INLINE 断线续传游标(null=从头)
     RelayTicket t;
     try {
       t = ticketCodec.decode(new String(ticket.getBytes(), java.nio.charset.StandardCharsets.UTF_8), user);
@@ -155,6 +157,10 @@ final class ResultRelay {
 
     if (t.kind() == TicketKind.COMMAND) {
       relayCommand(t, row, listener);
+      return;
+    }
+    if (t.kind() == TicketKind.INLINE) {
+      relayInline(t, row, listener, lastResponseId);
       return;
     }
 
@@ -380,6 +386,173 @@ final class ResultRelay {
     try (ArrowStreamReader reader = miniStream(schemaMessage, new byte[0], a)) {
       return reader.getVectorSchemaRoot().getSchema();
     }
+  }
+
+  // ------------------------------------------------------------- D38 INLINE（流式取数）
+
+  /** inline 消费互斥：同 queryId 同实例同时至多一个活跃消费（跨实例由引擎 INVALID_CURSOR 裁决）。 */
+  private final java.util.Set<String> inlineInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+  /**
+   * inline 中继：attachInline(lastResponseId) → 引擎响应流逐批转发。schema 用行上
+   * schemaBytes（AnalyzePlan 去重后，防引擎流 schema 重名列不一致）；每批
+   * {@code putNext(metadata=responseId)}（metadata 直达 FlightData.app_metadata，arrow19
+   * 实证）成功后立即 {@code releaseUntil}（前推 earliest_unreleased——断线时续传零丢失）。
+   * 断流：不迁行不释放（保留续传窗口），客户端持最后 app_metadata 重连续传；流终：
+   * casComplete + releaseAll。
+   */
+  private void relayInline(
+      RelayTicket t, OperationRow row, ServerStreamListener listener, String lastResponseId) {
+    if (!inlineInFlight.add(t.queryId())) {
+      fail(listener, CallStatus.INVALID_ARGUMENT,
+          "Inline stream already active for this query (forward-only cursor)");
+      return;
+    }
+    metrics.counter("fg.relay.streams", "kind", "INLINE").increment();
+    BufferAllocator child = allocator.newChildAllocator("fg-inline-" + t.queryId(), 0, Long.MAX_VALUE);
+    ReadyGate gate = new ReadyGate(listener);
+    try {
+      // 行终态即错误面（inline 票只服务在途消费；终态行给终态错误/空完成）
+      if (row.status().terminal()) {
+        switch (row.status()) {
+          case COMPLETED -> listener.completed(); // 已消费完的续传点：空完成（客户端已收全部）
+          case CANCELLED -> fail(listener, CallStatus.CANCELLED, "Query was cancelled");
+          default -> fail(listener, CallStatus.INTERNAL,
+              "Query failed: " + (row.error() == null ? "unknown" : row.error()));
+        }
+        return;
+      }
+
+      org.apache.arrow.vector.types.pojo.Schema schema = SchemaSerde.deserialize(row.schemaBytes());
+      VectorSchemaRoot out = VectorSchemaRoot.create(schema, child);
+      VectorLoader loader = new VectorLoader(out);
+      listener.start(out);
+      // 消费回调在 attach onNext 线程执行——装载+putNext+releaseUntil 串行（背压经 gate）
+
+      final java.util.concurrent.atomic.AtomicReference<String> lastAcked =
+          new java.util.concurrent.atomic.AtomicReference<>(lastResponseId);
+
+      org.fg.spi.SqlEngine.InlineConsumer consumer =
+          new org.fg.spi.SqlEngine.InlineConsumer() {
+            @Override
+            public void onSchema(org.apache.arrow.vector.types.pojo.Schema engineSchema) {
+              // root 已按行上 schema 建（AnalyzePlan 去重后，防引擎流重名列不一致）；
+              // 引擎流 schema 仅到达通知，不重建
+            }
+
+            @Override
+            public void onBatch(String rid, byte[] ipcStreamBytes) {
+              // Spark ArrowBatch.data = 自含 Arrow IPC stream（pyspark 同款消费方式）——
+              // 解码成 batch 后 VectorLoader 灌入输出 root（行上 schema）
+              try (ArrowStreamReader batchReader =
+                  new ArrowStreamReader(
+                      new java.io.ByteArrayInputStream(ipcStreamBytes), child)) {
+                if (!batchReader.loadNextBatch()) {
+                  throw new IllegalStateException("inline batch stream empty: " + t.queryId());
+                }
+                VectorSchemaRoot src = batchReader.getVectorSchemaRoot();
+                org.apache.arrow.vector.ipc.message.ArrowRecordBatch batch =
+                    new VectorUnloader(src).getRecordBatch();
+                try {
+                  loader.load(batch);
+                } finally {
+                  batch.close();
+                }
+              } catch (Exception e) {
+                throw new RuntimeException(e);
+              }
+              try {
+                gate.await(config.getDurationMs("fg.relay.client.readiness.timeout"), t.queryId());
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+              }
+              // metadata 盖 responseId（SPI onBatch 直参）——直达 FlightData.app_metadata（arrow19 实证）
+              org.apache.arrow.memory.ArrowBuf meta = null;
+              if (rid != null) {
+                meta = child.buffer(rid.length());
+                meta.setBytes(0, rid.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                    0, rid.length());
+                meta.writerIndex(rid.length());
+              }
+              listener.putNext(meta);
+              lastAcked.set(rid);
+              orchestrator.releaseInline(row, rid); // putNext 成功即前推（断线续传零丢失）
+            }
+
+            @Override
+            public void onResultComplete() {
+              // 流终仍以 onCompleted 为准（防御性放行）；此处仅记忆
+            }
+          };
+
+      java.util.concurrent.CompletableFuture<Void> clientGone = new java.util.concurrent.CompletableFuture<>();
+      listener.setOnCancelHandler(() -> clientGone.complete(null));
+      java.util.concurrent.CompletableFuture<org.fg.spi.ExecutionOutcome> f =
+          orchestrator.attachInline(row, lastResponseId, consumer);
+      // 注:inline 的 ArrowRecordBatch 构造在 consumer 内((rowCount, bodyBuffers) 两参形态
+      // 经 CompressionUtil 兼容——见下 onBatch 实现)
+
+      // 等待:引擎流终 or 客户端断流
+      java.util.concurrent.CompletableFuture<Object> either =
+          java.util.concurrent.CompletableFuture.anyOf(f, clientGone);
+      either.join();
+      if (clientGone.isDone() && !f.isDone()) {
+        // 客户端断流：不迁行不释放（续传窗口保留）；流留给引擎缓存,由续传或 sweeper 收尾
+        logger.info("Inline client disconnected: {} lastAcked={}", t.queryId(), lastAcked.get());
+        return;
+      }
+      org.fg.spi.ExecutionOutcome outcome = f.join();
+      switch (outcome.status()) {
+        case COMPLETED -> {
+          orchestrator.casCompleteInline(t.queryId());
+          orchestrator.releaseInlineAll(row);
+          listener.completed();
+          logger.info("Inline relay complete: {}", t.queryId());
+        }
+        case CANCELLED -> {
+          orchestrator.cancelInline(row); // casCancel + releaseAll（幂等）
+          fail(listener, CallStatus.CANCELLED, "Query was cancelled");
+        }
+        case FAILED -> {
+          orchestrator.casFailInline(t.queryId(), outcome.error());
+          orchestrator.releaseInlineAll(row);
+          CallStatus status = translateInlineError(outcome.error());
+          fail(listener, status,
+              status == CallStatus.INVALID_ARGUMENT
+                  ? "Resume cursor no longer available (data released); re-execute the query"
+                  : (outcome.error() == null ? "Inline failed" : outcome.error()));
+        }
+        case UNKNOWN -> fail(listener, CallStatus.UNAVAILABLE,
+            "Inline stream interrupted; resume with x-fg-resume-response-id: "
+                + (lastAcked.get() == null ? "(from start)" : lastAcked.get()));
+      }
+    } catch (Exception e) {
+      logger.warn("Inline relay failed for {}: {}", t.queryId(), e.toString());
+      fail(listener, CallStatus.INTERNAL, "Inline relay failed: " + e.getMessage());
+    } finally {
+      inlineInFlight.remove(t.queryId());
+      closeChildQuietly(child, "inline " + t.queryId());
+    }
+  }
+
+  /** INVALID_CURSOR 族（字节码实证的 Spark 原生错误）→ 客户端错误面。 */
+  private static CallStatus translateInlineError(String error) {
+    if (error == null) {
+      return CallStatus.INTERNAL;
+    }
+    if (error.contains("INVALID_CURSOR.POSITION_NOT_AVAILABLE")) {
+      return CallStatus.INVALID_ARGUMENT; // 游标已释放（前向单游标协议核心错误）
+    }
+    if (error.contains("POSITION_NOT_FOUND")
+        || error.contains("NOT_REATTACHABLE")
+        || error.contains("INVALID_CURSOR.DISCONNECTED")) {
+      return CallStatus.INVALID_ARGUMENT;
+    }
+    if (error.startsWith("operation not found")) {
+      return CallStatus.NOT_FOUND;
+    }
+    return CallStatus.INTERNAL; // 引擎执行错原样透传（fail 分支带 error 文本）
   }
 
   // ------------------------------------------------------------- COMMAND（D18）

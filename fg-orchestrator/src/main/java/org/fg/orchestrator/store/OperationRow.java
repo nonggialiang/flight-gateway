@@ -20,7 +20,9 @@ public final class OperationRow {
 
   public enum Mode {
     HTTPS,
-    RELAY;
+    RELAY,
+    /** D38:inline 流式——不物化,消费 DoGet 经 ReattachExecute 增量取数。 */
+    INLINE;
 
     public static Mode parse(String s) {
       return valueOf(Objects.requireNonNull(s, "mode").toUpperCase());
@@ -56,10 +58,6 @@ public final class OperationRow {
   private byte[] schemaBytes;
   private Status status;
   private String connectOperationId;
-  /** @deprecated D36：attach 租约已移除（各实例各自 attach）；列仅滚动升级期残留清理用，随 V2 删。 */
-  @Deprecated private String attachOwner;
-  /** @deprecated D36：同 {@link #attachOwner}。 */
-  @Deprecated private OffsetDateTime attachLeaseUntil;
   private String engineRef;
   private String error;
   private OffsetDateTime terminalAt;
@@ -192,24 +190,6 @@ public final class OperationRow {
     return this;
   }
 
-  public String attachOwner() {
-    return attachOwner;
-  }
-
-  public OperationRow attachOwner(String attachOwner) {
-    this.attachOwner = attachOwner;
-    return this;
-  }
-
-  public OffsetDateTime attachLeaseUntil() {
-    return attachLeaseUntil;
-  }
-
-  public OperationRow attachLeaseUntil(OffsetDateTime attachLeaseUntil) {
-    this.attachLeaseUntil = attachLeaseUntil;
-    return this;
-  }
-
   public String engineRef() {
     return engineRef;
   }
@@ -278,8 +258,6 @@ public final class OperationRow {
         && Arrays.equals(schemaBytes, that.schemaBytes)
         && status == that.status
         && Objects.equals(connectOperationId, that.connectOperationId)
-        && Objects.equals(attachOwner, that.attachOwner)
-        && Objects.equals(attachLeaseUntil, that.attachLeaseUntil)
         && Objects.equals(engineRef, that.engineRef)
         && Objects.equals(error, that.error)
         && Objects.equals(terminalAt, that.terminalAt)
@@ -290,7 +268,7 @@ public final class OperationRow {
   @Override
   public int hashCode() {
     int result = Objects.hash(queryId, sessionRef, sqlHash, user, sqlText, resultKeyPrefix, kind,
-        mode, ordered, scrollable, status, connectOperationId, attachOwner, attachLeaseUntil,
+        mode, ordered, scrollable, status, connectOperationId,
         engineRef, error, terminalAt, createdAt, updatedAt);
     return 31 * result + Arrays.hashCode(schemaBytes) + 31 * Arrays.hashCode(commandResult);
   }

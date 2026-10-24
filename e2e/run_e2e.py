@@ -619,6 +619,103 @@ def https_presign(c, sql, expect_rows, do_renew=False):
         print("[renew] PASS")
     return qid
 
+def inline_stream(c, sql, expect_rows):
+    """D38 inline 流式：注册期头 x-fg-endpoint-mode=inline → legacy GetFlightInfo 快返
+    INLINE 票 → DoGet 增量流。app_metadata 逐批盖 responseId（单调）；行数与 relay 一致。"""
+    headers = c.headers + [(b"x-fg-endpoint-mode", b"inline")]
+    opts = fl.FlightCallOptions(headers=headers, timeout=600)
+    info = c.fc.get_flight_info(command_descriptor(sql), options=opts)
+    assert info.endpoints, "inline quick-return must carry endpoint"
+    ticket_b, locations = parse_endpoint(info.endpoints[0])
+    assert ticket_b, "inline endpoint must carry ticket"
+    reader = c.do_get(fl.Ticket(ticket_b))
+    total = 0
+    last_rid = None
+    while reader.read_chunk():
+        chunk = reader.chunk
+        meta = chunk.app_metadata or b""
+        if meta:
+            rid = meta.decode()
+            assert (last_rid is None or int(rid) > int(last_rid)), \
+                f"responseId not monotonic: {last_rid} -> {rid}"
+            last_rid = rid
+        total += chunk.data.num_rows
+    assert total == expect_rows, f"inline rows {total} != {expect_rows}"
+    print(f"[inline] rows={total} lastResponseId={last_rid} PASS")
+    return ticket_b, last_rid
+
+
+def inline_resume(c, sql, expect_rows, cut_after_batches=3):
+    """D38 inline 断线续传:消费 N 批断流 → 同票 + x-fg-resume-response-id 续传 →
+    总行数衔接(无重无丢);已释放游标续传 → INVALID_ARGUMENT。"""
+    headers = c.headers + [(b"x-fg-endpoint-mode", b"inline")]
+    opts = fl.FlightCallOptions(headers=headers, timeout=600)
+    info = c.fc.get_flight_info(command_descriptor(sql), options=opts)
+    ticket_b, _ = parse_endpoint(info.endpoints[0])
+
+    # ① 首 DoGet:消费 N 批后断流(reader 不读完即弃)
+    reader = c.do_get(fl.Ticket(ticket_b))
+    got = 0
+    batches = 0
+    last_rid = None
+    while reader.read_chunk() and batches < cut_after_batches:
+        chunk = reader.chunk
+        meta = chunk.app_metadata or b""
+        if meta:
+            last_rid = meta.decode()
+        got += chunk.data.num_rows
+        batches += 1
+    reader.close()
+    print(f"[inline-resume] first segment: batches={batches} rows={got} lastRid={last_rid}")
+
+    # ② 续传:同票 + resume 头,读到尾,总行数=expect
+    resume_opts = fl.FlightCallOptions(
+        headers=c.headers + [(b"x-fg-resume-response-id", str(last_rid).encode())],
+        timeout=600)
+    reader2 = c.fc.do_get(fl.Ticket(ticket_b), options=resume_opts)
+    while reader2.read_chunk():
+        got += reader2.chunk.data.num_rows
+    assert got == expect_rows, f"resume total {got} != {expect_rows}"
+    print(f"[inline-resume] resumed to total={got} PASS")
+
+    # ③ 已释放游标:用首批的 responseId(已被 releaseUntil)续传 → INVALID_ARGUMENT
+    released_opts = fl.FlightCallOptions(
+        headers=c.headers + [(b"x-fg-resume-response-id", b"1")], timeout=600)
+    reader3 = c.fc.do_get(fl.Ticket(ticket_b), options=released_opts)
+    try:
+        while reader3.read_chunk():
+            pass
+        raise AssertionError("released cursor must error")
+    except fl.FlightUnavailableError:
+        raise AssertionError("expected INVALID_ARGUMENT, got UNAVAILABLE")
+    except fl.FlightError as e:
+        assert "cursor" in str(e).lower() or "re-execute" in str(e).lower(), \
+            f"unexpected error: {e}"
+    print("[inline-resume] released cursor rejected PASS")
+
+
+def inline_cancel(c, sql):
+    """D38 inline cancel:流中途 CancelFlightInfo → 流 CANCELLED;行 CANCELLED。"""
+    headers = c.headers + [(b"x-fg-endpoint-mode", b"inline")]
+    opts = fl.FlightCallOptions(headers=headers, timeout=600)
+    info = c.fc.get_flight_info(command_descriptor(sql), options=opts)
+    qid = info.app_metadata.decode()
+    ticket_b, _ = parse_endpoint(info.endpoints[0])
+    body = f_bytes(1, info.serialize())
+    time.sleep(2)  # 确保在途
+    results = list(c.do_action(fl.Action("CancelFlightInfo", body)))
+    assert results, "cancel returned no result"
+    reader = c.do_get(fl.Ticket(ticket_b))
+    try:
+        while reader.read_chunk():
+            pass
+        raise AssertionError("cancelled inline stream must error")
+    except fl.FlightError as e:
+        assert "cancel" in str(e).lower(), f"unexpected: {e}"
+    print("[inline-cancel] PASS")
+    return qid
+
+
 def cancel_inflight(c, sql):
     info = c.get_flight_info(command_descriptor(sql))
     qid = info.app_metadata.decode()
@@ -1208,6 +1305,12 @@ if __name__ == "__main__":
         https_presign(c, "SELECT id, id * 3 AS t FROM range(3000)", 3000, do_renew=True)
     elif which == "https-order":
         https_order_by(c)
+    elif which == "inline":
+        inline_stream(c, "SELECT id FROM range(3000)", 3000)
+    elif which == "inline-resume":
+        inline_resume(c, "SELECT a.id FROM range(200000) a JOIN range(50) b ON a.id % 50 = b.id", 200000)
+    elif which == "inline-cancel":
+        inline_cancel(c, "SELECT id FROM range(100000000)")
     elif which == "retry":
         part_retry(c)
     elif which == "backpressure":

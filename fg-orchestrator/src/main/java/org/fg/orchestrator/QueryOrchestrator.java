@@ -328,7 +328,9 @@ public class QueryOrchestrator implements Service {
 
     String queryId = explicitQueryId != null ? explicitQueryId : QueryIdHolder.newQueryId();
     String resultKeyPrefix =
-        config.getString("fg.result.prefix") + "/" + engine.type() + "/" + user + "/" + queryId;
+        mode == OperationRow.Mode.INLINE
+            ? "" // D38：inline 无物化对象（同 COMMAND 形态；reconcile 天然 no-op）
+            : config.getString("fg.result.prefix") + "/" + engine.type() + "/" + user + "/" + queryId;
     // D36：预生成 operationId 随行出生——Spark Connect 客户端可指定 operation_id（引擎按
     // UUID 规范化作执行身份），行 INSERT 起即可 attach/interrupt/release，消除"提交在途
     // opId 未知"窗口（UUID 标准形态保证引擎规范化 round-trip 无歧义）。
@@ -489,63 +491,33 @@ public class QueryOrchestrator implements Service {
     controlExecutor.submit(() -> {
       try {
         EngineSession session = openEngineSession(row);
-        try {
-          try {
-            boolean ordered = engine.isOrderSensitive(session, row.sqlText());
-            dao.setOrdered(row.queryId(), ordered);
-            row.ordered(ordered);
-          } catch (Exception e) {
-            logger.warn("Order detection failed for {}: {}", row.queryId(), e.toString());
-          }
-
-          // H4：partitions hint 裁决——顺序敏感：HTTPS 强制单对象；RELAY 禁 repartition(K) 用自然分区
-          Integer configured = null;
-          if (config.hasPath("fg.result.partitions")) {
-            configured = config.getInt("fg.result.partitions");
-          }
-          Integer partitionsHint = configured;
-          if (row.ordered()) {
-            partitionsHint = row.mode() == OperationRow.Mode.HTTPS ? 1 : null;
-          }
-
-          MaterializationSpec spec =
-              new MaterializationSpec(
-                  // s3a：Hadoop FileSystem 的实际 scheme（s3:// 无 FS 实现）
-                  "s3a://" + objects.bucket() + "/" + row.resultKeyPrefix() + "/",
-                  config.getString("fg.result.compression"),
-                  config.getInt("fg.result.batch.max.records"),
-                  partitionsHint);
-
-          // D36：预生成句柄随请求下发（行 INSERT 已带）；回显校验在 engine 侧（不一致仅 warn）。
-          EngineExecutionHandle clientHandle =
-              EngineExecutionHandle.parse(row.connectOperationId());
-          CompletableFuture<EngineExecutionHandle> submitted =
-              engine.submit(
-                  session,
-                  row.sqlText(),
-                  spec,
-                  clientHandle,
-                  handle -> {
-                    // 行已带同值 opId；此写为幂等兜底（滚动升级期旧版本行/异常路径）。
-                    try {
-                      dao.setOperationId(row.queryId(), handle.encode());
-                    } catch (Exception e) {
-                      logger.error("Failed to persist operationId for {}", row.queryId(), e);
-                    }
-                  });
-          submitted.whenComplete(
-              (handle, err) -> {
-                try {
-                  if (err != null) {
-                    dao.casFail(row.queryId(), "submit failed: " + err);
-                  }
-                } catch (Exception e) {
-                  logger.error("Failed to mark {} failed", row.queryId(), e);
+        // D38：inline 分叉——裸 SQL 关系 + reattachable，无物化规划（order/partitions/spec 全跳过）
+        EngineExecutionHandle clientHandle =
+            EngineExecutionHandle.parse(row.connectOperationId());
+        CompletableFuture<EngineExecutionHandle> submitted =
+            row.mode() == OperationRow.Mode.INLINE
+                ? engine.submitInline(
+                    session,
+                    row.sqlText(),
+                    clientHandle,
+                    handle -> {
+                      try {
+                        dao.setOperationId(row.queryId(), handle.encode());
+                      } catch (Exception e) {
+                        logger.error("Failed to persist operationId for {}", row.queryId(), e);
+                      }
+                    })
+                : submitMaterialized(session, row, clientHandle);
+        submitted.whenComplete(
+            (handle, err) -> {
+              try {
+                if (err != null) {
+                  dao.casFail(row.queryId(), "submit failed: " + err);
                 }
-              });
-        } finally {
-          // 触发实例提交后即无状态；engine session 缓存策略后续按需增强
-        }
+              } catch (Exception e) {
+                logger.error("Failed to mark {} failed", row.queryId(), e);
+              }
+            });
       } catch (Exception e) {
         logger.error("Trigger failed for {}", row.queryId(), e);
         try {
@@ -555,6 +527,53 @@ public class QueryOrchestrator implements Service {
         }
       }
     });
+  }
+
+  private CompletableFuture<EngineExecutionHandle> submitMaterialized(
+      EngineSession session, OperationRow row, EngineExecutionHandle clientHandle) throws Exception {
+    try {
+      try {
+        boolean ordered = engine.isOrderSensitive(session, row.sqlText());
+        dao.setOrdered(row.queryId(), ordered);
+        row.ordered(ordered);
+      } catch (Exception e) {
+        logger.warn("Order detection failed for {}: {}", row.queryId(), e.toString());
+      }
+
+      // H4：partitions hint 裁决——顺序敏感：HTTPS 强制单对象；RELAY 禁 repartition(K) 用自然分区
+      Integer configured = null;
+      if (config.hasPath("fg.result.partitions")) {
+        configured = config.getInt("fg.result.partitions");
+      }
+      Integer partitionsHint = configured;
+      if (row.ordered()) {
+        partitionsHint = row.mode() == OperationRow.Mode.HTTPS ? 1 : null;
+      }
+
+      MaterializationSpec spec =
+          new MaterializationSpec(
+              // s3a：Hadoop FileSystem 的实际 scheme（s3:// 无 FS 实现）
+              "s3a://" + objects.bucket() + "/" + row.resultKeyPrefix() + "/",
+              config.getString("fg.result.compression"),
+              config.getInt("fg.result.batch.max.records"),
+              partitionsHint);
+
+      return engine.submit(
+          session,
+          row.sqlText(),
+          spec,
+          clientHandle,
+          handle -> {
+            // 行已带同值 opId；此写为幂等兜底（滚动升级期旧版本行/异常路径）。
+            try {
+              dao.setOperationId(row.queryId(), handle.encode());
+            } catch (Exception e) {
+              logger.error("Failed to persist operationId for {}", row.queryId(), e);
+            }
+          });
+    } finally {
+      // 触发实例提交后即无状态；engine session 缓存策略后续按需增强
+    }
   }
 
   private EngineSession openEngineSession(OperationRow row) throws Exception {
@@ -682,8 +701,9 @@ public class QueryOrchestrator implements Service {
   }
 
   private PollOutcome terminalOutcome(OperationRow row) {
-    if (row.kind() == OperationRow.Kind.COMMAND) {
-      // D18：命令结果内联行内（command_result），无 manifest——跳过 readManifest
+    if (row.kind() == OperationRow.Kind.COMMAND
+        || row.mode() == OperationRow.Mode.INLINE) {
+      // D18 命令结果内联行内；D38 inline 无物化对象——均跳过 readManifest
       return new PollOutcome(true, row, null);
     }
     if (row.status() == OperationRow.Status.COMPLETED) {
@@ -706,6 +726,9 @@ public class QueryOrchestrator implements Service {
   private void maybeAttach(OperationRow row) {
     if (row.kind() == OperationRow.Kind.COMMAND) {
       return; // D18：命令由触发实例持流至终态，无 attach 语义（也无 manifest 可对账）
+    }
+    if (row.mode() == OperationRow.Mode.INLINE) {
+      return; // D38：inline 由消费 DoGet 独占 attach（空消费 attach 会拖走 arrow_batch，正确性危害）
     }
     Long notBefore = attachRetryNotBefore.get(row.queryId());
     if (notBefore != null) {
@@ -833,6 +856,60 @@ public class QueryOrchestrator implements Service {
     }
   }
 
+  // ------------------------------------------------------------- D38 inline 消费/释放封装
+
+  /** inline 消费 attach（ResultRelay 专用；不经 maybeAttach——inline 由消费 DoGet 独占）。 */
+  public CompletableFuture<ExecutionOutcome> attachInline(
+      OperationRow row, String lastResponseId, SqlEngine.InlineConsumer consumer)
+      throws Exception {
+    EngineSession session = openEngineSession(row);
+    return engine.attachInline(
+        session, EngineExecutionHandle.parse(row.connectOperationId()), lastResponseId, consumer);
+  }
+
+  /** inline 前向单游标释放（消费 DoGet 逐批调用；幂等）。 */
+  public void releaseInline(OperationRow row, String responseId) {
+    try {
+      engine.releaseUntil(EngineExecutionHandle.parse(row.connectOperationId()), responseId);
+    } catch (Exception e) {
+      logger.debug("Inline releaseUntil failed for {}: {}", row.queryId(), e.toString());
+    }
+  }
+
+  /** inline 终态全量释放（COMPLETED/CANCELLED/sweeper 兜底；幂等）。 */
+  public void releaseInlineAll(OperationRow row) {
+    try {
+      engine.releaseExecution(EngineExecutionHandle.parse(row.connectOperationId()));
+    } catch (Exception e) {
+      logger.debug("Inline releaseAll failed for {}: {}", row.queryId(), e.toString());
+    }
+  }
+
+  /** inline 终态 CAS：消费 DoGet 观测流终后迁行（与 attach 信号 CAS 竞争时条件更新幂等）。 */
+  public boolean casCompleteInline(String queryId) throws Exception {
+    return dao.casComplete(queryId);
+  }
+
+  /** inline 失败迁行（消费 DoGet 观测 FAILED）。 */
+  public void casFailInline(String queryId, String error) {
+    try {
+      dao.casFail(queryId, error == null ? "inline failed" : error);
+    } catch (Exception e) {
+      logger.error("Inline casFail failed for {}", queryId, e);
+    }
+  }
+
+  /** inline 取消迁行 + 释放（消费 DoGet 观测 CANCELLED）。 */
+  public void cancelInline(OperationRow row) {
+    try {
+      if (dao.casCancel(row.queryId())) {
+        releaseInlineAll(row);
+      }
+    } catch (Exception e) {
+      logger.error("Inline cancel failed for {}", row.queryId(), e);
+    }
+  }
+
   // ------------------------------------------------------------- 取消
 
   /**
@@ -863,6 +940,9 @@ public class QueryOrchestrator implements Service {
         return CancelOutcome.UNSPECIFIED;
       }
       boolean migrated = dao.casCancel(queryId);
+      if (migrated && row.mode() == OperationRow.Mode.INLINE) {
+        releaseInlineAll(row); // D38：释放引擎侧缓存（幂等，任意实例可发）
+      }
       return migrated ? CancelOutcome.CANCELLED : CancelOutcome.NOT_CANCELLABLE;
     } catch (Exception e) {
       logger.error("Cancel failed for {}", queryId, e);

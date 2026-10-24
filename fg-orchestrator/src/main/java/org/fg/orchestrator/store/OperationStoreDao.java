@@ -22,8 +22,7 @@ import org.fg.common.service.Service;
  *   <li>行迁移 CAS：UPDATE ... WHERE query_id=? AND status='RUNNING'——完成/取消双写者互斥。
  * </ul>
  *
- * <p>D36：attach 租约仲裁已移除（每网关实例各自 attach，attach_owner 列仅作滚动升级期旧实例
- * 残留清理的过渡——casTerminal 顺带置 NULL，列本身随 V2 删除）。
+ * <p>D36：attach 租约仲裁已移除;D38/V2 起 attach_owner/attach_lease_until 两列已删除。
  */
 public class OperationStoreDao implements Service {
 
@@ -158,7 +157,7 @@ public class OperationStoreDao implements Service {
     boolean won =
         update(
             "UPDATE fg_operation SET status = 'COMPLETED', schema_bytes = ?, command_result = ?,"
-                + " terminal_at = now(), updated_at = now(), attach_owner = NULL, attach_lease_until = NULL"
+                + " terminal_at = now(), updated_at = now()"
                 + " WHERE query_id = ? AND status = 'RUNNING'",
             ps -> {
               ps.setBytes(1, schemaBytes);
@@ -248,12 +247,9 @@ public class OperationStoreDao implements Service {
   }
 
   private boolean casTerminal(String queryId, String status, String error) throws SQLException {
-    // D36：清列子句保留——滚动升级期旧实例仍写 attach_owner，终态顺带清掉防观测僵尸；
-    // 列本身随 V2 删除（届时去掉本子句）。
     boolean won =
         update(
-            "UPDATE fg_operation SET status = ?, error = ?, terminal_at = now(), updated_at = now(),"
-                + " attach_owner = NULL, attach_lease_until = NULL"
+            "UPDATE fg_operation SET status = ?, error = ?, terminal_at = now(), updated_at = now()"
                 + " WHERE query_id = ? AND status = 'RUNNING'",
             ps -> {
               ps.setString(1, status);
@@ -344,8 +340,6 @@ public class OperationStoreDao implements Service {
         .schemaBytes(rs.getBytes("schema_bytes"))
         .status(OperationRow.Status.valueOf(rs.getString("status")))
         .connectOperationId(rs.getString("connect_operation_id"))
-        .attachOwner(rs.getString("attach_owner"))
-        .attachLeaseUntil(rs.getObject("attach_lease_until", OffsetDateTime.class))
         .engineRef(rs.getString("engine_ref"))
         .error(rs.getString("error"))
         .terminalAt(rs.getObject("terminal_at", OffsetDateTime.class))

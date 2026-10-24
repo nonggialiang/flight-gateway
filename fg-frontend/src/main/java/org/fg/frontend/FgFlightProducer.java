@@ -130,10 +130,11 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   private FlightInfo registerAndQuickReturn(
       String sql, FlightProducer.CallContext context, FlightDescriptor descriptor)
       throws Exception {
+    boolean[] scrollCarrier = new boolean[1];
     QueryOrchestrator.Registration reg =
         orchestrator.register(
-            sessionRef(context), user(context), sql, negotiateMode(context),
-            scrollRequested(context), requestedQueryId(context));
+            sessionRef(context), user(context), sql, negotiateMode(context, scrollCarrier),
+            scrollCarrier[0], requestedQueryId(context));
     OperationRow row = reg.row();
     return flightInfo(
         schemaOf(row.schemaBytes()),
@@ -141,7 +142,9 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
         List.of(
             row.kind() == OperationRow.Kind.COMMAND
                 ? endpoints.commandEndpoint(row)
-                : endpoints.streamEndpoint(row)),
+                : row.mode() == OperationRow.Mode.INLINE
+                    ? endpoints.inlineEndpoint(row) // D38:inline 流式票(DoGet 增量取数)
+                    : endpoints.streamEndpoint(row)),
         -1L,
         -1L,
         false,
@@ -172,13 +175,41 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
 
       // ① 幂等注册 + 触发（首个 poll 触发；后续 poll 同 fingerprint 命中在途/终态行；
       //    D28 x-fg-query-id 显式续传：poll 循环期间行 RUNNING，同 id 每次命中①收敛）
+      boolean[] scrollCarrier = new boolean[1];
       QueryOrchestrator.Registration reg =
           orchestrator.register(
-              sessionRef(context), user(context), sql, negotiateMode(context),
-              scrollRequested(context), requestedQueryId(context));
+              sessionRef(context), user(context), sql, negotiateMode(context, scrollCarrier),
+              scrollCarrier[0], requestedQueryId(context));
       OperationRow row = reg.row();
       LOGGER.debug("pollFlightInfo: registered queryId={} isNew={} status={}",
           row.queryId(), reg.newlyTriggered(), row.status());
+
+      // D38:inline 短路——终态由消费 DoGet 观测 result_complete 后 CAS,poll 无长等待语义
+      // (无 attach future 可等:maybeAttach 对 inline 排除)。RUNNING 即刻 done 携 INLINE 票
+      // (与 legacy 快返同构,poll 客户端首响应拿票后统一走 DoGet 增量取数);终态同现有分支。
+      if (row.mode() == OperationRow.Mode.INLINE && row.kind() == OperationRow.Kind.QUERY) {
+        if (row.status() == OperationRow.Status.RUNNING) {
+          return new PollInfo(
+              flightInfo(
+                  schemaOf(row), descriptor,
+                  List.of(endpoints.inlineEndpoint(row)), -1L, -1L, false, row.queryId()),
+              null, null, null); // descriptor unset → done:消费经 DoGet,不再 poll
+        }
+        switch (row.status()) {
+          case FAILED -> throw internal(
+              "Query failed: " + (row.error() == null ? "unknown" : row.error()));
+          case CANCELLED -> throw CallStatus.CANCELLED
+              .withDescription("Query was cancelled").toRuntimeException();
+          case COMPLETED -> {
+            return new PollInfo(
+                flightInfo(
+                    schemaOf(row), descriptor,
+                    List.of(endpoints.inlineEndpoint(row)), -1L, -1L, false, row.queryId()),
+                null, null, null);
+          }
+          default -> { }
+        }
+      }
 
       // ②…长等待（D36：行级 deadline = created_at + fg.query.timeout，挂到查询生死——
       // 与 sweeper 同值同时到点，客户端零续期；内部等 attach future，毫秒级唤醒）
@@ -291,8 +322,12 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     // 经 PagingMiddleware 捕获后随票下发——STREAM 票 + 页头 = scroll 页切片
     PagingMiddleware paging = context.getMiddleware(PagingMiddleware.KEY);
     PagingMiddleware.PageRequest page = paging == null ? null : paging.request();
-    LOGGER.debug("getStream: HMAC relay ticket, paging={}", page == null ? "none" : page);
-    relayExecutor.execute(() -> relay.relay(context.peerIdentity(), ticket, listener, page));
+    ResumeMiddleware resume = context.getMiddleware(ResumeMiddleware.KEY);
+    String lastResponseId = resume == null ? null : resume.resumeResponseId();
+    LOGGER.debug("getStream: HMAC relay ticket, paging={}, resume={}",
+        page == null ? "none" : page, lastResponseId == null ? "none" : lastResponseId);
+    relayExecutor.execute(
+        () -> relay.relay(context.peerIdentity(), ticket, listener, page, lastResponseId));
   }
 
   // ------------------- SqlInfo（JDBC DatabaseMetaData 最小面，设计 7.4；SqlInfoBuilder 照 Dremio 范式）
@@ -1018,27 +1053,46 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
   }
 
   /**
-   * D15 endpoint 模式协商（注册时生效、随即落行，后续同指纹 RPC 按行构造不再受头影响）：
-   * 客户端请求头 {@code x-fg-endpoint-mode}（{@code https|relay}，大小写不敏感，经
-   * {@link EndpointModeMiddleware} 捕获）优先；未携带/非法值回退服务端配置
-   * {@code fg.result.endpoint.mode}（默认 relay）。session option 通道归 M3。
+   * D38 四值线上协议归一化（头 {@code x-fg-endpoint-mode}：
+   * {@code relay-forward|relay-scroll|https|inline}，大小写不敏感；兼容旧值 {@code relay}
+   * ——按 scroll 头二分为 relay-forward/relay-scroll，已部署 fork 驱动零破坏）。
+   *
+   * <p>优先级链（D27 延续）：scroll 声明（头或显式 relay-scroll 值）强制 RELAY+scrollable
+   * &gt; 显式头值 &gt; 配置 {@code fg.result.endpoint.mode}。存储三值（RELAY/HTTPS/INLINE）
+   * + scrollable 标志，四行为可推导。非法头值不阻断，回退配置默认。inline+scroll 冲突时
+   * scroll 胜（inline 前向单游标与随机翻页语义互斥）。
+   *
+   * @param scrollOut 单元素载体：归一化后的 scrollable（覆盖 scrollRequested 直读，使
+   *                  {@code relay-scroll} 显式头生效）
    */
-  private OperationRow.Mode negotiateMode(FlightProducer.CallContext context) {
-    // D27 优先级链：scroll 强制 RELAY > x-fg-endpoint-mode > fg.result.endpoint.mode
-    if (scrollRequested(context)) {
-      return OperationRow.Mode.RELAY;
-    }
+  private OperationRow.Mode negotiateMode(
+      FlightProducer.CallContext context, boolean[] scrollOut) {
+    boolean scroll = scrollRequested(context);
     EndpointModeMiddleware negotiated = context.getMiddleware(EndpointModeMiddleware.KEY);
-    if (negotiated != null && negotiated.requestedMode() != null) {
-      String requested = negotiated.requestedMode().trim();
-      for (OperationRow.Mode mode : OperationRow.Mode.values()) {
-        if (mode.name().equalsIgnoreCase(requested)) {
-          return mode;
+    String requested =
+        negotiated != null && negotiated.requestedMode() != null
+            ? negotiated.requestedMode().trim().toLowerCase()
+            : null;
+    if (requested != null) {
+      switch (requested) {
+        case "relay-scroll" -> scroll = true; // 显式写法
+        case "relay", "relay-forward" -> { /* 旧值/显式 forward：scrollable 全凭 scroll 头 */ }
+        case "https", "inline" -> {
+          if (!scroll) {
+            scrollOut[0] = false;
+            return OperationRow.Mode.parse(requested);
+          }
+          // scroll 胜：https/inline + scroll → RELAY+scrollable（与 D27 现行一致）
+          scrollOut[0] = true;
+          return OperationRow.Mode.RELAY;
         }
+        default -> { /* 非法值不阻断 */ }
       }
-      // 非法值不阻断：回退配置默认
     }
-    return OperationRow.Mode.parse(config.getString("fg.result.endpoint.mode"));
+    scrollOut[0] = scroll;
+    return scroll
+        ? OperationRow.Mode.RELAY
+        : OperationRow.Mode.parse(config.getString("fg.result.endpoint.mode"));
   }
 
   /** D27：本 RPC 是否声明 scroll（经 ScrollModeMiddleware 捕获；注册时读取并落行）。 */
