@@ -112,6 +112,21 @@ final class ResultRelay {
     //     RUNNING 即 UNAVAILABLE，不占 relay 池长挂。
     // D37：客户端断流经 setOnCancelHandler → cancelSignal 参与 poll 的 anyOf 等待——
     // 断流毫秒级释放有界 relay 池线程（不再依赖轮询粒度）。
+    // D38:inline 分发必须在 poll 之前——终态由消费 DoGet 观测,poll 等终态=死锁。
+    // pollOnce 只查行不等待(RUNNING 也可开始消费);终态行为 relayInline 内部处理
+    if (t.kind() == TicketKind.INLINE) {
+      try {
+        // pollOnce 查行不等待;not-done(row=null,RUNNING)时直接查行——RUNNING 即开始消费
+        QueryOrchestrator.PollOutcome out = orchestrator.pollOnce(t.queryId());
+        org.fg.orchestrator.store.OperationRow inlineRow =
+            out.done() ? out.row() : orchestrator.getRow(t.queryId());
+        relayInline(t, inlineRow, listener, lastResponseId);
+      } catch (Exception e) {
+        fail(listener, CallStatus.INTERNAL, "Inline poll failed: " + e.getMessage());
+      }
+      return;
+    }
+
     boolean zeroWait = t.kind() == TicketKind.PART || paged;
     QueryOrchestrator.PollOutcome outcome;
     if (zeroWait) {
@@ -159,11 +174,6 @@ final class ResultRelay {
       relayCommand(t, row, listener);
       return;
     }
-    if (t.kind() == TicketKind.INLINE) {
-      relayInline(t, row, listener, lastResponseId);
-      return;
-    }
-
     ResultManifest manifest = outcome.manifest();
     if (manifest == null) {
       fail(listener, CallStatus.INTERNAL, "Manifest missing for completed query");
@@ -411,6 +421,7 @@ final class ResultRelay {
     metrics.counter("fg.relay.streams", "kind", "INLINE").increment();
     BufferAllocator child = allocator.newChildAllocator("fg-inline-" + t.queryId(), 0, Long.MAX_VALUE);
     ReadyGate gate = new ReadyGate(listener);
+    VectorSchemaRoot out = null; // D38 泄漏修复:finally 必须关(out 的向量持 child 内存)
     try {
       // 行终态即错误面（inline 票只服务在途消费；终态行给终态错误/空完成）
       if (row.status().terminal()) {
@@ -424,7 +435,7 @@ final class ResultRelay {
       }
 
       org.apache.arrow.vector.types.pojo.Schema schema = SchemaSerde.deserialize(row.schemaBytes());
-      VectorSchemaRoot out = VectorSchemaRoot.create(schema, child);
+      out = VectorSchemaRoot.create(schema, child);
       VectorLoader loader = new VectorLoader(out);
       listener.start(out);
       // 消费回调在 attach onNext 线程执行——装载+putNext+releaseUntil 串行（背压经 gate）
@@ -532,6 +543,13 @@ final class ResultRelay {
       fail(listener, CallStatus.INTERNAL, "Inline relay failed: " + e.getMessage());
     } finally {
       inlineInFlight.remove(t.queryId());
+      if (out != null) {
+        try {
+          out.close();
+        } catch (Exception e) {
+          logger.debug("Inline out close failed for {}: {}", t.queryId(), e.toString());
+        }
+      }
       closeChildQuietly(child, "inline " + t.queryId());
     }
   }

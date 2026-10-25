@@ -627,18 +627,25 @@ private[client] object SparkEngineClient {
   def classifyAttachError(t: Throwable): ExecutionOutcome = {
     t match {
       case e: io.grpc.StatusRuntimeException =>
-        e.getStatus.getCode match {
-          case io.grpc.Status.Code.CANCELLED =>
-            ExecutionOutcome.cancelled()
-          case io.grpc.Status.Code.UNAVAILABLE | io.grpc.Status.Code.DEADLINE_EXCEEDED =>
-            ExecutionOutcome.unknown(
-              s"reattach transport error: ${e.getStatus.getCode}: ${e.getStatus.getDescription}")
-          case io.grpc.Status.Code.NOT_FOUND | io.grpc.Status.Code.INVALID_ARGUMENT =>
-            ExecutionOutcome.unknown(
-              s"operation not found: ${e.getStatus.getCode}: ${e.getStatus.getDescription}")
-          case code =>
-            ExecutionOutcome.failed(
-              s"engine execution failed: $code: ${e.getStatus.getDescription}")
+        val desc = Option(e.getStatus.getDescription).getOrElse("")
+        // Spark 包装:OPERATION_NOT_FOUND 以 INTERNAL gRPC status + SparkSQLException 文本
+        // 送达——必须检查错误文本而非仅 status code(e2e 实证踩坑)
+        if (desc.contains("OPERATION_NOT_FOUND") || desc.contains("operation not found")) {
+          ExecutionOutcome.unknown(s"operation not found: ${e.getStatus.getCode}: $desc")
+        } else {
+          e.getStatus.getCode match {
+            case io.grpc.Status.Code.CANCELLED =>
+              ExecutionOutcome.cancelled()
+            case io.grpc.Status.Code.UNAVAILABLE | io.grpc.Status.Code.DEADLINE_EXCEEDED =>
+              ExecutionOutcome.unknown(
+                s"reattach transport error: ${e.getStatus.getCode}: $desc")
+            case io.grpc.Status.Code.NOT_FOUND | io.grpc.Status.Code.INVALID_ARGUMENT =>
+              ExecutionOutcome.unknown(
+                s"operation not found: ${e.getStatus.getCode}: $desc")
+            case code =>
+              ExecutionOutcome.failed(
+                s"engine execution failed: $code: $desc")
+          }
         }
       case _ =>
         ExecutionOutcome.unknown(s"reattach stream closed: $t")

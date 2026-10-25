@@ -856,6 +856,12 @@ public class QueryOrchestrator implements Service {
     }
   }
 
+  /** D38:直查行(INLINE DoGet 分发用——pollOnce not-done 时仍需行对象开始消费)。 */
+  public OperationRow getRow(String queryId) throws Exception {
+    return dao.get(queryId).orElseThrow(
+        () -> new IllegalArgumentException("Unknown query: " + queryId));
+  }
+
   // ------------------------------------------------------------- D38 inline 消费/释放封装
 
   /** inline 消费 attach（ResultRelay 专用；不经 maybeAttach——inline 由消费 DoGet 独占）。 */
