@@ -539,7 +539,10 @@ final class ResultRelay {
                 + (lastAcked.get() == null ? "(from start)" : lastAcked.get()));
       }
     } catch (Exception e) {
-      logger.warn("Inline relay failed for {}: {}", t.queryId(), e.toString());
+      // D39b 排障：带完整堆栈——此前仅 e.toString() 吞掉了服务端栈，"Not started" 类
+      // gRPC 守卫异常无法定位触发点（classpath 字节扫描：grpc-core ClientCallImpl 的
+      // request/halfClose/sendMessage pre-start 守卫）
+      logger.warn("Inline relay failed for {}", t.queryId(), e);
       fail(listener, CallStatus.INTERNAL, "Inline relay failed: " + e.getMessage());
     } finally {
       inlineInFlight.remove(t.queryId());
