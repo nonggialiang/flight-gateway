@@ -246,11 +246,15 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     // D39b 排障修复：无界初始需求——依赖 ClientCalls 逐条 request(1) 的自动流量控制时，
     // 服务端连发（重放缓冲恰好是连发形态）会丢消息（实测：连发 4 条丢第 2 条）。
     // 背压已由 relayInline 的 ReadyGate 在消费端实施，此处取尽流。
+    // 正确契约（grpc 1.79 字节码实证）：beforeStart 阶段调 request() 直通
+    // ClientCallImpl.request 的 pre-start 守卫 → ISE("Not started")（现网栈实证）；
+    // pre-start 设置初始需求的唯一合法 API 是 disableAutoRequestWithInitial——
+    // start 时刻一次性发出该数量的消息需求。
     val consumerObserver =
       new io.grpc.stub.ClientResponseObserver[ReattachExecuteRequest, ExecutePlanResponse] {
         override def beforeStart(
             requestStream: io.grpc.stub.ClientCallStreamObserver[ReattachExecuteRequest]): Unit =
-          requestStream.request(Int.MaxValue)
+          requestStream.disableAutoRequestWithInitial(Integer.MAX_VALUE)
         override def onNext(value: ExecutePlanResponse): Unit = delegate.onNext(value)
         override def onError(t: Throwable): Unit = delegate.onError(t)
         override def onCompleted(): Unit = delegate.onCompleted()
