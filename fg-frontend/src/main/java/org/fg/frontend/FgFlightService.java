@@ -75,7 +75,6 @@ public final class FgFlightService implements Service {
             .middleware(QueryIdMiddleware.KEY, new QueryIdMiddleware.Factory())
             // D27 页头：DoGet 时捕获 x-fg-page-offset/limit（STREAM 票页切片）
             .middleware(PagingMiddleware.KEY, new PagingMiddleware.Factory())
-            .middleware(ResumeMiddleware.KEY, new ResumeMiddleware.Factory()) // D38 resume 游标
             // RPC 级调试日志（每个 RPC 一行 DEBUG：方法/peer/session/fg 头——调用顺序分析用）
             .middleware(RpcTraceMiddleware.KEY, new RpcTraceMiddleware.Factory())
             // D20 会话身份（fg-p2 严格模式）：服务端零铸造，身份一律客户端携带——

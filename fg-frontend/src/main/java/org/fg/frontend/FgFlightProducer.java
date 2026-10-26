@@ -322,12 +322,9 @@ final class FgFlightProducer extends NoOpFlightSqlProducer {
     // 经 PagingMiddleware 捕获后随票下发——STREAM 票 + 页头 = scroll 页切片
     PagingMiddleware paging = context.getMiddleware(PagingMiddleware.KEY);
     PagingMiddleware.PageRequest page = paging == null ? null : paging.request();
-    ResumeMiddleware resume = context.getMiddleware(ResumeMiddleware.KEY);
-    String lastResponseId = resume == null ? null : resume.resumeResponseId();
-    LOGGER.debug("getStream: HMAC relay ticket, paging={}, resume={}",
-        page == null ? "none" : page, lastResponseId == null ? "none" : lastResponseId);
+    LOGGER.debug("getStream: HMAC relay ticket, paging={}", page == null ? "none" : page);
     relayExecutor.execute(
-        () -> relay.relay(context.peerIdentity(), ticket, listener, page, lastResponseId));
+        () -> relay.relay(context.peerIdentity(), ticket, listener, page));
   }
 
   // ------------------- SqlInfo（JDBC DatabaseMetaData 最小面，设计 7.4；SqlInfoBuilder 照 Dremio 范式）

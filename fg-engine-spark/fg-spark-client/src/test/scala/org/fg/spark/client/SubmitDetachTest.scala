@@ -13,14 +13,11 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * D39 后补回归：提交即 detach 必须真实生效——submit/submitInline 首响应（operationId 回显）
- * 后，引擎侧应观测到客户端 cancel。原 CancelCapture 拦截器捕获式 cancel 是 no-op（grpc 在
- * 拦截器 start() 时 delegate 为 ClientCallImpl，非 ClientCallStreamObserver——断点实证
- * observer=null），inline 的 reattach 消费者因此只拿到缓冲重放（schema）后饿死：活消息全部
- * 流向未取消的 submit 流，客户端 ~120s 超时 0 行。
- *
- * <p>假引擎：executePlan 发一条带 operationId 的响应后挂住不 complete——客户端 detach（cancel）
- * 由 onCancelHandler 观测；修复前 cancel 永不到达（用例超时失败），修复后毫秒级到达。
+ * D39b/D40 回归：
+ * ① 物化 submit 的"提交即 detach"真实生效（CancelCapture no-op 事故回归）；
+ * ② inline submitInline = 非 reattachable 挂流直消——请求不带 ReattachOptions、流保持
+ *    打开（服务端不观测 cancel）、首响应（opId+schema）即 submitted 信号、消费端
+ *    requestMore 逐条拉取（手动流控），流终 outcome=COMPLETED。
  */
 class SubmitDetachTest {
 
@@ -42,8 +39,10 @@ class SubmitDetachTest {
           ExecutePlanResponse.newBuilder()
             .setResponseId("r-1")
             .setOperationId(request.getOperationId)
+            .setSchema(org.apache.spark.connect.proto.DataType.newBuilder()
+              .setStruct(org.apache.spark.connect.proto.DataType.Struct.newBuilder()))
             .build())
-        // 刻意不继续发送也不 complete：流必须由客户端 detach（cancel）收口
+        // 刻意不继续发送也不 complete：物化 submit 须由客户端 detach（cancel）收口
       }
     }
     server = NettyServerBuilder.forPort(0).addService(service).build().start()
@@ -58,74 +57,10 @@ class SubmitDetachTest {
     server.awaitTermination(5, TimeUnit.SECONDS)
   }
 
-  /** D39b 排障延伸：验证我们的 reattach 消费端能完整接收多消息流（排除 grpc 客户端
-    * 只 request(1) 不续读的可能——那也会表现成"恰好一条消息后静默"）。假 reattach 连发
-    * schema + 2×batch + result_complete，InlineConsumer 必须全部收到。 */
-  @Test
-  def attachInlineConsumesMultiMessageReplay(): Unit = {
-    val schemaPayload = org.apache.spark.connect.proto.ExecutePlanResponse.newBuilder()
-      .setResponseId("r-1")
-      .setOperationId("op-multi")
-      .setSchema(org.apache.spark.connect.proto.DataType.newBuilder()
-        .setStruct(org.apache.spark.connect.proto.DataType.Struct.newBuilder()))
-      .build()
-    val service = new SparkConnectServiceGrpc.SparkConnectServiceImplBase {
-      override def reattachExecute(
-          request: org.apache.spark.connect.proto.ReattachExecuteRequest,
-          observer: StreamObserver[ExecutePlanResponse]): Unit = {
-        val batchProto = org.apache.spark.connect.proto.ExecutePlanResponse.newBuilder()
-          .setResponseId("r-2")
-          .setArrowBatch(
-            org.apache.spark.connect.proto.ExecutePlanResponse.ArrowBatch.newBuilder()
-              .setRowCount(1)
-              .setData(com.google.protobuf.ByteString.copyFromUtf8("fake-ipc")))
-          .build()
-        // 连发（重放缓冲的真实形态——修复前实测丢第 2 条）
-        observer.onNext(schemaPayload)
-        observer.onNext(batchProto.toBuilder().setResponseId("r-2").build())
-        observer.onNext(batchProto.toBuilder().setResponseId("r-3").build())
-        observer.onNext(org.apache.spark.connect.proto.ExecutePlanResponse.newBuilder()
-          .setResponseId("r-4")
-          .setResultComplete(
-            org.apache.spark.connect.proto.ExecutePlanResponse.ResultComplete.getDefaultInstance)
-          .build())
-        observer.onCompleted()
-      }
-    }
-    val srv = NettyServerBuilder.forPort(0).addService(service).build().start()
-    val eng = new SparkEngineClient(GatewayConfig.create(), s"sc://localhost:${srv.getPort}", 0)
-    try {
-      val schemas = new java.util.concurrent.atomic.AtomicInteger()
-      val batches = java.util.Collections.synchronizedList(new java.util.ArrayList[String]())
-      val completes = new java.util.concurrent.atomic.AtomicInteger()
-      val outcome = eng
-        .attachInline(
-          eng.openSession(new GatewaySession("s-1", "alice")),
-          new EngineExecutionHandle("spark", "op-multi"),
-          null,
-          new org.fg.spi.SqlEngine.InlineConsumer {
-            override def onSchema(s: org.apache.arrow.vector.types.pojo.Schema): Unit =
-              schemas.incrementAndGet()
-            override def onBatch(responseId: String, ipcStreamBytes: Array[Byte]): Unit =
-              batches.add(responseId)
-            override def onResultComplete(): Unit = completes.incrementAndGet()
-          })
-        .get(5, TimeUnit.SECONDS)
-      Assertions.assertEquals(1, schemas.get, "onSchema 应恰好一次")
-      Assertions.assertEquals(java.util.Arrays.asList("r-2", "r-3"), batches, "两批应全量到达")
-      Assertions.assertEquals(1, completes.get, "onResultComplete 应恰好一次")
-      Assertions.assertEquals(org.fg.spi.ExecutionOutcome.OutcomeStatus.COMPLETED, outcome.status())
-    } finally {
-      eng.close()
-      srv.shutdownNow()
-      srv.awaitTermination(5, TimeUnit.SECONDS)
-    }
-  }
-
   private def session: org.fg.spi.EngineSession =
     engine.openSession(new GatewaySession("s-1", "alice"))
 
-  /** 物化提交：首响应捕获 opId → future 完成 → 引擎侧观测 cancel。 */
+  /** 物化提交（QUERY 路径）：首响应捕获 opId → future 完成 → 引擎侧观测 cancel。 */
   @Test
   def submitDetachesAfterOperationIdEcho(): Unit = {
     val handle = new EngineExecutionHandle("spark", UUID.randomUUID().toString)
@@ -144,20 +79,89 @@ class SubmitDetachTest {
       "提交即 detach：服务端应观测到客户端 cancel（原 CancelCapture no-op 回归）")
   }
 
-  /** inline 提交：同款 detach 语义（reattach 消费者依赖此成立）。 */
+  /**
+   * D40 inline 挂流直消：请求无 ReattachOptions、首响应即 submitted、流保持打开（无
+   * cancel）、requestMore 逐条拉取全部消息、流终 COMPLETED。
+   */
   @Test
-  def submitInlineDetachesAfterOperationIdEcho(): Unit = {
-    val handle = new EngineExecutionHandle("spark", UUID.randomUUID().toString)
-    val onHandle = new CountDownLatch(1)
-    val future = engine.submitInline(
-      session, "SELECT 1", handle,
-      (_: org.fg.spi.EngineExecutionHandle) => onHandle.countDown())
+  def submitInlineHoldsStreamAndDeliversOnDemand(): Unit = {
+    val capturedRequest = new java.util.concurrent.atomic.AtomicReference[ExecutePlanRequest]()
+    val batchProto = ExecutePlanResponse.newBuilder()
+      .setResponseId("r-2")
+      .setArrowBatch(
+        org.apache.spark.connect.proto.ExecutePlanResponse.ArrowBatch.newBuilder()
+          .setRowCount(1)
+          .setData(com.google.protobuf.ByteString.copyFromUtf8("fake-ipc")))
+      .build()
+    val service = new SparkConnectServiceGrpc.SparkConnectServiceImplBase {
+      override def executePlan(
+          request: ExecutePlanRequest,
+          observer: StreamObserver[ExecutePlanResponse]): Unit = {
+        capturedRequest.set(request)
+        observer.onNext(
+          ExecutePlanResponse.newBuilder()
+            .setResponseId("r-1")
+            .setOperationId(request.getOperationId)
+            .setSchema(org.apache.spark.connect.proto.DataType.newBuilder()
+              .setStruct(org.apache.spark.connect.proto.DataType.Struct.newBuilder()))
+            .build())
+        // 连发余量（客户端手动流控按 requestMore 逐条放行——已到消息在客户端入站队列排队）
+        observer.onNext(batchProto.toBuilder().setResponseId("r-2").build())
+        observer.onNext(batchProto.toBuilder().setResponseId("r-3").build())
+        observer.onNext(ExecutePlanResponse.newBuilder()
+          .setResponseId("r-4")
+          .setResultComplete(
+            org.apache.spark.connect.proto.ExecutePlanResponse.ResultComplete.getDefaultInstance)
+          .build())
+        observer.onCompleted()
+      }
+    }
+    val srv = NettyServerBuilder.forPort(0).addService(service).build().start()
+    val eng = new SparkEngineClient(GatewayConfig.create(), s"sc://localhost:${srv.getPort}", 0)
+    try {
+      val handle = new EngineExecutionHandle("spark", "op-d40")
+      val onHandle = new CountDownLatch(1)
+      val stream = eng.submitInline(
+        eng.openSession(new GatewaySession("s-1", "alice")),
+        "SELECT 1",
+        handle,
+        (_: org.fg.spi.EngineExecutionHandle) => onHandle.countDown())
 
-    val echoed = future.get(5, TimeUnit.SECONDS)
-    Assertions.assertEquals(handle.handle(), echoed.handle())
-    Assertions.assertTrue(onHandle.await(5, TimeUnit.SECONDS), "listener.onHandle 应随首响应触发")
-    Assertions.assertTrue(
-      clientCancelled.await(5, TimeUnit.SECONDS),
-      "提交即 detach：服务端应观测到客户端 cancel（原 CancelCapture no-op 回归）")
+      // 首响应（submitted 信号）
+      stream.submitted().get(5, TimeUnit.SECONDS)
+      Assertions.assertTrue(onHandle.await(1, TimeUnit.SECONDS), "listener.onHandle 应随首响应触发")
+      // 非 reattachable：请求不携带 ReattachOptions
+      val req = capturedRequest.get
+      Assertions.assertEquals(
+          0,
+          req.getRequestOptionsCount,
+          "inline executePlan 不应携带 requestOptions（reattachable 已弃用）")
+
+      val schemas = new java.util.concurrent.atomic.AtomicInteger()
+      val batches = java.util.Collections.synchronizedList(new java.util.ArrayList[String]())
+      val completes = new java.util.concurrent.atomic.AtomicInteger()
+      stream.attach(new org.fg.spi.SqlEngine.InlineConsumer {
+        override def onSchema(s: org.apache.arrow.vector.types.pojo.Schema): Unit =
+          schemas.incrementAndGet()
+        override def onBatch(responseId: String, ipcStreamBytes: Array[Byte]): Unit =
+          batches.add(responseId)
+        override def onResultComplete(): Unit = completes.incrementAndGet()
+      })
+
+      // 逐条拉取：每条交付后才 requestMore
+      stream.requestMore()
+      stream.requestMore()
+      stream.requestMore()
+
+      val outcome = stream.outcome().get(5, TimeUnit.SECONDS)
+      Assertions.assertEquals(1, schemas.get, "onSchema 应恰好一次（首响应投递）")
+      Assertions.assertEquals(java.util.Arrays.asList("r-2", "r-3"), batches, "两批应全量到达")
+      Assertions.assertEquals(1, completes.get, "onResultComplete 应恰好一次")
+      Assertions.assertEquals(org.fg.spi.ExecutionOutcome.OutcomeStatus.COMPLETED, outcome.status())
+    } finally {
+      eng.close()
+      srv.shutdownNow()
+      srv.awaitTermination(5, TimeUnit.SECONDS)
+    }
   }
 }

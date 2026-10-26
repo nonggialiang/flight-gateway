@@ -67,36 +67,66 @@ public interface SqlEngine extends AutoCloseable {
   CompletableFuture<ExecutionOutcome> attach(EngineSession session, EngineExecutionHandle handle);
 
   /**
-   * D38 inline 提交：同 {@link #submit} 的提交即 detach，但 plan 为裸 SQL 关系（无
-   * WriteOperation/无物化）+ ReattachOptions——结果经 {@link #attachInline} 增量消费。
+   * D40 inline 提交：<b>非 reattachable</b> 挂流直消——executePlan 不带 ReattachOptions，
+   * 网关持有引擎流到终态（不 detach）。引擎侧无结果缓冲（D38 reattachable 方案的实证
+   * 缺陷：reattach 语义要求引擎保留全部未释放响应到 driver 堆，大数据量/慢客户端 =
+   * 引擎内存悬崖，实测 3g driver 在 ~900MB arrow 下崩溃并连坐全部会话）。
+   *
+   * <p>流控：初始仅取首响应（schema + operationId 回显，触发 {@link SubmitListener}）；
+   * 后续消息由消费端经 {@link InlineStream#requestMore()} 逐条拉取——客户端读多快引擎
+   * 发多快（gRPC 窗口背压）。断线即终（引擎把流 cancel 解释为 interrupt，查询作废，
+   * 客户端重新执行——inline 不物化，无续传）。
    */
-  CompletableFuture<EngineExecutionHandle> submitInline(
+  InlineStream submitInline(
       EngineSession session, String sql, EngineExecutionHandle clientHandle, SubmitListener listener);
 
   /**
-   * D38 inline 消费 attach：{@code ReattachExecute(last_response_id)}——{@code lastResponseId}
-   * 为 null 从头消费。逐批回调 {@link InlineConsumer}（回调线程=attach 流的 onNext 线程，
-   * 实现必须非阻塞或自行转交；观察者绝不抛）。返回 future 终态语义同 {@link #attach}。
+   * D40：inline 挂流句柄（提交实例持有，不跨实例）。
+   *
+   * <ul>
+   *   <li>{@link #submitted()}：首响应到达（operationId 回显）即完成——submit 确认门控
+   *       信号；异常完成 = 提交失败；</li>
+   *   <li>{@link #attach(InlineConsumer)}：绑定消费者（DoGet 到达时调用一次），已收存的
+   *       首响应（schema）先行投递；</li>
+   *   <li>{@link #requestMore()}：拉取下一条消息——消费端处理完当前批（向客户端 putNext
+   *       成功）后调用，构成端到端背压；</li>
+   *   <li>{@link #cancel(String)}：取消引擎流（引擎 interrupt 执行）——客户端断开/行取消
+   *       时调用；幂等；</li>
+   *   <li>{@link #outcome()}：执行终态（COMPLETED/FAILED/CANCELLED/UNKNOWN），流终结
+   *       （onCompleted/onError/本地 cancel）时完成。</li>
+   * </ul>
    */
-  CompletableFuture<ExecutionOutcome> attachInline(
-      EngineSession session,
-      EngineExecutionHandle handle,
-      String lastResponseId,
-      InlineConsumer consumer);
+  interface InlineStream extends AutoCloseable {
+
+    /** 首响应（schema + opId 回显）到达时完成；提交失败异常完成。 */
+    CompletableFuture<Void> submitted();
+
+    /** 绑定消费者并投递已收存的首响应（schema）。 */
+    void attach(InlineConsumer consumer);
+
+    /** 拉取下一条引擎消息（批处理完成后调用，端到端背压）。 */
+    void requestMore();
+
+    /** 取消引擎流（interrupt 执行）；幂等。 */
+    void cancel(String reason);
+
+    /** 执行终态 future（流终结时完成）。 */
+    CompletableFuture<ExecutionOutcome> outcome();
+
+    /** 同 {@link #cancel(String)}。 */
+    @Override
+    default void close() {
+      cancel("closed");
+    }
+  }
 
   /**
-   * D38 前向单游标释放：earliest_unreleased 前推到 {@code responseId} 之后（该 id 之前的
-   * 缓存响应永久不可再读——续传请求落在已释放区间由引擎报 INVALID_CURSOR，实现侧幂等）。
-   */
-  void releaseUntil(EngineExecutionHandle handle, String responseId);
-
-  /**
-   * D38：inline 逐批消费者。
+   * D38/D40：inline 逐批消费者。
    *
    * <p>{@code ipcStreamBytes} = Spark Connect ArrowBatch.data 的完整 Arrow IPC stream
    * bytes（pyspark 同款消费方式：{@code pa.ipc.open_stream(batch.data)}——自含 framing，
-   * ArrowStreamReader 可直读）。responseId = 引擎响应流位置标识（客户端续传游标，经
-   * app_metadata 回传）。
+   * ArrowStreamReader 可直读）。responseId = 引擎响应流位置标识（可为 null——非
+   * reattachable 流不保证携带；仅作 app_metadata 观测标记，无续传语义）。
    */
   interface InlineConsumer {
     void onSchema(org.apache.arrow.vector.types.pojo.Schema schema);

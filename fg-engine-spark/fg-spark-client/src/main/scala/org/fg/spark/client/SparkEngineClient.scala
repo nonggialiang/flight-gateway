@@ -132,153 +132,128 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     future
   }
 
-  // ------------------------------------------------------------- D38 inline（流式取数）
+  // ------------------------------------------------------------- D40 inline（非 reattachable 挂流直消）
 
+  /**
+   * D40：executePlan <b>无 ReattachOptions</b> + 持流不 detach + 手动入站流控——
+   * 引擎侧零结果缓冲（D38 reattachable 实证缺陷：保留未释放响应到 driver 堆，
+   * 大数据量 = 引擎内存悬崖，3g driver ~900MB arrow 崩溃连坐全部会话）。
+   * 初始 request(1) 只取首响应（schema+opId 回显，触发 listener/markSubmitted）；
+   * 消费端经 InlineStream.requestMore() 逐条拉取——端到端背压。
+   */
   override def submitInline(
       session: EngineSession,
       sql: String,
       clientHandle: EngineExecutionHandle,
-      listener: SqlEngine.SubmitListener): CompletableFuture[EngineExecutionHandle] = {
+      listener: SqlEngine.SubmitListener): SqlEngine.InlineStream = {
     val s = session.asInstanceOf[SparkEngineSession]
     val request = MaterializationPlanner.inlinePlanRequest(
       s.user, s.gatewaySessionId, sql, clientHandle.handle())
-    val future = new CompletableFuture[EngineExecutionHandle]()
-    // D39 后补：同 submit——手工持有 ClientCall，cancel 必定生效（inline 的重放消费者
-    // 依赖 detach 成立：未取消的 submit 流会吃掉全部活消息，reattach 只拿到缓冲重放）
+
+    val submittedF = new CompletableFuture[Void]()
+    val outcomeF = new CompletableFuture[ExecutionOutcome]()
+    val firstResponse = new java.util.concurrent.atomic.AtomicReference[ExecutePlanResponse]()
+    val consumerRef = new java.util.concurrent.atomic.AtomicReference[SqlEngine.InlineConsumer]()
     val callRef = new java.util.concurrent.atomic.AtomicReference[
         io.grpc.ClientCall[ExecutePlanRequest, ExecutePlanResponse]]()
-    val observer = new StreamObserver[ExecutePlanResponse] {
-      private var done = false
-      override def onNext(value: ExecutePlanResponse): Unit = synchronized {
-        if (done) {
-          // D39b 排障：detach 后仍收消息 = 引擎未把 cancel 当 detach（僵尸证据）
-          logger.info(
-            s"inline submit post-detach onNext: op=${clientHandle.handle()}" +
-              s" responseId=${value.getResponseId}")
-          return
+    val locallyCancelled = new java.util.concurrent.atomic.AtomicBoolean(false)
+
+    def dispatch(consumer: SqlEngine.InlineConsumer, value: ExecutePlanResponse): Unit = {
+      // 消费回调（attach 后的 onNext 线程）绝不抛（executeCommand 同款教训）
+      try {
+        if (value.hasSchema && value.getSchema.hasStruct) {
+          consumer.onSchema(MaterializationPlanner.toArrowSchema(value.getSchema.getStruct))
+        } else if (value.hasArrowBatch) {
+          consumer.onBatch(value.getResponseId, value.getArrowBatch.getData.toByteArray)
+        } else if (value.hasResultComplete) {
+          consumer.onResultComplete()
         }
-        val opId = value.getOperationId
-        if (opId != null && !opId.isEmpty && !future.isDone) {
-          done = true
-          try listener.onHandle(clientHandle)
-          catch { case _: Throwable => }
-          future.complete(clientHandle)
-          val call = callRef.get() // 提交即 detach（同 submit）
-          if (call != null) {
-            logger.info(s"inline submit detaching after operationId capture: op=${clientHandle.handle()}")
-            call.cancel("fg: detached after operationId capture", null)
+        // 其余（ObservedMetrics 等）忽略
+      } catch {
+        case t: Throwable =>
+          if (!outcomeF.isDone) {
+            outcomeF.complete(ExecutionOutcome.unknown("inline consumer failed: " + t))
           }
-        }
-      }
-      override def onError(t: Throwable): Unit = synchronized {
-        if (!future.isDone) future.completeExceptionally(t)
-      }
-      override def onCompleted(): Unit = synchronized {
-        if (!future.isDone) {
-          future.completeExceptionally(
-            new IllegalStateException("inline execute stream completed without operationId"))
-        }
       }
     }
+
+    val observer =
+      new io.grpc.stub.ClientResponseObserver[ExecutePlanRequest, ExecutePlanResponse] {
+        override def beforeStart(
+            requestStream: io.grpc.stub.ClientCallStreamObserver[ExecutePlanRequest]): Unit =
+          requestStream.disableAutoRequestWithInitial(1) // 仅首响应；后续 requestMore 驱动
+
+        override def onNext(value: ExecutePlanResponse): Unit = synchronized {
+          val opId = value.getOperationId
+          if (!submittedF.isDone && opId != null && !opId.isEmpty) {
+            // 首响应：opId 回显 + schema——收存待 attach 时投递（消费者此刻尚未绑定）
+            try listener.onHandle(clientHandle)
+            catch { case _: Throwable => }
+            firstResponse.set(value)
+            submittedF.complete(null)
+            return
+          }
+          val consumer = consumerRef.get
+          if (consumer != null) {
+            dispatch(consumer, value)
+          } else {
+            logger.warn(
+              s"inline stream message before consumer attached (dropped): op=${clientHandle.handle()}")
+          }
+        }
+
+        override def onError(t: Throwable): Unit = {
+          val code = t match {
+            case e: io.grpc.StatusRuntimeException => e.getStatus.getCode
+            case _ => io.grpc.Status.Code.UNKNOWN
+          }
+          if (!submittedF.isDone) {
+            submittedF.completeExceptionally(t)
+          }
+          if (locallyCancelled.get || code == io.grpc.Status.Code.CANCELLED) {
+            outcomeF.complete(ExecutionOutcome.cancelled())
+          } else {
+            outcomeF.complete(SparkEngineClient.classifyAttachError(t))
+          }
+        }
+
+        override def onCompleted(): Unit = {
+          if (!submittedF.isDone) {
+            // 流正常结束但未见 opId 回显：提交形态异常
+            submittedF.completeExceptionally(
+              new IllegalStateException("inline execute stream completed without operationId"))
+          }
+          outcomeF.complete(ExecutionOutcome.completed())
+        }
+      }
     callRef.set(channel.startServerStreaming(
       SparkConnectServiceGrpc.getExecutePlanMethod, s.user, s.gatewaySessionId, request, observer))
-    future
-  }
 
-  override def attachInline(
-      session: EngineSession,
-      handle: EngineExecutionHandle,
-      lastResponseId: String,
-      consumer: SqlEngine.InlineConsumer): CompletableFuture[ExecutionOutcome] = {
-    val s = session.asInstanceOf[SparkEngineSession]
-    val future = new CompletableFuture[ExecutionOutcome]()
-    val b = ReattachExecuteRequest.newBuilder()
-      .setSessionId(s.gatewaySessionId)
-      .setUserContext(UserContext.newBuilder().setUserId(s.user))
-      .setClientType("fg-gateway")
-      .setOperationId(handle.handle())
-    if (lastResponseId != null) {
-      b.setLastResponseId(lastResponseId) // D38:断线续传游标(空=从头消费)
-    }
-    val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
-      ch => SparkConnectServiceGrpc.newStub(ch),
-      s.user, s.gatewaySessionId)
-    val delegate = new StreamObserver[ExecutePlanResponse] {
-      override def onNext(value: ExecutePlanResponse): Unit = {
-        // 观察者绝不抛（executeCommand 同款教训：抛=grpc 吞异常伪装 CANCELLED）
-        try {
-          // D39b 排障：逐响应事实日志（定位 inline 饿死问题的关键证据——schema 后是否静默）
-          val respType =
-            if (value.hasSchema) "SCHEMA"
-            else if (value.hasArrowBatch) "ARROW_BATCH"
-            else if (value.hasResultComplete) "RESULT_COMPLETE"
-            else value.getResponseTypeCase.toString
-          val rowCount = if (value.hasArrowBatch) value.getArrowBatch.getRowCount else -1L
-          logger.info(
-            s"inline reattach onNext: op=${handle.handle()} responseId=${value.getResponseId}" +
-              s" type=$respType rowCount=$rowCount")
-          if (value.hasSchema && value.getSchema.hasStruct) {
-            consumer.onSchema(
-              MaterializationPlanner.toArrowSchema(value.getSchema.getStruct))
-          } else if (value.hasArrowBatch) {
-            val batch = value.getArrowBatch
-            consumer.onBatch(value.getResponseId, batch.getData.toByteArray)
-          } else if (value.hasResultComplete) {
-            consumer.onResultComplete()
-          }
-          // 其余（ObservedMetrics 等）忽略
-        } catch {
-          case t: Throwable =>
-            if (!future.isDone) {
-              future.complete(ExecutionOutcome.unknown("inline consumer failed: " + t))
-            }
+    new SqlEngine.InlineStream {
+      override def submitted(): CompletableFuture[Void] = submittedF
+      override def attach(consumer: SqlEngine.InlineConsumer): Unit = synchronized {
+        if (consumerRef.getAndSet(consumer) != null) {
+          logger.warn(s"inline stream consumer re-attached: op=${clientHandle.handle()}")
+        }
+        val first = firstResponse.getAndSet(null)
+        if (first != null) {
+          dispatch(consumer, first)
         }
       }
-      override def onError(t: Throwable): Unit = {
-        logger.info(s"inline reattach onError: op=${handle.handle()} err=$t")
-        future.complete(SparkEngineClient.classifyInlineAttachError(t))
+      override def requestMore(): Unit = {
+        val call = callRef.get
+        if (call != null) call.request(1)
       }
-      override def onCompleted(): Unit = {
-        logger.info(s"inline reattach onCompleted: op=${handle.handle()}")
-        future.complete(ExecutionOutcome.completed())
+      override def cancel(reason: String): Unit = {
+        locallyCancelled.set(true)
+        val call = callRef.get
+        if (call != null) {
+          call.cancel("fg: inline cancel: " + reason, null)
+        }
+        // 兜底：本地 cancel 未必回 onError(CANCELLED)
+        outcomeF.complete(ExecutionOutcome.cancelled())
       }
-    }
-    // D39b 排障修复：无界初始需求——依赖 ClientCalls 逐条 request(1) 的自动流量控制时，
-    // 服务端连发（重放缓冲恰好是连发形态）会丢消息（实测：连发 4 条丢第 2 条）。
-    // 背压已由 relayInline 的 ReadyGate 在消费端实施，此处取尽流。
-    // 正确契约（grpc 1.79 字节码实证）：beforeStart 阶段调 request() 直通
-    // ClientCallImpl.request 的 pre-start 守卫 → ISE("Not started")（现网栈实证）；
-    // pre-start 设置初始需求的唯一合法 API 是 disableAutoRequestWithInitial——
-    // start 时刻一次性发出该数量的消息需求。
-    val consumerObserver =
-      new io.grpc.stub.ClientResponseObserver[ReattachExecuteRequest, ExecutePlanResponse] {
-        override def beforeStart(
-            requestStream: io.grpc.stub.ClientCallStreamObserver[ReattachExecuteRequest]): Unit =
-          requestStream.disableAutoRequestWithInitial(Integer.MAX_VALUE)
-        override def onNext(value: ExecutePlanResponse): Unit = delegate.onNext(value)
-        override def onError(t: Throwable): Unit = delegate.onError(t)
-        override def onCompleted(): Unit = delegate.onCompleted()
-      }
-    async.reattachExecute(b.build(), consumerObserver)
-    future
-  }
-
-  override def releaseUntil(handle: EngineExecutionHandle, responseId: String): Unit = {
-    val request = ReleaseExecuteRequest.newBuilder()
-      .setUserContext(UserContext.newBuilder().setUserId("fg-gateway"))
-      .setClientType("fg-gateway")
-      .setOperationId(handle.handle())
-      .setReleaseUntil(ReleaseExecuteRequest.ReleaseUntil.newBuilder().setResponseId(responseId))
-      .build()
-    try {
-      channel
-        .unaryStub[SparkConnectServiceGrpc.SparkConnectServiceBlockingStub](
-          ch => SparkConnectServiceGrpc.newBlockingStub(ch),
-          "fg-gateway", "", 30000L)
-        .withDeadlineAfter(30, java.util.concurrent.TimeUnit.SECONDS)
-        .releaseExecute(request)
-    } catch {
-      case _: Exception => // 幂等：已释放/不存在忽略
+      override def outcome(): CompletableFuture[ExecutionOutcome] = outcomeF
     }
   }
 

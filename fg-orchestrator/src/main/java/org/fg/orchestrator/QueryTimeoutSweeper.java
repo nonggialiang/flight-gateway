@@ -9,8 +9,6 @@ import org.fg.common.config.GatewayConfig;
 import org.fg.common.service.Service;
 import org.fg.orchestrator.store.OperationRow;
 import org.fg.orchestrator.store.OperationStoreDao;
-import org.fg.spi.EngineExecutionHandle;
-import org.fg.spi.SqlEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,13 +22,11 @@ public class QueryTimeoutSweeper implements Service {
 
   private final OperationStoreDao dao;
   private final GatewayConfig config;
-  private final SqlEngine engine;
   private ScheduledExecutorService scheduler;
 
-  public QueryTimeoutSweeper(OperationStoreDao dao, GatewayConfig config, SqlEngine engine) {
+  public QueryTimeoutSweeper(OperationStoreDao dao, GatewayConfig config) {
     this.dao = dao;
     this.config = config;
-    this.engine = engine;
   }
 
   @Override
@@ -55,18 +51,10 @@ public class QueryTimeoutSweeper implements Service {
               row -> {
                 try {
                   if (dao.casFail(row.queryId(), "query timeout after " + timeoutMs + "ms")) {
+                    // D40：INLINE 挂流随持有实例/引擎消亡（非 reattachable 无引擎侧缓存可
+                    // 释放；本实例流由 relayInline/cancelInlineStream 收口，孤儿流随引擎
+                    // idle-kill/重启终结）——无需引擎 RPC
                     logger.info("Query {} timed out", row.queryId());
-                    if (row.mode() == OperationRow.Mode.INLINE
-                        && row.connectOperationId() != null) {
-                      // D38：inline 缓存只在 driver 内存——终态必须释放（幂等，任意实例可发）
-                      try {
-                        engine.releaseExecution(
-                            EngineExecutionHandle.parse(row.connectOperationId()));
-                      } catch (Exception re) {
-                        logger.debug("Inline release on timeout failed for {}: {}",
-                            row.queryId(), re.toString());
-                      }
-                    }
                   }
                 } catch (Exception e) {
                   logger.warn("Timeout sweep failed for {}: {}", row.queryId(), e.toString());

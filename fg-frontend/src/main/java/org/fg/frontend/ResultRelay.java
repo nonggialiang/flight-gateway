@@ -75,15 +75,14 @@ final class ResultRelay {
   }
 
   void relay(String user, Ticket ticket, ServerStreamListener listener) {
-    relay(user, ticket, listener, null, null);
+    relay(user, ticket, listener, null);
   }
 
   void relay(
       String user,
       Ticket ticket,
       ServerStreamListener listener,
-      PagingMiddleware.PageRequest paging,
-      String lastResponseId) { // D38:INLINE 断线续传游标(null=从头)
+      PagingMiddleware.PageRequest paging) {
     RelayTicket t;
     try {
       t = ticketCodec.decode(new String(ticket.getBytes(), java.nio.charset.StandardCharsets.UTF_8), user);
@@ -120,7 +119,7 @@ final class ResultRelay {
         QueryOrchestrator.PollOutcome out = orchestrator.pollOnce(t.queryId());
         org.fg.orchestrator.store.OperationRow inlineRow =
             out.done() ? out.row() : orchestrator.getRow(t.queryId());
-        relayInline(t, inlineRow, listener, lastResponseId);
+        relayInline(t, inlineRow, listener);
       } catch (Exception e) {
         fail(listener, CallStatus.INTERNAL, "Inline poll failed: " + e.getMessage());
       }
@@ -404,18 +403,18 @@ final class ResultRelay {
   private final java.util.Set<String> inlineInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
   /**
-   * inline 中继：attachInline(lastResponseId) → 引擎响应流逐批转发。schema 用行上
-   * schemaBytes（AnalyzePlan 去重后，防引擎流 schema 重名列不一致）；每批
-   * {@code putNext(metadata=responseId)}（metadata 直达 FlightData.app_metadata，arrow19
-   * 实证）成功后立即 {@code releaseUntil}（前推 earliest_unreleased——断线时续传零丢失）。
-   * 断流：不迁行不释放（保留续传窗口），客户端持最后 app_metadata 重连续传；流终：
-   * casComplete + releaseAll。
+   * D40 inline 中继：<b>DoGet 驱动提交 + 挂流直消</b>。消费 DoGet 到达的实例经
+   * {@link QueryOrchestrator#consumeInline} 抢占提交权（首消费）或接管本实例在途流，
+   * 引擎侧零结果缓冲（非 reattachable，无 D38 方案的 driver 堆悬崖）；端到端背压：每向
+   * 客户端 {@code putNext} 一批才 {@code requestMore} 拉下一批。schema 用行上 schemaBytes
+   * （AnalyzePlan 去重后）；每批 {@code putNext(metadata=responseId)}（可达时作观测标记）。
+   * 客户端断开：取消挂流（引擎 interrupt）→ 行 CANCELLED；断点续传不存在（non-reattachable
+   * 不可重放）——客户端收到明确错误后重新执行（inline 不物化，重跑即真相）。
    */
-  private void relayInline(
-      RelayTicket t, OperationRow row, ServerStreamListener listener, String lastResponseId) {
+  private void relayInline(RelayTicket t, OperationRow row, ServerStreamListener listener) {
     if (!inlineInFlight.add(t.queryId())) {
       fail(listener, CallStatus.INVALID_ARGUMENT,
-          "Inline stream already active for this query (forward-only cursor)");
+          "Inline stream already active for this query (forward-only)");
       return;
     }
     metrics.counter("fg.relay.streams", "kind", "INLINE").increment();
@@ -423,15 +422,13 @@ final class ResultRelay {
     ReadyGate gate = new ReadyGate(listener);
     VectorSchemaRoot out = null; // D38 泄漏修复:finally 必须关(out 的向量持 child 内存)
     try {
-      // 行终态即错误面（inline 票只服务在途消费）。D39b 修复：COMPLETED 行此前给"空完成"
-      // （无 start 无 schema）——pyarrow 直接报 "Server never sent a data message"（INTERNAL）；
-      // 且 COMPLETED 意味着 result_complete 已消费、游标已 releaseAll——无论 resume 头指向哪，
-      // 该点之后的数据都不可再取，显式 INVALID_ARGUMENT（与已释放游标同族，客户端重跑）。
+      // 行终态即错误面（inline 票只服务首消费；终态行的任何 DoGet 都不可再取数据）。
+      // COMPLETED 给"空完成"（无 start 无 schema）会让 pyarrow 报 "Server never sent a
+      // data message"（INTERNAL 裸错）——显式 INVALID_ARGUMENT（客户端重跑）。
       if (row.status().terminal()) {
         switch (row.status()) {
           case COMPLETED -> fail(listener, CallStatus.INVALID_ARGUMENT,
-              "Resume cursor no longer available (query completed and results released);"
-                  + " re-execute the query");
+              "Query already completed (results released); re-execute the query");
           case CANCELLED -> fail(listener, CallStatus.CANCELLED, "Query was cancelled");
           default -> fail(listener, CallStatus.INTERNAL,
               "Query failed: " + (row.error() == null ? "unknown" : row.error()));
@@ -443,10 +440,10 @@ final class ResultRelay {
       out = VectorSchemaRoot.create(schema, child);
       VectorLoader loader = new VectorLoader(out);
       listener.start(out);
-      // 消费回调在 attach onNext 线程执行——装载+putNext+releaseUntil 串行（背压经 gate）
+      // 消费回调在引擎流 onNext 线程执行——装载+putNext+requestMore 串行（背压端到端）
 
-      final java.util.concurrent.atomic.AtomicReference<String> lastAcked =
-          new java.util.concurrent.atomic.AtomicReference<>(lastResponseId);
+      final java.util.concurrent.atomic.AtomicReference<org.fg.spi.SqlEngine.InlineStream>
+          streamRef = new java.util.concurrent.atomic.AtomicReference<>();
 
       org.fg.spi.SqlEngine.InlineConsumer consumer =
           new org.fg.spi.SqlEngine.InlineConsumer() {
@@ -483,94 +480,86 @@ final class ResultRelay {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException(e);
               }
-              // D39b 僵尸击杀：客户端断开后（pyarrow reader.cancel() 实证不触发服务端
-              // onCancel 回调）grpc 释放流控窗口 → gate 敞开 → 缓冲余量全部灌向死流并被
-              // 静默丢弃——且逐批 releaseUntil 把游标推到底、行被 casCompleteInline 终态化
-              // → 续传 DoGet 只能拿到"已释放"错误。putNext 前查 isCancelled：本批不再投递、
-              // **不前推游标**，续传窗口保留在最后 ack 的批。
+              // 客户端已断开（onCancel 回调实证不可靠，isCancelled 兜底）：本批不再投递，
+              // 由 relay 线程的轮询取消挂流
               if (listener.isCancelled()) {
                 throw new IllegalStateException("inline client cancelled: " + t.queryId());
               }
-              // metadata 盖 responseId（SPI onBatch 直参）——直达 FlightData.app_metadata（arrow19 实证）
+              // metadata 盖 responseId（可达时作观测标记；non-reattachable 无续传语义）
               org.apache.arrow.memory.ArrowBuf meta = null;
-              if (rid != null) {
+              if (rid != null && !rid.isEmpty()) {
                 meta = child.buffer(rid.length());
                 meta.setBytes(0, rid.getBytes(java.nio.charset.StandardCharsets.UTF_8),
                     0, rid.length());
                 meta.writerIndex(rid.length());
               }
               listener.putNext(meta);
-              lastAcked.set(rid);
-              orchestrator.releaseInline(row, rid); // putNext 成功即前推（断线续传零丢失）
+              // 端到端背压核心：本批交付后才拉下一批
+              org.fg.spi.SqlEngine.InlineStream stream = streamRef.get();
+              if (stream != null) {
+                stream.requestMore();
+              }
             }
 
             @Override
             public void onResultComplete() {
-              // 流终仍以 onCompleted 为准（防御性放行）；此处仅记忆
+              // 流终以 outcome 为准（防御性）；此处仅到达通知
             }
           };
 
-      java.util.concurrent.CompletableFuture<Void> clientGone = new java.util.concurrent.CompletableFuture<>();
-      listener.setOnCancelHandler(() -> clientGone.complete(null));
-      java.util.concurrent.CompletableFuture<org.fg.spi.ExecutionOutcome> f =
-          orchestrator.attachInline(row, lastResponseId, consumer);
-      // 注:inline 的 ArrowRecordBatch 构造在 consumer 内((rowCount, bodyBuffers) 两参形态
-      // 经 CompressionUtil 兼容——见下 onBatch 实现)
+      // DoGet 驱动提交/接管（含 claim CAS、submit 失败 casFail、attach）
+      org.fg.spi.SqlEngine.InlineStream stream;
+      try {
+        stream = orchestrator.consumeInline(row, consumer).join();
+      } catch (java.util.concurrent.CompletionException e) {
+        fail(listener, CallStatus.INVALID_ARGUMENT,
+            (e.getCause() == null ? String.valueOf(e) : e.getCause().getMessage()));
+        return;
+      }
+      streamRef.set(stream);
+      stream.requestMore(); // 首响应(schema)已在 attach 时投递，拉第一条批
 
-      // 等待:引擎流终 or 客户端断流。D39b：onCancel 回调实证不可靠（pyarrow cancel 后
-      // 服务端 GetListener.onCancel 未触达）——以 500ms 轮询 listener.isCancelled() 兜底
-      java.util.concurrent.CompletableFuture<Object> either =
-          java.util.concurrent.CompletableFuture.anyOf(f, clientGone);
-      while (!f.isDone() && !clientGone.isDone()) {
+      java.util.concurrent.CompletableFuture<org.fg.spi.ExecutionOutcome> outcome = stream.outcome();
+      // 等待:流终态 or 客户端断开（isCancelled 500ms 轮询兜底 onCancel 回调缺失）
+      while (!outcome.isDone()) {
         if (listener.isCancelled()) {
-          clientGone.complete(null);
+          stream.cancel("client disconnected");
+          logger.info("Inline client cancelled stream: {}", t.queryId());
           break;
         }
         try {
-          either.get(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+          outcome.get(500, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.TimeoutException te) {
           // 回圈重查 isCancelled
         } catch (java.util.concurrent.ExecutionException ee) {
-          break; // anyOf 已完成（f 异常完成），交由下方 f.join 处理
+          break; // outcome 异常完成，下方处理
         } catch (InterruptedException ie) {
           Thread.currentThread().interrupt();
           break;
         }
       }
-      if (clientGone.isDone() && !f.isDone()) {
-        // 客户端断流：不迁行不释放（续传窗口保留）；流留给引擎缓存,由续传或 sweeper 收尾
-        logger.info("Inline client disconnected: {} lastAcked={}", t.queryId(), lastAcked.get());
-        return;
-      }
-      org.fg.spi.ExecutionOutcome outcome = f.join();
-      switch (outcome.status()) {
+
+      org.fg.spi.ExecutionOutcome result = outcome.join();
+      switch (result.status()) {
         case COMPLETED -> {
           orchestrator.casCompleteInline(t.queryId());
-          orchestrator.releaseInlineAll(row);
           listener.completed();
           logger.info("Inline relay complete: {}", t.queryId());
         }
         case CANCELLED -> {
-          orchestrator.cancelInline(row); // casCancel + releaseAll（幂等）
+          orchestrator.cancelInline(row); // casCancel + 挂流取消（幂等）
           fail(listener, CallStatus.CANCELLED, "Query was cancelled");
         }
         case FAILED -> {
-          orchestrator.casFailInline(t.queryId(), outcome.error());
-          orchestrator.releaseInlineAll(row);
-          CallStatus status = translateInlineError(outcome.error());
-          fail(listener, status,
-              status == CallStatus.INVALID_ARGUMENT
-                  ? "Resume cursor no longer available (data released); re-execute the query"
-                  : (outcome.error() == null ? "Inline failed" : outcome.error()));
+          orchestrator.casFailInline(t.queryId(), result.error());
+          fail(listener, CallStatus.INTERNAL,
+              result.error() == null ? "Inline failed" : result.error());
         }
         case UNKNOWN -> fail(listener, CallStatus.UNAVAILABLE,
-            "Inline stream interrupted; resume with x-fg-resume-response-id: "
-                + (lastAcked.get() == null ? "(from start)" : lastAcked.get()));
+            "Inline stream interrupted; re-execute the query");
       }
     } catch (Exception e) {
-      // D39b 排障：带完整堆栈——此前仅 e.toString() 吞掉了服务端栈，"Not started" 类
-      // gRPC 守卫异常无法定位触发点（classpath 字节扫描：grpc-core ClientCallImpl 的
-      // request/halfClose/sendMessage pre-start 守卫）
+      // D39b 排障：带完整堆栈（"Not started" 类 gRPC 守卫异常凭消息无法定位触发点）
       logger.warn("Inline relay failed for {}", t.queryId(), e);
       fail(listener, CallStatus.INTERNAL, "Inline relay failed: " + e.getMessage());
     } finally {
@@ -584,25 +573,6 @@ final class ResultRelay {
       }
       closeChildQuietly(child, "inline " + t.queryId());
     }
-  }
-
-  /** INVALID_CURSOR 族（字节码实证的 Spark 原生错误）→ 客户端错误面。 */
-  private static CallStatus translateInlineError(String error) {
-    if (error == null) {
-      return CallStatus.INTERNAL;
-    }
-    if (error.contains("INVALID_CURSOR.POSITION_NOT_AVAILABLE")) {
-      return CallStatus.INVALID_ARGUMENT; // 游标已释放（前向单游标协议核心错误）
-    }
-    if (error.contains("POSITION_NOT_FOUND")
-        || error.contains("NOT_REATTACHABLE")
-        || error.contains("INVALID_CURSOR.DISCONNECTED")) {
-      return CallStatus.INVALID_ARGUMENT;
-    }
-    if (error.startsWith("operation not found")) {
-      return CallStatus.NOT_FOUND;
-    }
-    return CallStatus.INTERNAL; // 引擎执行错原样透传（fail 分支带 error 文本）
   }
 
   // ------------------------------------------------------------- COMMAND（D18）

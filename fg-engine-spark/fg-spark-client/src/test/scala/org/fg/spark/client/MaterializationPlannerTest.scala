@@ -57,10 +57,9 @@ class MaterializationPlannerTest {
     assertTrue(plan.hasRoot, "inline plan must be bare SQL relation")
     assertFalse(plan.hasCommand, "inline plan must not carry WriteOperation/Command")
     assertTrue(plan.getRoot.hasSql)
+    // D40：挂流直消——不携带 ReattachOptions（reattach 保留缓冲 = 引擎内存悬崖，已弃用）
     assertTrue(
-      request.getRequestOptionsList.asScala.exists(
-        (o: org.apache.spark.connect.proto.ExecutePlanRequest.RequestOption) =>
-          o.hasReattachOptions && o.getReattachOptions.getReattachable),
-      "inline must be reattachable (result_complete 门控)")
+      request.getRequestOptionsList.isEmpty,
+      "inline must NOT carry reattach options (held-stream, non-reattachable)")
   }
 }

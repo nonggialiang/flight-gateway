@@ -657,14 +657,17 @@ def inline_stream(c, sql, expect_rows):
 
 
 def inline_resume(c, sql, expect_rows, cut_after_batches=2):
-    """D38 inline 断线续传:慢客户端(逐批 sleep→背压)消费 N 批断流 → 同票 +
-    x-fg-resume-response-id 续传 → 总行数衔接;已释放游标 → INVALID_ARGUMENT。"""
+    """D40 inline 断线语义：断流 = 查询作废（non-reattachable 不可重放）→ 行 CANCELLED
+    → 客户端收明确错误 → 重新执行拿全量。取替 D38 的 x-fg-resume-response-id 续传
+    （reattach 缓冲 = 引擎内存悬崖，D40 已弃用）。"""
+    import subprocess as sp
     headers = c.headers + [(b"x-fg-endpoint-mode", b"inline")]
     opts = fl.FlightCallOptions(headers=headers, timeout=120)
     info = c.fc.get_flight_info(command_descriptor(sql), options=opts)
+    qid = info.app_metadata.decode()
     ticket_b, _ = parse_endpoint(info.endpoints[0])
 
-    # ① 首 DoGet:慢读 N 批(sleep 让服务端 relay 在 gate.await 阻塞→消费在途)后断流
+    # ① 首 DoGet：慢读 N 批（sleep 让服务端 relay 在 gate.await 阻塞→消费在途）后断流
     reader = c.do_get(fl.Ticket(ticket_b))
     got = 0
     batches = 0
@@ -678,50 +681,52 @@ def inline_resume(c, sql, expect_rows, cut_after_batches=2):
             if chunk.data is not None:
                 got += chunk.data.num_rows
             batches += 1
-            time.sleep(0.5)  # 慢读:服务端 relay 因 isReady false 在 gate.await 阻塞
+            time.sleep(0.5)  # 慢读：服务端 relay 因 isReady false 在 gate.await 阻塞
     except StopIteration:
-        pass  # 流已完(太快)——直接跳到续传场景③
+        pass  # 流已完(太快)——直接跳到重执行场景②
     try: reader.cancel()
     except: pass
-    time.sleep(5)  # 等服务端 cancel handler 传播 + inlineInFlight 清理
-    print(f"[inline-resume] first segment: batches={batches} rows={got} lastRid={last_rid}")
+    time.sleep(3)  # 等服务端 isCancelled 轮询取消挂流 + 行迁 CANCELLED
+    print(f"[inline-reexecute] first segment: batches={batches} rows={got} lastRid={last_rid}")
 
-    if last_rid is None:
-        print("[inline-resume] SKIP: no batch received in first segment")
+    if batches == 0:
+        print("[inline-reexecute] SKIP: no batch received in first segment")
         return
 
-    # ② 续传:同票 + resume 头,读到尾
-    resume_opts = fl.FlightCallOptions(
-        headers=c.headers + [(b"x-fg-resume-response-id", last_rid.encode())],
-        timeout=120)
-    reader2 = c.fc.do_get(fl.Ticket(ticket_b), options=resume_opts)
+    # ② 断流后同票重放：明确错误（non-reattachable 不可重放）——re-execute
+    try:
+        reader2 = c.do_get(fl.Ticket(ticket_b))  # D40：终态行可能在流建立前即错
+        while True:
+            reader2.read_chunk()
+        raise AssertionError("replay of disconnected inline stream must error")
+    except Exception as e:  # FlightError/ArrowInvalid(INVALID_ARGUMENT 形态)皆收
+        assert "re-execute" in str(e).lower() or "cancel" in str(e).lower(), f"unexpected: {e}"
+    print("[inline-reexecute] replay rejected as expected")
+
+    # ③ 行终态：CANCELLED（结果大于传输窗口、流真在途）或 COMPLETED（小结果在窗口内
+    # 已全量交付——断开丢弃的是客户端缓冲，网关视角已完整送达）皆为 D40 正确语义
+    st = sp.run(["docker", "exec", "fg-pg", "psql", "-U", "fg", "-d", "flightgateway", "-tAc",
+                f"SELECT status FROM fg_operation WHERE query_id='{qid}'"],
+               capture_output=True, text=True).stdout.strip()
+    assert st in ("CANCELLED", "COMPLETED"), f"row status after disconnect = {st!r}"
+    print(f"[inline-reexecute] row {st} after disconnect PASS")
+
+    # ④ 重新执行（清掉本行避免指纹复用）拿全量
+    sp.run(["docker", "exec", "fg-pg", "psql", "-U", "fg", "-d", "flightgateway", "-tAc",
+            f"DELETE FROM fg_operation WHERE query_id='{qid}'"], capture_output=True)
+    info2 = c.fc.get_flight_info(command_descriptor(sql), options=opts)
+    ticket2, _ = parse_endpoint(info2.endpoints[0])
+    reader3 = c.fc.do_get(fl.Ticket(ticket2), options=opts)
+    total = 0
     try:
         while True:
-            chunk = reader2.read_chunk()
+            chunk = reader3.read_chunk()
             if chunk.data is not None:
-                got += chunk.data.num_rows
+                total += chunk.data.num_rows
     except StopIteration:
         pass
-    except Exception as e:
-        # 行已 COMPLETED(首段实际推完)+ 续传点已释放 → INVALID_ARGUMENT 属预期
-        if "cursor" in str(e).lower() or "re-execute" in str(e).lower():
-            print(f"[inline-resume] resume rejected (cursor released) as expected: {e}")
-            return
-        raise
-    assert got == expect_rows, f"resume total {got} != {expect_rows}"
-    print(f"[inline-resume] resumed to total={got} PASS")
-
-    # ③ 已释放游标:用首个 responseId(已被 releaseUntil)→ INVALID_ARGUMENT
-    released_opts = fl.FlightCallOptions(
-        headers=c.headers + [(b"x-fg-resume-response-id", b"1")], timeout=30)
-    try:
-        reader3 = c.fc.do_get(fl.Ticket(ticket_b), options=released_opts)
-        while True:
-            reader3.read_chunk()
-        raise AssertionError("released cursor must error")
-    except fl.FlightError as e:
-        assert "cursor" in str(e).lower() or "re-execute" in str(e).lower(), f"unexpected: {e}"
-    print("[inline-resume] released cursor rejected PASS")
+    assert total == expect_rows, f"re-execute rows {total} != {expect_rows}"
+    print(f"[inline-reexecute] re-executed to total={total} PASS")
 
 
 def inline_cancel(c, sql):
@@ -735,14 +740,15 @@ def inline_cancel(c, sql):
     time.sleep(2)  # 确保在途
     results = list(c.do_action(fl.Action("CancelFlightInfo", body)))
     assert results, "cancel returned no result"
-    reader = c.do_get(fl.Ticket(ticket_b))
+    # D40：终态行（CANCELLED）在流建立前即错——do_get 本身可能直接抛
     try:
+        reader = c.do_get(fl.Ticket(ticket_b))
         while True:
             reader.read_chunk()
         raise AssertionError("cancelled inline stream must error")
     except fl.FlightError as e:
-        # CANCELLED(正常)或 UNAVAILABLE(operation 已释放→UNKNOWN→resume 提示)都证明取消生效
-        assert "cancel" in str(e).lower() or "resume" in str(e).lower() or "cursor" in str(e).lower(), f"unexpected: {e}"
+        # CANCELLED（正常）或 UNAVAILABLE（中断→re-execute 提示）都证明取消生效
+        assert "cancel" in str(e).lower() or "re-execute" in str(e).lower(), f"unexpected: {e}"
     print("[inline-cancel] PASS")
     return qid
 
@@ -1338,7 +1344,7 @@ if __name__ == "__main__":
         https_order_by(c)
     elif which == "inline":
         inline_stream(c, "SELECT id FROM range(3000)", 3000)
-    elif which == "inline-resume":
+    elif which == "inline-resume":  # D40: 断线→作废→重执行
         inline_resume(c, "SELECT a.id FROM range(2000000) a JOIN range(50) b ON a.id % 50 = b.id", 2000000, cut_after_batches=2)
     elif which == "inline-cancel":
         inline_cancel(c, "SELECT a.id FROM range(5000000) a JOIN range(50) b ON a.id % 50 = b.id")

@@ -114,33 +114,13 @@ final class SparkEngineRouter(
         ExecutionOutcome.unknown("engine not available for attach"))
     }
 
-  // ------------------------------------------------------------- D38 inline（流式取数）
+  // ------------------------------------------------------------- D40 inline（挂流直消）
 
   override def submitInline(session: EngineSession, sql: String,
       clientHandle: EngineExecutionHandle,
-      listener: SqlEngine.SubmitListener): CompletableFuture[EngineExecutionHandle] = {
+      listener: SqlEngine.SubmitListener): SqlEngine.InlineStream = {
     val me = manager.ensureEngine(keyOf(cast(session)))
     me.client.submitInline(session, sql, clientHandle, bindListener(me.space, listener))
-  }
-
-  override def attachInline(session: EngineSession, handle: EngineExecutionHandle,
-      lastResponseId: String,
-      consumer: SqlEngine.InlineConsumer): CompletableFuture[ExecutionOutcome] =
-    manager.existingClient(keyOf(cast(session))) match {
-      case Some(client) => client.attachInline(session, handle, lastResponseId, consumer)
-      // inline 无 manifest 对账：UNKNOWN 直译客户端（relay 提示 resume 续传/重跑）
-      case None => CompletableFuture.completedFuture(
-        ExecutionOutcome.unknown("engine not available for inline attach"))
-    }
-
-  override def releaseUntil(handle: EngineExecutionHandle, responseId: String): Unit = {
-    // 同 releaseExecution：opId→engineSpace 定向（submitInline 的 bindListener 已记录），miss 广播（幂等）
-    opBindings.consume(handle.handle()) match {
-      case Some(space) =>
-        manager.clientBySpace(space).foreach(_.releaseUntil(handle, responseId))
-      case None =>
-        manager.allClients.foreach(_.releaseUntil(handle, responseId))
-    }
   }
 
   override def interrupt(session: EngineSession, handle: EngineExecutionHandle): Unit =

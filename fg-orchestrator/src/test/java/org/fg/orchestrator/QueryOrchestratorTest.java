@@ -103,6 +103,15 @@ class QueryOrchestratorTest {
               return true;
             });
     when(dao.casCancel(anyString())).thenAnswer(inv -> migrate(OperationRow.Status.CANCELLED));
+    when(dao.claimSubmitted(anyString())).thenAnswer(
+        inv -> {
+          OperationRow row = rowState.get();
+          if (row != null && row.submittedAt() == null) {
+            rowState.set(row.submittedAt(OffsetDateTime.now()));
+            return true;
+          }
+          return false;
+        });
     when(dao.markSubmitted(anyString(), anyString()))
         .thenAnswer(
             inv -> {
@@ -478,16 +487,31 @@ class QueryOrchestratorTest {
     QueryOrchestrator.PollOutcome out = orchestrator.poll("q-1");
     assertThat(out.done()).isFalse();
     verify(engine, never()).attach(any(), any()); // 信号 attach 排除
-    verify(engine, never()).attachInline(any(), any(), any(), any()); // 消费 attach 只在 DoGet
+    verify(engine, never()).submitInline(any(), anyString(), any(), any()); // D40：DoGet 驱动
   }
 
   /** 14（D38）：INLINE 行 cancel 成功后补 releaseExecution（driver 内存义务）。 */
   @Test
-  void inlineCancelReleasesEngineCache() throws Exception {
+  void inlineCancelInterruptsEngine() throws Exception {
     rowState.set(runningRow(OffsetDateTime.now(), "spark:op-14").mode(OperationRow.Mode.INLINE));
     QueryOrchestrator.CancelOutcome outcome = orchestrator.cancel("q-1");
     assertThat(outcome).isEqualTo(QueryOrchestrator.CancelOutcome.CANCELLED);
-    verify(engine).releaseExecution(any());
+    verify(engine).interrupt(any(), any()); // D40：已提交的 inline 行取消 = interrupt
+    verify(engine, never()).releaseExecution(any());
+  }
+
+  /** 14b（D40）：INLINE 行未被消费（submitted_at NULL，DoGet 驱动提交）——cancel 纯元数据
+    * 迁移，不 interrupt（执行从未开始，truthful）。 */
+  @Test
+  void inlineCancelBeforeConsumptionIsMetadataOnly() throws Exception {
+    rowState.set(
+        runningRow(OffsetDateTime.now(), "spark:op-14b")
+            .mode(OperationRow.Mode.INLINE)
+            .submittedAt(null));
+    QueryOrchestrator.CancelOutcome outcome = orchestrator.cancel("q-1");
+    assertThat(outcome).isEqualTo(QueryOrchestrator.CancelOutcome.CANCELLED);
+    verify(engine, never()).interrupt(any(), any());
+    verify(engine, never()).releaseExecution(any());
   }
 
   /** 15（D38）：INLINE 终态 terminalOutcome 不 readManifest。 */
@@ -650,61 +674,121 @@ class QueryOrchestratorTest {
     assertThat(attachCalls.get()).isZero();
   }
 
+  /** D40 测试假流：记录 attach/requestMore/cancel，submitted/outcome 可控。 */
+  private static final class FakeInlineStream implements SqlEngine.InlineStream {
+    final CompletableFuture<Void> submittedF = new CompletableFuture<>();
+    final CompletableFuture<ExecutionOutcome> outcomeF = new CompletableFuture<>();
+    final AtomicInteger attachCalls = new AtomicInteger();
+    final AtomicInteger requestMores = new AtomicInteger();
+
+    @Override
+    public CompletableFuture<Void> submitted() {
+      return submittedF;
+    }
+
+    @Override
+    public void attach(SqlEngine.InlineConsumer consumer) {
+      attachCalls.incrementAndGet();
+    }
+
+    @Override
+    public void requestMore() {
+      requestMores.incrementAndGet();
+    }
+
+    @Override
+    public void cancel(String reason) {
+      outcomeF.complete(ExecutionOutcome.cancelled());
+    }
+
+    @Override
+    public CompletableFuture<ExecutionOutcome> outcome() {
+      return outcomeF;
+    }
+  }
+
   /**
-   * 19（D39）：attachInline 门控——submit 未确认前不向引擎发起消费 attach（INLINE 快返票后
-   * DoGet 几乎即刻到达，裸 attach 必撞 not-found）；marker 落（跨实例窥行）后才 attach；
-   * 行终态且 marker 仍 NULL（submit 失败防御路径）→ 不 attach，行上真实错误直达。
+   * 19（D40）：consumeInline 首消费——claim CAS 抢占 + 本实例同步 submitInline + attach 消费者；
+   * 重复消费（同实例流在途）→ re-execute；已提交但无本地流（他实例）→ re-execute；
+   * 行终态 → 行上错误直达。
    */
   @Test
-  void attachInlineGatesOnSubmitConfirmation() throws Exception {
-    System.setProperty("fg.command.poll.interval", "100ms");
-    config = GatewayConfig.create();
-    orchestrator = new QueryOrchestrator(dao, sessions, engine, objects, config, executor);
-
-    AtomicInteger inlineCalls = new AtomicInteger();
-    CompletableFuture<ExecutionOutcome> engineInline = new CompletableFuture<>();
-    when(engine.attachInline(any(), any(), any(), any()))
+  void consumeInlineClaimsSubmitsAndAttaches() throws Exception {
+    FakeInlineStream fake = new FakeInlineStream();
+    AtomicInteger submits = new AtomicInteger();
+    when(engine.submitInline(any(), anyString(), any(), any()))
         .thenAnswer(
             inv -> {
-              inlineCalls.incrementAndGet();
-              return engineInline;
+              submits.incrementAndGet();
+              return fake;
             });
     SqlEngine.InlineConsumer consumer = mock(SqlEngine.InlineConsumer.class);
 
-    // a：未确认 → 门内等待，零 attach；marker 落（跨实例窥行）→ attach 放行
+    // a：首消费（submitted_at NULL）→ claim + submit + attach
     rowState.set(
         runningRow(OffsetDateTime.now(), "spark:op-19a")
             .mode(OperationRow.Mode.INLINE)
             .submittedAt(null));
-    CompletableFuture<ExecutionOutcome> gated =
-        orchestrator.attachInline(rowState.get(), null, consumer);
-    Thread.sleep(250);
-    assertThat(inlineCalls.get()).as("submit 未确认不得消费 attach").isZero();
-    assertThat(gated.isDone()).isFalse();
+    fake.submittedF.complete(null);
+    SqlEngine.InlineStream got = orchestrator.consumeInline(rowState.get(), consumer).get(3, TimeUnit.SECONDS);
+    assertThat(got).isSameAs(fake);
+    assertThat(submits.get()).as("首消费应同步 submitInline").isEqualTo(1);
+    assertThat(fake.attachCalls.get()).as("应 attach 消费者").isEqualTo(1);
+    verify(dao).claimSubmitted("q-1");
 
-    rowState.set(rowState.get().submittedAt(OffsetDateTime.now())); // 窥行看到 marker
-    long t0 = System.currentTimeMillis();
-    while (inlineCalls.get() == 0 && System.currentTimeMillis() - t0 < 3000) {
-      Thread.sleep(10);
-    }
-    assertThat(inlineCalls.get()).as("marker 落后应发起消费 attach").isGreaterThanOrEqualTo(1);
-    engineInline.complete(ExecutionOutcome.completed());
-    assertThat(gated.get(3, TimeUnit.SECONDS).status())
-        .isEqualTo(ExecutionOutcome.OutcomeStatus.COMPLETED);
+    // b：重复消费（同实例流在途）→ re-execute，不再提交
+    assertThatThrownBy(() -> orchestrator.consumeInline(rowState.get(), consumer).get(3, TimeUnit.SECONDS))
+        .isInstanceOf(java.util.concurrent.ExecutionException.class)
+        .hasRootCauseMessage("inline stream already active or consumed (non-reattachable,"
+            + " cannot replay); re-execute the query");
+    assertThat(submits.get()).isEqualTo(1);
 
-    // b：终态且无 marker（submit 失败）→ 不 attach，行上错误直达
-    inlineCalls.set(0);
+    // c：已提交（他实例持有）且本实例无流 → re-execute
+    orchestratorCloseQuietly(); // 摘掉本地流（模拟流已终态清理）
+    assertThatThrownBy(() -> orchestrator.consumeInline(rowState.get(), consumer).get(3, TimeUnit.SECONDS))
+        .isInstanceOf(java.util.concurrent.ExecutionException.class)
+        .hasRootCauseMessage("inline stream is held by another gateway instance"
+            + " (or its owner is gone); re-execute the query");
+    assertThat(submits.get()).isEqualTo(1);
+
+    // d：行终态 → 行上错误直达，不提交
     rowState.set(
         runningRow(OffsetDateTime.now().minusSeconds(1), "spark:op-19b")
             .mode(OperationRow.Mode.INLINE)
             .status(OperationRow.Status.FAILED)
-            .error("boom: analysis failed")
-            .submittedAt(null));
-    CompletableFuture<ExecutionOutcome> failed =
-        orchestrator.attachInline(rowState.get(), null, consumer);
-    assertThatThrownBy(() -> failed.get(3, TimeUnit.SECONDS))
+            .error("boom: analysis failed"));
+    assertThatThrownBy(() -> orchestrator.consumeInline(rowState.get(), consumer).get(3, TimeUnit.SECONDS))
         .isInstanceOf(java.util.concurrent.ExecutionException.class)
         .hasRootCauseMessage("boom: analysis failed");
-    assertThat(inlineCalls.get()).isZero();
+    assertThat(submits.get()).isEqualTo(1);
+  }
+
+  /** 19b（D40）：INLINE register 不触发执行——engine.submitInline 不被调用（DoGet 驱动）。 */
+  @Test
+  void registerInlineDoesNotTriggerExecution() throws Exception {
+    when(engine.type()).thenReturn("spark");
+    when(engine.sessionStatus(any())).thenReturn(org.fg.spi.EngineSessionStatus.dead());
+    when(engine.analyzeSchema(any(), anyString(), any())).thenReturn(null);
+    when(dao.insertOrGet(any()))
+        .thenAnswer(
+            inv -> {
+              OperationRow r = (OperationRow) inv.getArgument(0);
+              rowState.set(r.status(OperationRow.Status.RUNNING).createdAt(OffsetDateTime.now()));
+              return r;
+            });
+    orchestrator.register("s-1", "alice", "SELECT 1", OperationRow.Mode.INLINE, false, null);
+    Thread.sleep(200);
+    verify(engine, never()).submitInline(any(), anyString(), any(), any());
+    verify(dao, never()).claimSubmitted(anyString());
+  }
+
+  private void orchestratorCloseQuietly() {
+    try {
+      java.lang.reflect.Field f = QueryOrchestrator.class.getDeclaredField("inlineStreams");
+      f.setAccessible(true);
+      ((java.util.Map<?, ?>) f.get(orchestrator)).clear();
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
   }
 }

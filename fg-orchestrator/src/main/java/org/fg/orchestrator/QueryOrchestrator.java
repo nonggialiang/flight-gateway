@@ -82,13 +82,21 @@ public class QueryOrchestrator implements Service {
   private final Map<String, Long> attachRetryNotBefore = new ConcurrentHashMap<>();
 
   /**
-   * D39：本实例在途 submit future（queryId → submit/submitInline future 镜像）。在
-   * controlExecutor.submit <b>之前</b>同步注册——同实例 poll/attachInline 在 submit 任务
-   * 仍在队列时即可事件驱动等待（零轮询）；完成（含异常）即摘除。跨实例无此信号，靠行上
-   * submitted_at 标记 + 有界窥行（fg.command.poll.interval 节拍）。
+   * D39：本实例在途 submit future（queryId → submit future 镜像，QUERY 物化路径）。在
+   * controlExecutor.submit <b>之前</b>同步注册——同实例 poll 在 submit 任务仍在队列时即可
+   * 事件驱动等待（零轮询）；完成（含异常）即摘除。跨实例无此信号，靠行上 submitted_at
+   * 标记 + 有界窥行（fg.command.poll.interval 节拍）。
    */
   private final Map<String, CompletableFuture<EngineExecutionHandle>> pendingSubmits =
       new ConcurrentHashMap<>();
+
+  /**
+   * D40：本实例在途 inline 挂流（queryId → 流句柄）。<b>DoGet 驱动提交</b>——executePlan
+   * 在消费 DoGet 到达的实例上同步发起（register 只落行返票，不触发执行），流与 DoGet 同
+   * 生死：无孤儿流、无跨实例接管（非 reattachable 流不可迁移）。流终态（outcome 完成）
+   * 时摘除。
+   */
+  private final Map<String, SqlEngine.InlineStream> inlineStreams = new ConcurrentHashMap<>();
 
   public QueryOrchestrator(
       OperationStoreDao dao,
@@ -115,6 +123,7 @@ public class QueryOrchestrator implements Service {
     activeAttaches.clear();
     attachRetryNotBefore.clear();
     pendingSubmits.clear(); // D39：仅信号位，无资源持有
+    inlineStreams.clear(); // D40：仅句柄位，流随通道消亡
   }
 
   // ------------------------------------------------------------- 会话生命周期（D20）
@@ -367,8 +376,8 @@ public class QueryOrchestrator implements Service {
     OperationRow stored = dao.insertOrGet(row);
     boolean isNew = stored.queryId().equals(queryId);
 
-    if (isNew) {
-      triggerExecution(stored);
+    if (isNew && mode != OperationRow.Mode.INLINE) {
+      triggerExecution(stored); // D40：INLINE 不在 register 触发——executePlan 由消费 DoGet 驱动
     }
     return new Registration(stored, isNew);
   }
@@ -499,10 +508,9 @@ public class QueryOrchestrator implements Service {
   }
 
   /**
-   * 异步提交（提交即 detach，首响应回调落 submitted_at 标记）。schema 已随行出生（register
-   * 同步 AnalyzePlan），此处只做排序检测 + 物化规划 + 提交。D39：submit future（首响应
-   * operationId 回显即完成）镜像进 {@link #pendingSubmits}——同实例 poll/attachInline 的
-   * submit 确认门控事件驱动唤醒，零轮询。
+   * 异步提交（QUERY 物化路径；INLINE 不经此——D40 起 inline 由消费 DoGet 驱动提交）。
+   * 提交即 detach，首响应回调落 submitted_at 标记；future 镜像进 {@link #pendingSubmits}
+   * 供同实例 poll 门控（D39）。
    */
   private void triggerExecution(OperationRow row) {
     CompletableFuture<EngineExecutionHandle> signal = new CompletableFuture<>();
@@ -511,23 +519,10 @@ public class QueryOrchestrator implements Service {
     controlExecutor.submit(() -> {
       try {
         EngineSession session = openEngineSession(row);
-        // D38：inline 分叉——裸 SQL 关系 + reattachable，无物化规划（order/partitions/spec 全跳过）
         EngineExecutionHandle clientHandle =
             EngineExecutionHandle.parse(row.connectOperationId());
         CompletableFuture<EngineExecutionHandle> submitted =
-            row.mode() == OperationRow.Mode.INLINE
-                ? engine.submitInline(
-                    session,
-                    row.sqlText(),
-                    clientHandle,
-                    handle -> {
-                      try {
-                        dao.markSubmitted(row.queryId(), handle.encode());
-                      } catch (Exception e) {
-                        logger.error("Failed to mark submitted for {}", row.queryId(), e);
-                      }
-                    })
-                : submitMaterialized(session, row, clientHandle);
+            submitMaterialized(session, row, clientHandle);
         submitted.whenComplete(
             (handle, err) -> {
               try {
@@ -944,124 +939,87 @@ public class QueryOrchestrator implements Service {
         () -> new IllegalArgumentException("Unknown query: " + queryId));
   }
 
-  // ------------------------------------------------------------- D38 inline 消费/释放封装
+  // ------------------------------------------------------------- D40 inline 挂流消费封装
 
   /**
-   * inline 消费 attach（ResultRelay 专用；不经 maybeAttach——inline 由消费 DoGet 独占）。D39：
-   * submit 确认门控前置——INLINE 快返票后客户端 DoGet 几乎即刻到达，executePlan 大概率尚未被
-   * 引擎处理，裸 attach 必得 "operation not found"。门内：marker 落 → attach；行终态 → 不
-   * attach，行上真实错误直达消费端；龄超 orphan-grace 仍无 marker → "submit never confirmed"。
-   * 外部契约不变（返回 future，relayInline 的 anyOf(f, clientGone) 照旧——门只是延迟完成）。
+   * D40：inline 消费接管（ResultRelay 专用）——<b>DoGet 驱动提交</b>。
+   *
+   * <ul>
+   *   <li>本实例已有在途流 → 非可重放（non-reattachable 流已被消费），唯一路径 re-execute
+   *       （inlineInFlight 互斥已挡并发 DoGet；此处命中的是"首次 DoGet 失败后同票重放"
+   *       类场景）；</li>
+   *   <li>行 {@code submitted_at} 为 NULL（首次消费）→ {@code claimSubmitted} CAS 抢占
+   *       （并发 DoGet 落不同实例时仅一赢家）→ <b>本实例同步</b> submitInline（流与 DoGet
+   *       同生死，无孤儿流）→ attach(consumer) → 返回流；提交失败 casFail 行并抛出；</li>
+   *   <li>已提交（submitted_at 落）但本实例无流 → 流在他实例或持有实例已消亡——
+   *       non-reattachable 不可跨实例接管，re-execute。</li>
+   * </ul>
    */
-  public CompletableFuture<ExecutionOutcome> attachInline(
-      OperationRow row, String lastResponseId, SqlEngine.InlineConsumer consumer) {
-    return awaitSubmitted(row)
-        .thenCompose(
-            v -> {
-              try {
-                EngineSession session = openEngineSession(row);
-                return engine.attachInline(
-                    session,
-                    EngineExecutionHandle.parse(row.connectOperationId()),
-                    lastResponseId,
-                    consumer);
-              } catch (Exception e) {
-                return CompletableFuture.failedFuture(e);
-              }
-            });
-  }
-
-  /**
-   * D39：等待 submit 确认（submitted_at 落库）。同实例优先等 pendingSubmits future（事件驱
-   * 动）；唤醒后<b>只认 marker</b>（DB 写可见性竞态下不凭信号放行）。判定序（每轮重读行）：
-   * ① marker 已落 → 放行（<b>含终态行</b>——INLINE COMPLETED 后的续传 DoGet 须照常抵引擎吃
-   * INVALID_CURSOR 翻译，不得被门改道）；② 终态且 marker 仍 NULL（submit 失败/被取消——正常
-   * 流程不可达，防御路径）→ 行上真实错误直达，不 attach 死 opId；③ 龄超 orphan-grace 仍无
-   * marker → "submit never confirmed"。循环体在 controlExecutor，总预算 orphan-grace。
-   */
-  private CompletableFuture<Void> awaitSubmitted(OperationRow row) {
-    if (row.submittedAt() != null) {
-      return CompletableFuture.completedFuture(null);
+  public CompletableFuture<SqlEngine.InlineStream> consumeInline(
+      OperationRow row, SqlEngine.InlineConsumer consumer) {
+    if (inlineStreams.containsKey(row.queryId())) {
+      return CompletableFuture.failedFuture(
+          new IllegalStateException(
+              "inline stream already active or consumed (non-reattachable, cannot replay);"
+                  + " re-execute the query"));
     }
-    long graceMs = config.getDurationMs("fg.attach.orphan-grace");
-    long createdMs =
-        row.createdAt() == null
-            ? System.currentTimeMillis()
-            : row.createdAt().toInstant().toEpochMilli();
-    return CompletableFuture.supplyAsync(
-        () -> {
-          while (true) {
-            final OperationRow fresh;
-            try {
-              fresh =
-                  dao.get(row.queryId())
-                      .orElseThrow(
-                          () -> new IllegalStateException("Row vanished: " + row.queryId()));
-            } catch (Exception e) {
-              throw new CompletionException(e);
-            }
-            if (fresh.submittedAt() != null) {
-              return null; // submit 确认：可 attach（终态行照常放行，见 javadoc ①）
-            }
-            if (fresh.status().terminal()) {
-              // 终态且无 marker：submit 失败/被取消——真实错误直达（防御路径）
-              throw new CompletionException(
-                  new IllegalStateException(
-                      fresh.error() == null ? "query " + fresh.status() : fresh.error()));
-            }
-            long budgetMs = graceMs - (System.currentTimeMillis() - createdMs);
-            if (budgetMs <= 0) {
-              throw new CompletionException(
-                  new IllegalStateException(
-                      "submit never confirmed (engine submit RPC got no first response within"
-                          + " fg.attach.orphan-grace)"));
-            }
-            long waitMs = Math.min(budgetMs, config.getDurationMs("fg.command.poll.interval"));
-            CompletableFuture<EngineExecutionHandle> pending = pendingSubmits.get(row.queryId());
-            if (pending != null) {
-              try {
-                CompletableFuture.anyOf(pending).get(waitMs, TimeUnit.MILLISECONDS);
-              } catch (java.util.concurrent.TimeoutException te) {
-                // 本轮预算到点：回圈重读行
-              } catch (java.util.concurrent.ExecutionException ee) {
-                // submit 异常完成：行已 casFail，回圈读行见终态
-              } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                throw new CompletionException(ie);
-              }
-            } else {
-              try {
-                Thread.sleep(waitMs); // 跨实例窥行节拍（无本地信号，D37 COMMAND 同款）
-              } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                throw new CompletionException(ie);
-              }
-            }
-            // 信号已到但 marker 未可见（DB 写竞态）或仍 RUNNING 未确认：回圈
-          }
-        },
-        controlExecutor);
-  }
-
-  /** inline 前向单游标释放（消费 DoGet 逐批调用；幂等）。 */
-  public void releaseInline(OperationRow row, String responseId) {
     try {
-      engine.releaseUntil(EngineExecutionHandle.parse(row.connectOperationId()), responseId);
+      OperationRow fresh =
+          dao.get(row.queryId())
+              .orElseThrow(() -> new IllegalStateException("Row vanished: " + row.queryId()));
+      if (fresh.status().terminal()) {
+        return CompletableFuture.failedFuture(
+            new IllegalStateException(
+                fresh.error() == null ? "query " + fresh.status() : fresh.error()));
+      }
+      if (fresh.submittedAt() == null) {
+        if (!dao.claimSubmitted(row.queryId())) {
+          // 并发 DoGet 他实例先赢——本 DoGet 为重复消费
+          return CompletableFuture.failedFuture(
+              new IllegalStateException(
+                  "inline execution claimed by another request; re-execute the query"));
+        }
+        EngineSession session = openEngineSession(fresh);
+        SqlEngine.InlineStream stream =
+            engine.submitInline(
+                session,
+                fresh.sqlText(),
+                EngineExecutionHandle.parse(fresh.connectOperationId()),
+                handle -> {
+                  try {
+                    dao.markSubmitted(row.queryId(), handle.encode()); // 幂等（claim 已落）
+                  } catch (Exception e) {
+                    logger.error("Failed to mark submitted for {}", row.queryId(), e);
+                  }
+                });
+        inlineStreams.put(row.queryId(), stream);
+        stream.submitted()
+            .whenComplete(
+                (v, err) -> {
+                  if (err != null) {
+                    try {
+                      dao.casFail(row.queryId(), "submit failed: " + err);
+                    } catch (Exception e) {
+                      logger.error("Failed to mark {} failed", row.queryId(), e);
+                    }
+                  }
+                });
+        stream.outcome()
+            .whenComplete(
+                (o, e) -> inlineStreams.remove(row.queryId(), stream)); // 带 value：不误删
+        stream.attach(consumer);
+        return CompletableFuture.completedFuture(stream);
+      }
+      return CompletableFuture.failedFuture(
+          new IllegalStateException(
+              "inline stream is held by another gateway instance (or its owner is gone);"
+                  + " re-execute the query"));
     } catch (Exception e) {
-      logger.debug("Inline releaseUntil failed for {}: {}", row.queryId(), e.toString());
+      return CompletableFuture.failedFuture(e);
     }
   }
 
-  /** inline 终态全量释放（COMPLETED/CANCELLED/sweeper 兜底；幂等）。 */
-  public void releaseInlineAll(OperationRow row) {
-    try {
-      engine.releaseExecution(EngineExecutionHandle.parse(row.connectOperationId()));
-    } catch (Exception e) {
-      logger.debug("Inline releaseAll failed for {}: {}", row.queryId(), e.toString());
-    }
-  }
-
-  /** inline 终态 CAS：消费 DoGet 观测流终后迁行（与 attach 信号 CAS 竞争时条件更新幂等）。 */
+  /** inline 终态 CAS：消费 DoGet 观测流终后迁行（与 cancel CAS 竞争时条件更新幂等）。 */
   public boolean casCompleteInline(String queryId) throws Exception {
     return dao.casComplete(queryId);
   }
@@ -1075,14 +1033,26 @@ public class QueryOrchestrator implements Service {
     }
   }
 
-  /** inline 取消迁行 + 释放（消费 DoGet 观测 CANCELLED）。 */
+  /** inline 取消迁行 + 取消本实例挂流（引擎 interrupt 执行）。 */
   public void cancelInline(OperationRow row) {
     try {
       if (dao.casCancel(row.queryId())) {
-        releaseInlineAll(row);
+        cancelInlineStream(row.queryId());
       }
     } catch (Exception e) {
       logger.error("Inline cancel failed for {}", row.queryId(), e);
+    }
+  }
+
+  /** 取消本实例在途 inline 挂流（幂等；流不在/已终态为 no-op）。 */
+  private void cancelInlineStream(String queryId) {
+    SqlEngine.InlineStream stream = inlineStreams.get(queryId);
+    if (stream != null) {
+      try {
+        stream.cancel("row cancelled");
+      } catch (Exception e) {
+        logger.debug("Inline stream cancel failed for {}: {}", queryId, e.toString());
+      }
     }
   }
 
@@ -1107,6 +1077,12 @@ public class QueryOrchestrator implements Service {
       if (row.connectOperationId() == null) {
         return CancelOutcome.NOT_CANCELLABLE; // 理论不可达（行带 opId 出生）
       }
+      if (row.mode() == OperationRow.Mode.INLINE && row.submittedAt() == null) {
+        // D40：INLINE 未被消费（DoGet 驱动提交，引擎从未收到 executePlan）——行是纯元数据，
+        // 无需 interrupt，直接迁 CANCELLED（truthful：执行从未开始）
+        boolean metaCancelled = dao.casCancel(queryId);
+        return metaCancelled ? CancelOutcome.CANCELLED : CancelOutcome.NOT_CANCELLABLE;
+      }
       try {
         EngineSession session = openEngineSession(row);
         engine.interrupt(session, EngineExecutionHandle.parse(row.connectOperationId()));
@@ -1117,7 +1093,7 @@ public class QueryOrchestrator implements Service {
       }
       boolean migrated = dao.casCancel(queryId);
       if (migrated && row.mode() == OperationRow.Mode.INLINE) {
-        releaseInlineAll(row); // D38：释放引擎侧缓存（幂等，任意实例可发）
+        cancelInlineStream(queryId); // D40：取消本实例挂流（引擎 interrupt 执行）
       }
       return migrated ? CancelOutcome.CANCELLED : CancelOutcome.NOT_CANCELLABLE;
     } catch (Exception e) {

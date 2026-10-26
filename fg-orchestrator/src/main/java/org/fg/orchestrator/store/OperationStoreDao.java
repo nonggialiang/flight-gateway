@@ -205,6 +205,17 @@ public class OperationStoreDao implements Service {
   }
 
   /**
+   * D40：INLINE 消费驱动的提交抢占——首个消费 DoGet 赢得 executePlan 发起权（并发 DoGet
+   * 落不同实例仅一赢家；输家收 re-execute）。条件更新幂等。
+   */
+  public boolean claimSubmitted(String queryId) throws SQLException {
+    return update(
+        "UPDATE fg_operation SET submitted_at = now(), updated_at = now()"
+            + " WHERE query_id = ? AND submitted_at IS NULL AND status = 'RUNNING'",
+        ps -> ps.setString(1, queryId));
+  }
+
+  /**
    * D39：submit 确认——引擎首响应 operationId 回显后落 {@code submitted_at}（顺带回填
    * connect_operation_id 幂等兜底，滚动升级期旧版本行）。单一写点（submit/submitInline/
    * executeCommand 三回调），poll/attach 以此门控。无条件写：终态行也写（留证无害）。

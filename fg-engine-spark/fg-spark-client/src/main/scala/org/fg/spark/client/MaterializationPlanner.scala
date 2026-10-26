@@ -81,7 +81,12 @@ object MaterializationPlanner {
       .build()
   }
 
-  /** D38 inline 执行请求：裸 SQL 关系（无 WriteOperation/repartition）+ 预生成 operationId + REATTACHABLE（result_complete 门控必须）。 */
+  /**
+   * D40 inline 执行请求：裸 SQL 关系（无 WriteOperation/repartition）+ 预生成 operationId，
+   * <b>无 ReattachOptions</b>——挂流直消（D38 reattachable 的引擎侧保留缓冲是内存悬崖
+   * 根因：reattach 语义要求保留未释放响应到 driver 堆，实测 3g driver ~900MB arrow 崩溃）。
+   * 完成信号以流 onCompleted 为准（result_complete 消息仅作到达通知）。
+   */
   def inlinePlanRequest(
       user: String,
       sessionId: String,
@@ -96,11 +101,6 @@ object MaterializationPlanner {
       .setClientType("fg-gateway")
       .setPlan(plan)
       .setOperationId(clientOperationId)
-      .addRequestOptions(
-        ExecutePlanRequest.RequestOption.newBuilder()
-          .setReattachOptions(
-            org.apache.spark.connect.proto.ReattachOptions.newBuilder()
-              .setReattachable(true)))
       .build()
   }
 
