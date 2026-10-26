@@ -14,6 +14,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -50,7 +51,11 @@ import org.slf4j.LoggerFactory;
  *       续期）；
  *   <li>取消：Interrupt（不要求 attach）+ CAS 行迁移（"B 下杀手 A 收尸"）；
  *   <li>对账兜底：等待到点且行 RUNNING → 查 manifest 存在性，存在即自助作答并修行为
- *       COMPLETED（状态以 manifest 为准，D7）。
+ *       COMPLETED（状态以 manifest 为准，D7）；
+ *   <li>D39 submit 确认门控：行 submitted_at 未落（executePlan 尚未被引擎首响应确认）时
+ *       poll/attachInline 不发起 attach——同实例等 pendingSubmits future（事件驱动），跨实例
+ *       有界窥行；龄超 orphan-grace 仍无标记 = 从未提交成功，快败（替代 D36 的 not-found
+ *       推断式判死，消除 attach 抢跑的 "operation not found" 噪音与歧义）。
  * </ul>
  */
 public class QueryOrchestrator implements Service {
@@ -76,6 +81,15 @@ public class QueryOrchestrator implements Service {
    */
   private final Map<String, Long> attachRetryNotBefore = new ConcurrentHashMap<>();
 
+  /**
+   * D39：本实例在途 submit future（queryId → submit/submitInline future 镜像）。在
+   * controlExecutor.submit <b>之前</b>同步注册——同实例 poll/attachInline 在 submit 任务
+   * 仍在队列时即可事件驱动等待（零轮询）；完成（含异常）即摘除。跨实例无此信号，靠行上
+   * submitted_at 标记 + 有界窥行（fg.command.poll.interval 节拍）。
+   */
+  private final Map<String, CompletableFuture<EngineExecutionHandle>> pendingSubmits =
+      new ConcurrentHashMap<>();
+
   public QueryOrchestrator(
       OperationStoreDao dao,
       SessionRegistryDao sessions,
@@ -100,6 +114,7 @@ public class QueryOrchestrator implements Service {
     activeAttaches.values().forEach(f -> f.cancel(true));
     activeAttaches.clear();
     attachRetryNotBefore.clear();
+    pendingSubmits.clear(); // D39：仅信号位，无资源持有
   }
 
   // ------------------------------------------------------------- 会话生命周期（D20）
@@ -425,9 +440,9 @@ public class QueryOrchestrator implements Service {
                     row.sqlText(),
                     handle -> {
                       try {
-                        dao.setOperationId(row.queryId(), handle.encode());
+                        dao.markSubmitted(row.queryId(), handle.encode()); // D39：统一 submit 确认写点
                       } catch (Exception e) {
-                        logger.error("Failed to persist operationId for {}", row.queryId(), e);
+                        logger.error("Failed to mark submitted for {}", row.queryId(), e);
                       }
                     });
             executed.whenComplete(
@@ -484,10 +499,15 @@ public class QueryOrchestrator implements Service {
   }
 
   /**
-   * 异步提交（提交即 detach，首响应回调落 operationId）。schema 已随行出生（register 同步
-   * AnalyzePlan），此处只做排序检测 + 物化规划 + 提交。
+   * 异步提交（提交即 detach，首响应回调落 submitted_at 标记）。schema 已随行出生（register
+   * 同步 AnalyzePlan），此处只做排序检测 + 物化规划 + 提交。D39：submit future（首响应
+   * operationId 回显即完成）镜像进 {@link #pendingSubmits}——同实例 poll/attachInline 的
+   * submit 确认门控事件驱动唤醒，零轮询。
    */
   private void triggerExecution(OperationRow row) {
+    CompletableFuture<EngineExecutionHandle> signal = new CompletableFuture<>();
+    // 同步注册（先于 executor 任务）：register 返回后立刻到来的同实例 poll 即可找到信号
+    pendingSubmits.put(row.queryId(), signal);
     controlExecutor.submit(() -> {
       try {
         EngineSession session = openEngineSession(row);
@@ -502,9 +522,9 @@ public class QueryOrchestrator implements Service {
                     clientHandle,
                     handle -> {
                       try {
-                        dao.setOperationId(row.queryId(), handle.encode());
+                        dao.markSubmitted(row.queryId(), handle.encode());
                       } catch (Exception e) {
-                        logger.error("Failed to persist operationId for {}", row.queryId(), e);
+                        logger.error("Failed to mark submitted for {}", row.queryId(), e);
                       }
                     })
                 : submitMaterialized(session, row, clientHandle);
@@ -516,6 +536,14 @@ public class QueryOrchestrator implements Service {
                 }
               } catch (Exception e) {
                 logger.error("Failed to mark {} failed", row.queryId(), e);
+              } finally {
+                // 镜像完成（含异常——poller 醒来重读行，终态先于门判，无误读）：唤醒本地等待者
+                if (err != null) {
+                  signal.completeExceptionally(err);
+                } else {
+                  signal.complete(handle);
+                }
+                pendingSubmits.remove(row.queryId(), signal); // 带 value：不误删后来重建的
               }
             });
       } catch (Exception e) {
@@ -524,6 +552,9 @@ public class QueryOrchestrator implements Service {
           dao.casFail(row.queryId(), "trigger failed: " + e);
         } catch (Exception e2) {
           logger.error("Failed to mark {} failed", row.queryId(), e2);
+        } finally {
+          signal.completeExceptionally(e);
+          pendingSubmits.remove(row.queryId(), signal);
         }
       }
     });
@@ -564,11 +595,12 @@ public class QueryOrchestrator implements Service {
           spec,
           clientHandle,
           handle -> {
-            // 行已带同值 opId；此写为幂等兜底（滚动升级期旧版本行/异常路径）。
+            // 行已带同值 opId；markSubmitted 顺带回填 connect_operation_id 为幂等兜底
+            //（滚动升级期旧版本行/异常路径），主要写 submitted_at（D39 门控标记）。
             try {
-              dao.setOperationId(row.queryId(), handle.encode());
+              dao.markSubmitted(row.queryId(), handle.encode());
             } catch (Exception e) {
-              logger.error("Failed to persist operationId for {}", row.queryId(), e);
+              logger.error("Failed to mark submitted for {}", row.queryId(), e);
             }
           });
     } finally {
@@ -646,6 +678,50 @@ public class QueryOrchestrator implements Service {
         deadlineEpochMs =
             row.createdAt().toInstant().toEpochMilli()
                 + config.getDurationMs("fg.query.timeout");
+      }
+      // D39 submit 确认门控：QUERY（非 INLINE/COMMAND）行 submitted_at 未落 = executePlan 尚
+      // 未被引擎处理，attach 必得 "operation not found"——不建 attach，等 submit 确认：
+      // 本实例等 pendingSubmits future（事件驱动，ms 级唤醒）；跨实例无本地信号，按
+      // fg.command.poll.interval 有界窥行（窗口 = submit 延迟，通常 ms~s 级，唤醒罕见有界）。
+      // 终态检查在前：submit error 已 casFail 的行（marker 亦 NULL）不会被误判 never-submitted。
+      long gateRemainingMs = deadlineEpochMs - System.currentTimeMillis();
+      if (gateRemainingMs > 0
+          && row.kind() == OperationRow.Kind.QUERY
+          && row.mode() != OperationRow.Mode.INLINE
+          && row.submittedAt() == null) {
+        if (row.createdAt() != null
+            && System.currentTimeMillis() - row.createdAt().toInstant().toEpochMilli()
+                >= config.getDurationMs("fg.attach.orphan-grace")) {
+          // 触发实例死亡/submit 丢失：标记式判死（替代原 not-found 推断），快败直达
+          dao.casFail(
+              row.queryId(),
+              "submit never confirmed (engine submit RPC got no first response within"
+                  + " fg.attach.orphan-grace)");
+          continue; // 回圈即见终态 FAILED
+        }
+        CompletableFuture<EngineExecutionHandle> pending = pendingSubmits.get(row.queryId());
+        try {
+          if (pending != null) {
+            // 同实例：submit 确认/异常完成毫秒级唤醒（异常路径行已先 casFail 再唤醒）
+            CompletableFuture.anyOf(pending, cancelSignal)
+                .get(gateRemainingMs, TimeUnit.MILLISECONDS);
+          } else {
+            // 跨实例：有界窥行（COMMAND 跨实例同款节拍），醒后重读行
+            CompletableFuture.anyOf(cancelSignal)
+                .get(
+                    Math.min(
+                        gateRemainingMs, config.getDurationMs("fg.command.poll.interval")),
+                    TimeUnit.MILLISECONDS);
+          }
+        } catch (java.util.concurrent.TimeoutException te) {
+          // 预约上界到点：回圈重读行
+        } catch (java.util.concurrent.ExecutionException ee) {
+          // submit 异常完成镜像：行已 casFail，回圈见终态
+        }
+        if (cancelSignal.isDone()) {
+          throw new InterruptedException("Poll caller cancelled: " + queryId);
+        }
+        continue;
       }
       // RUNNING：QUERY 确保本实例有 attach 在挂（D36 各实例各自建，实例内 computeIfAbsent 去重）
       maybeAttach(row);
@@ -730,6 +806,9 @@ public class QueryOrchestrator implements Service {
     if (row.mode() == OperationRow.Mode.INLINE) {
       return; // D38：inline 由消费 DoGet 独占 attach（空消费 attach 会拖走 arrow_batch，正确性危害）
     }
+    if (row.submittedAt() == null) {
+      return; // D39：submit 未确认，poll 门控已拦（此处纵深防御——读行与 attach 间的竞态窗口）
+    }
     Long notBefore = attachRetryNotBefore.get(row.queryId());
     if (notBefore != null) {
       if (System.currentTimeMillis() < notBefore) {
@@ -771,17 +850,20 @@ public class QueryOrchestrator implements Service {
                       if (reconcile(row.queryId())) {
                         break;
                       }
-                      // D36 抢跑宽限：预生成 opId 的 attach 可能早于 submit 到达引擎
-                      // （"operation not found"类 UNKNOWN）——行龄 < orphan-grace 视为在途，
-                      // cooldown 重试不误杀；≥ grace 仍 not-found 且无 manifest = 从未提交
-                      // 成功，快败（原为 sweeper 600s）。
+                      // D36 抢跑宽限（D39 后语义收窄）：marker 已落的行再遇 not-found = 引擎侧
+                      // operation 消失（重启清空/驱逐），非 submit 抢跑（抢跑由 poll 门控拦截）。
+                      // 行龄 < orphan-grace 维持 cooldown 重试不误杀；≥ grace 仍 not-found 且无
+                      // manifest = 不可恢复，快败（原为 sweeper 600s）。
                       String error = outcome.error() == null ? "" : outcome.error();
                       if (error.startsWith("operation not found")
                           && row.createdAt() != null
                           && System.currentTimeMillis()
                                   - row.createdAt().toInstant().toEpochMilli()
                               >= config.getDurationMs("fg.attach.orphan-grace")) {
-                        dao.casFail(row.queryId(), "operation not found: never submitted");
+                        dao.casFail(
+                            row.queryId(),
+                            "operation not found at engine (engine restarted or operation"
+                                + " evicted)");
                         break;
                       }
                       attachRetryNotBefore.put(
@@ -864,13 +946,101 @@ public class QueryOrchestrator implements Service {
 
   // ------------------------------------------------------------- D38 inline 消费/释放封装
 
-  /** inline 消费 attach（ResultRelay 专用；不经 maybeAttach——inline 由消费 DoGet 独占）。 */
+  /**
+   * inline 消费 attach（ResultRelay 专用；不经 maybeAttach——inline 由消费 DoGet 独占）。D39：
+   * submit 确认门控前置——INLINE 快返票后客户端 DoGet 几乎即刻到达，executePlan 大概率尚未被
+   * 引擎处理，裸 attach 必得 "operation not found"。门内：marker 落 → attach；行终态 → 不
+   * attach，行上真实错误直达消费端；龄超 orphan-grace 仍无 marker → "submit never confirmed"。
+   * 外部契约不变（返回 future，relayInline 的 anyOf(f, clientGone) 照旧——门只是延迟完成）。
+   */
   public CompletableFuture<ExecutionOutcome> attachInline(
-      OperationRow row, String lastResponseId, SqlEngine.InlineConsumer consumer)
-      throws Exception {
-    EngineSession session = openEngineSession(row);
-    return engine.attachInline(
-        session, EngineExecutionHandle.parse(row.connectOperationId()), lastResponseId, consumer);
+      OperationRow row, String lastResponseId, SqlEngine.InlineConsumer consumer) {
+    return awaitSubmitted(row)
+        .thenCompose(
+            v -> {
+              try {
+                EngineSession session = openEngineSession(row);
+                return engine.attachInline(
+                    session,
+                    EngineExecutionHandle.parse(row.connectOperationId()),
+                    lastResponseId,
+                    consumer);
+              } catch (Exception e) {
+                return CompletableFuture.failedFuture(e);
+              }
+            });
+  }
+
+  /**
+   * D39：等待 submit 确认（submitted_at 落库）。同实例优先等 pendingSubmits future（事件驱
+   * 动）；唤醒后<b>只认 marker</b>（DB 写可见性竞态下不凭信号放行）。判定序（每轮重读行）：
+   * ① marker 已落 → 放行（<b>含终态行</b>——INLINE COMPLETED 后的续传 DoGet 须照常抵引擎吃
+   * INVALID_CURSOR 翻译，不得被门改道）；② 终态且 marker 仍 NULL（submit 失败/被取消——正常
+   * 流程不可达，防御路径）→ 行上真实错误直达，不 attach 死 opId；③ 龄超 orphan-grace 仍无
+   * marker → "submit never confirmed"。循环体在 controlExecutor，总预算 orphan-grace。
+   */
+  private CompletableFuture<Void> awaitSubmitted(OperationRow row) {
+    if (row.submittedAt() != null) {
+      return CompletableFuture.completedFuture(null);
+    }
+    long graceMs = config.getDurationMs("fg.attach.orphan-grace");
+    long createdMs =
+        row.createdAt() == null
+            ? System.currentTimeMillis()
+            : row.createdAt().toInstant().toEpochMilli();
+    return CompletableFuture.supplyAsync(
+        () -> {
+          while (true) {
+            final OperationRow fresh;
+            try {
+              fresh =
+                  dao.get(row.queryId())
+                      .orElseThrow(
+                          () -> new IllegalStateException("Row vanished: " + row.queryId()));
+            } catch (Exception e) {
+              throw new CompletionException(e);
+            }
+            if (fresh.submittedAt() != null) {
+              return null; // submit 确认：可 attach（终态行照常放行，见 javadoc ①）
+            }
+            if (fresh.status().terminal()) {
+              // 终态且无 marker：submit 失败/被取消——真实错误直达（防御路径）
+              throw new CompletionException(
+                  new IllegalStateException(
+                      fresh.error() == null ? "query " + fresh.status() : fresh.error()));
+            }
+            long budgetMs = graceMs - (System.currentTimeMillis() - createdMs);
+            if (budgetMs <= 0) {
+              throw new CompletionException(
+                  new IllegalStateException(
+                      "submit never confirmed (engine submit RPC got no first response within"
+                          + " fg.attach.orphan-grace)"));
+            }
+            long waitMs = Math.min(budgetMs, config.getDurationMs("fg.command.poll.interval"));
+            CompletableFuture<EngineExecutionHandle> pending = pendingSubmits.get(row.queryId());
+            if (pending != null) {
+              try {
+                CompletableFuture.anyOf(pending).get(waitMs, TimeUnit.MILLISECONDS);
+              } catch (java.util.concurrent.TimeoutException te) {
+                // 本轮预算到点：回圈重读行
+              } catch (java.util.concurrent.ExecutionException ee) {
+                // submit 异常完成：行已 casFail，回圈读行见终态
+              } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new CompletionException(ie);
+              }
+            } else {
+              try {
+                Thread.sleep(waitMs); // 跨实例窥行节拍（无本地信号，D37 COMMAND 同款）
+              } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new CompletionException(ie);
+              }
+            }
+            // 信号已到但 marker 未可见（DB 写竞态）或仍 RUNNING 未确认：回圈
+          }
+        },
+        controlExecutor);
   }
 
   /** inline 前向单游标释放（消费 DoGet 逐批调用；幂等）。 */

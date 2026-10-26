@@ -204,10 +204,15 @@ public class OperationStoreDao implements Service {
         });
   }
 
-  /** 触发实例首响应捕获 operationId 后回填（H1 映射）。 */
-  public boolean setOperationId(String queryId, String engineHandle) throws SQLException {
+  /**
+   * D39：submit 确认——引擎首响应 operationId 回显后落 {@code submitted_at}（顺带回填
+   * connect_operation_id 幂等兜底，滚动升级期旧版本行）。单一写点（submit/submitInline/
+   * executeCommand 三回调），poll/attach 以此门控。无条件写：终态行也写（留证无害）。
+   */
+  public boolean markSubmitted(String queryId, String engineHandle) throws SQLException {
     return update(
-        "UPDATE fg_operation SET connect_operation_id = ?, updated_at = now() WHERE query_id = ?",
+        "UPDATE fg_operation SET submitted_at = now(), connect_operation_id = ?,"
+            + " updated_at = now() WHERE query_id = ?",
         ps -> {
           ps.setString(1, engineHandle);
           ps.setString(2, queryId);
@@ -340,6 +345,7 @@ public class OperationStoreDao implements Service {
         .schemaBytes(rs.getBytes("schema_bytes"))
         .status(OperationRow.Status.valueOf(rs.getString("status")))
         .connectOperationId(rs.getString("connect_operation_id"))
+        .submittedAt(rs.getObject("submitted_at", OffsetDateTime.class))
         .engineRef(rs.getString("engine_ref"))
         .error(rs.getString("error"))
         .terminalAt(rs.getObject("terminal_at", OffsetDateTime.class))

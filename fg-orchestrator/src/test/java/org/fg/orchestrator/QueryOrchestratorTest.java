@@ -28,6 +28,7 @@ import org.fg.result.manifest.ResultManifest;
 import org.fg.result.store.ObjectStoreService;
 import org.fg.spi.EngineExecutionHandle;
 import org.fg.spi.EngineSession;
+import org.fg.spi.EngineSessionStatus;
 import org.fg.spi.ExecutionOutcome;
 import org.fg.spi.SqlEngine;
 import org.junit.jupiter.api.AfterAll;
@@ -102,6 +103,15 @@ class QueryOrchestratorTest {
               return true;
             });
     when(dao.casCancel(anyString())).thenAnswer(inv -> migrate(OperationRow.Status.CANCELLED));
+    when(dao.markSubmitted(anyString(), anyString()))
+        .thenAnswer(
+            inv -> {
+              OperationRow row = rowState.get();
+              if (row != null) {
+                rowState.set(row.submittedAt(OffsetDateTime.now()));
+              }
+              return true;
+            });
     when(objects.manifestExists(anyString())).thenReturn(false);
     when(engine.attach(any(), any()))
         .thenAnswer(
@@ -144,6 +154,8 @@ class QueryOrchestratorTest {
         .mode(OperationRow.Mode.RELAY)
         .status(OperationRow.Status.RUNNING)
         .connectOperationId(opId)
+        // D39：submit 已确认（存量用例默认直通 attach 路径；门控用例显式 submittedAt(null)）
+        .submittedAt(OffsetDateTime.now())
         .engineRef("spark")
         .createdAt(createdAt);
   }
@@ -378,7 +390,8 @@ class QueryOrchestratorTest {
     assertThat(out2.done()).isTrue();
     assertThat(attachCalls.get()).isGreaterThanOrEqualTo(1);
     assertThat(out2.row().status()).isEqualTo(OperationRow.Status.FAILED);
-    assertThat(out2.row().error()).contains("never submitted");
+    // D39 后语义收窄：marker 已落的 not-found = 引擎侧 operation 消失，非 never submitted
+    assertThat(out2.row().error()).contains("operation not found at engine");
   }
 
   /** 9：pollOnce（PART/页票）：终态即返、RUNNING 不等待不建 attach。 */
@@ -486,5 +499,212 @@ class QueryOrchestratorTest {
     QueryOrchestrator.PollOutcome out = orchestrator.pollOnce("q-1");
     assertThat(out.done()).isTrue();
     verify(objects, never()).readManifest(anyString());
+  }
+
+  /** 真实 register→triggerExecution 链路的公共 mock（D39 门控用例）。 */
+  private AtomicReference<SqlEngine.SubmitListener> mockSubmitChain(
+      CompletableFuture<EngineExecutionHandle> submitFuture) throws Exception {
+    when(engine.type()).thenReturn("spark"); // bornOrGet 第三参（mock 默认 null 不匹配 anyString）
+    when(engine.sessionStatus(any())).thenReturn(EngineSessionStatus.dead()); // 未锚定放行
+    when(engine.analyzeSchema(any(), anyString(), any())).thenReturn(null);
+    when(dao.insertOrGet(any()))
+        .thenAnswer(
+            inv -> {
+              OperationRow r = (OperationRow) inv.getArgument(0);
+              // 模拟 DB 默认列：真实 insertOrGet 后经 dao.get 重读时 created_at 已由 DB 落值
+              rowState.set(
+                  r.status(OperationRow.Status.RUNNING).createdAt(OffsetDateTime.now()));
+              return r;
+            });
+    AtomicReference<SqlEngine.SubmitListener> listener = new AtomicReference<>();
+    when(engine.submit(any(), anyString(), any(), any(), any()))
+        .thenAnswer(
+            inv -> {
+              listener.set(inv.getArgument(4));
+              return submitFuture;
+            });
+    return listener;
+  }
+
+  /**
+   * 16（D39）：submit 确认门控——register 落行后、引擎首响应（operationId 回显）前，poll 不
+   * 发起 attach；首响应（listener 落 marker + future 镜像完成）毫秒级唤醒后才 attach。全链
+   * 路走真实 register→triggerExecution（interval=10s 下任何快速进展都证明事件驱动而非轮询）。
+   */
+  @Test
+  void pollDuringUnsubmittedWindowWaitsForSubmitThenAttaches() throws Exception {
+    // 行级 deadline 收短到 3s：poll 在 attach future 摘除竞态（D36 已注记"醒在 deadline"）下
+    // 也能有界回收；interval=10s 仍证明 submit 确认的推进是事件驱动而非周期轮询
+    System.setProperty("fg.query.timeout", "3s");
+    config = GatewayConfig.create();
+    orchestrator = new QueryOrchestrator(dao, sessions, engine, objects, config, executor);
+
+    CompletableFuture<EngineExecutionHandle> submitFuture = new CompletableFuture<>();
+    AtomicReference<SqlEngine.SubmitListener> listener = mockSubmitChain(submitFuture);
+    attachFuture = new CompletableFuture<>(); // 不预完成：等门放行后由用例补
+
+    QueryOrchestrator.Registration reg =
+        orchestrator.register("s-1", "alice", "SELECT 1", OperationRow.Mode.RELAY, false, null);
+    assertThat(reg.newlyTriggered()).isTrue();
+    assertThat(rowState.get().submittedAt()).isNull(); // 行已出生，submit 未确认
+    long t0 = System.nanoTime();
+    long waitUntil = System.currentTimeMillis() + 3000;
+    while (listener.get() == null && System.currentTimeMillis() < waitUntil) {
+      Thread.sleep(10); // 等 triggerExecution 任务跑到 engine.submit
+    }
+    assertThat(listener.get()).isNotNull();
+
+    AtomicReference<QueryOrchestrator.PollOutcome> result = new AtomicReference<>();
+    Thread poller =
+        new Thread(
+            () -> {
+              try {
+                result.set(orchestrator.poll("q-1"));
+              } catch (Exception e) {
+                throw new RuntimeException(e);
+              }
+            });
+    poller.start();
+    Thread.sleep(200); // poll 已进入门控等待
+    assertThat(attachCalls.get()).as("submit 未确认期间不得 attach").isZero();
+
+    // 模拟引擎首响应：listener 落 marker（先）→ future 完成（后，镜像唤醒本地等待者）
+    EngineExecutionHandle handle =
+        EngineExecutionHandle.parse(rowState.get().connectOperationId());
+    listener.get().onHandle(handle);
+    submitFuture.complete(handle);
+
+    long attachUntil = System.currentTimeMillis() + 3000;
+    while (attachCalls.get() == 0 && System.currentTimeMillis() < attachUntil) {
+      Thread.sleep(10);
+    }
+    assertThat(attachCalls.get()).as("submit 确认后应发起 attach").isGreaterThanOrEqualTo(1);
+    attachFuture.complete(ExecutionOutcome.completed()); // 引擎执行完成
+    poller.join(8000);
+
+    assertThat(result.get()).isNotNull();
+    assertThat(result.get().done()).isTrue();
+    assertThat(result.get().row().status()).isEqualTo(OperationRow.Status.COMPLETED);
+    long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+    assertThat(ms)
+        .as("同实例 submit 确认应事件驱动推进（远小于 interval=10s；含 deadline 兜底上界 3s）")
+        .isLessThan(5000);
+  }
+
+  /**
+   * 17（D39）：跨实例（无本地 submit 信号）+ submit 始终未确认——窥行节拍（300ms）醒来到
+   * grace（500ms）后标记式判死 "submit never confirmed"，全程零 attach（替代 600s sweeper）。
+   */
+  @Test
+  void crossInstanceUnsubmittedFailsDeterministicallyBeyondGrace() throws Exception {
+    System.setProperty("fg.command.poll.interval", "300ms");
+    config = GatewayConfig.create();
+    orchestrator = new QueryOrchestrator(dao, sessions, engine, objects, config, executor);
+
+    rowState.set(runningRow(OffsetDateTime.now(), "spark:op-17").submittedAt(null));
+    attachFuture = new CompletableFuture<>();
+
+    long t0 = System.nanoTime();
+    QueryOrchestrator.PollOutcome out = orchestrator.poll("q-1");
+    long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+
+    assertThat(out.done()).isTrue();
+    assertThat(out.row().status()).isEqualTo(OperationRow.Status.FAILED);
+    assertThat(out.row().error()).contains("submit never confirmed");
+    assertThat(ms).as("应在 grace(500ms) 附近判死").isBetween(400L, 3000L);
+    verify(engine, never()).attach(any(), any());
+  }
+
+  /**
+   * 18（D39）：submit 异常完成（marker 恒 NULL）——行先被 casFail("submit failed: ...")，
+   * poll 醒来读行见终态直达真实错误，不误判 never-submitted（终态判定先于门）。
+   */
+  @Test
+  void submitErrorWithNullMarkerSurfacesSubmitFailed() throws Exception {
+    CompletableFuture<EngineExecutionHandle> submitFuture = new CompletableFuture<>();
+    mockSubmitChain(submitFuture);
+    attachFuture = new CompletableFuture<>();
+
+    orchestrator.register("s-1", "alice", "SELECT 1", OperationRow.Mode.RELAY, false, null);
+
+    AtomicReference<QueryOrchestrator.PollOutcome> result = new AtomicReference<>();
+    Thread poller =
+        new Thread(
+            () -> {
+              try {
+                result.set(orchestrator.poll("q-1"));
+              } catch (Exception e) {
+                throw new RuntimeException(e);
+              }
+            });
+    poller.start();
+    Thread.sleep(100);
+    submitFuture.completeExceptionally(new RuntimeException("engine down"));
+    poller.join(5000);
+
+    assertThat(result.get()).isNotNull();
+    assertThat(result.get().done()).isTrue();
+    assertThat(result.get().row().status()).isEqualTo(OperationRow.Status.FAILED);
+    assertThat(result.get().row().error()).contains("submit failed");
+    assertThat(result.get().row().error()).doesNotContain("never confirmed");
+    assertThat(attachCalls.get()).isZero();
+  }
+
+  /**
+   * 19（D39）：attachInline 门控——submit 未确认前不向引擎发起消费 attach（INLINE 快返票后
+   * DoGet 几乎即刻到达，裸 attach 必撞 not-found）；marker 落（跨实例窥行）后才 attach；
+   * 行终态且 marker 仍 NULL（submit 失败防御路径）→ 不 attach，行上真实错误直达。
+   */
+  @Test
+  void attachInlineGatesOnSubmitConfirmation() throws Exception {
+    System.setProperty("fg.command.poll.interval", "100ms");
+    config = GatewayConfig.create();
+    orchestrator = new QueryOrchestrator(dao, sessions, engine, objects, config, executor);
+
+    AtomicInteger inlineCalls = new AtomicInteger();
+    CompletableFuture<ExecutionOutcome> engineInline = new CompletableFuture<>();
+    when(engine.attachInline(any(), any(), any(), any()))
+        .thenAnswer(
+            inv -> {
+              inlineCalls.incrementAndGet();
+              return engineInline;
+            });
+    SqlEngine.InlineConsumer consumer = mock(SqlEngine.InlineConsumer.class);
+
+    // a：未确认 → 门内等待，零 attach；marker 落（跨实例窥行）→ attach 放行
+    rowState.set(
+        runningRow(OffsetDateTime.now(), "spark:op-19a")
+            .mode(OperationRow.Mode.INLINE)
+            .submittedAt(null));
+    CompletableFuture<ExecutionOutcome> gated =
+        orchestrator.attachInline(rowState.get(), null, consumer);
+    Thread.sleep(250);
+    assertThat(inlineCalls.get()).as("submit 未确认不得消费 attach").isZero();
+    assertThat(gated.isDone()).isFalse();
+
+    rowState.set(rowState.get().submittedAt(OffsetDateTime.now())); // 窥行看到 marker
+    long t0 = System.currentTimeMillis();
+    while (inlineCalls.get() == 0 && System.currentTimeMillis() - t0 < 3000) {
+      Thread.sleep(10);
+    }
+    assertThat(inlineCalls.get()).as("marker 落后应发起消费 attach").isGreaterThanOrEqualTo(1);
+    engineInline.complete(ExecutionOutcome.completed());
+    assertThat(gated.get(3, TimeUnit.SECONDS).status())
+        .isEqualTo(ExecutionOutcome.OutcomeStatus.COMPLETED);
+
+    // b：终态且无 marker（submit 失败）→ 不 attach，行上错误直达
+    inlineCalls.set(0);
+    rowState.set(
+        runningRow(OffsetDateTime.now().minusSeconds(1), "spark:op-19b")
+            .mode(OperationRow.Mode.INLINE)
+            .status(OperationRow.Status.FAILED)
+            .error("boom: analysis failed")
+            .submittedAt(null));
+    CompletableFuture<ExecutionOutcome> failed =
+        orchestrator.attachInline(rowState.get(), null, consumer);
+    assertThatThrownBy(() -> failed.get(3, TimeUnit.SECONDS))
+        .isInstanceOf(java.util.concurrent.ExecutionException.class)
+        .hasRootCauseMessage("boom: analysis failed");
+    assertThat(inlineCalls.get()).isZero();
   }
 }

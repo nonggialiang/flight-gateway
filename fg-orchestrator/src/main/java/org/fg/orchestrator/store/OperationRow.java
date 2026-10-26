@@ -58,6 +58,8 @@ public final class OperationRow {
   private byte[] schemaBytes;
   private Status status;
   private String connectOperationId;
+  /** D39：submit 确认时刻（引擎首响应 operationId 回显）；NULL = submit 未确认，poll/attach 门控等待。 */
+  private OffsetDateTime submittedAt;
   private String engineRef;
   private String error;
   private OffsetDateTime terminalAt;
@@ -190,6 +192,15 @@ public final class OperationRow {
     return this;
   }
 
+  public OffsetDateTime submittedAt() {
+    return submittedAt;
+  }
+
+  public OperationRow submittedAt(OffsetDateTime submittedAt) {
+    this.submittedAt = submittedAt;
+    return this;
+  }
+
   public String engineRef() {
     return engineRef;
   }
@@ -258,6 +269,7 @@ public final class OperationRow {
         && Arrays.equals(schemaBytes, that.schemaBytes)
         && status == that.status
         && Objects.equals(connectOperationId, that.connectOperationId)
+        && Objects.equals(submittedAt, that.submittedAt)
         && Objects.equals(engineRef, that.engineRef)
         && Objects.equals(error, that.error)
         && Objects.equals(terminalAt, that.terminalAt)
@@ -268,7 +280,7 @@ public final class OperationRow {
   @Override
   public int hashCode() {
     int result = Objects.hash(queryId, sessionRef, sqlHash, user, sqlText, resultKeyPrefix, kind,
-        mode, ordered, scrollable, status, connectOperationId,
+        mode, ordered, scrollable, status, connectOperationId, submittedAt,
         engineRef, error, terminalAt, createdAt, updatedAt);
     return 31 * result + Arrays.hashCode(schemaBytes) + 31 * Arrays.hashCode(commandResult);
   }
