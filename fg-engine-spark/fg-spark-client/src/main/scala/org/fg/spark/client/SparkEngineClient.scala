@@ -82,12 +82,11 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     val request = MaterializationPlanner.executePlanRequest(
       s.user, s.gatewaySessionId, sql, spec, clientHandle.handle())
     val future = new CompletableFuture[EngineExecutionHandle]()
-    val capture = new CancelCapture
-    val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
-      ch => SparkConnectServiceGrpc.newStub(ch),
-      s.user, s.gatewaySessionId, capture)
-
-    async.executePlan(request, new StreamObserver[ExecutePlanResponse] {
+    // D39 后补：手工持有 ClientCall——ClientCall.cancel public 且必定生效（原 CancelCapture
+    // 拦截器捕获是 no-op，断点实证 observer=null，"提交即 detach"从未生效）
+    val callRef = new java.util.concurrent.atomic.AtomicReference[
+        io.grpc.ClientCall[ExecutePlanRequest, ExecutePlanResponse]]()
+    val observer = new StreamObserver[ExecutePlanResponse] {
       private var done = false
 
       override def onNext(value: ExecutePlanResponse): Unit = synchronized {
@@ -105,8 +104,11 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
             case _: Throwable => // 触发实例回调异常不阻断 detach
           }
           future.complete(clientHandle)
-          // 提交即 detach（⑤ 主路径）：引擎照常执行、manifest 照落
-          capture.cancel("fg: detached after operationId capture")
+          // 提交即 detach（⑤ 主路径）：引擎照常执行、manifest 照落、响应进缓冲待 attach 重放
+          val call = callRef.get()
+          if (call != null) {
+            call.cancel("fg: detached after operationId capture", null)
+          }
         }
         // 其余响应（ObservedMetrics 等）由 attach 者消费
       }
@@ -124,7 +126,9 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
             new IllegalStateException("execute stream completed without operationId"))
         }
       }
-    })
+    }
+    callRef.set(channel.startServerStreaming(
+      SparkConnectServiceGrpc.getExecutePlanMethod, s.user, s.gatewaySessionId, request, observer))
     future
   }
 
@@ -139,11 +143,11 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     val request = MaterializationPlanner.inlinePlanRequest(
       s.user, s.gatewaySessionId, sql, clientHandle.handle())
     val future = new CompletableFuture[EngineExecutionHandle]()
-    val capture = new CancelCapture
-    val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
-      ch => SparkConnectServiceGrpc.newStub(ch),
-      s.user, s.gatewaySessionId, capture)
-    async.executePlan(request, new StreamObserver[ExecutePlanResponse] {
+    // D39 后补：同 submit——手工持有 ClientCall，cancel 必定生效（inline 的重放消费者
+    // 依赖 detach 成立：未取消的 submit 流会吃掉全部活消息，reattach 只拿到缓冲重放）
+    val callRef = new java.util.concurrent.atomic.AtomicReference[
+        io.grpc.ClientCall[ExecutePlanRequest, ExecutePlanResponse]]()
+    val observer = new StreamObserver[ExecutePlanResponse] {
       private var done = false
       override def onNext(value: ExecutePlanResponse): Unit = synchronized {
         if (done) return
@@ -153,7 +157,10 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
           try listener.onHandle(clientHandle)
           catch { case _: Throwable => }
           future.complete(clientHandle)
-          capture.cancel("fg: detached after operationId capture") // 提交即 detach（同 submit）
+          val call = callRef.get() // 提交即 detach（同 submit）
+          if (call != null) {
+            call.cancel("fg: detached after operationId capture", null)
+          }
         }
       }
       override def onError(t: Throwable): Unit = synchronized {
@@ -165,7 +172,9 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
             new IllegalStateException("inline execute stream completed without operationId"))
         }
       }
-    })
+    }
+    callRef.set(channel.startServerStreaming(
+      SparkConnectServiceGrpc.getExecutePlanMethod, s.user, s.gatewaySessionId, request, observer))
     future
   }
 
@@ -186,7 +195,7 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     }
     val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
       ch => SparkConnectServiceGrpc.newStub(ch),
-      s.user, s.gatewaySessionId, new CancelCapture)
+      s.user, s.gatewaySessionId)
     async.reattachExecute(b.build(), new StreamObserver[ExecutePlanResponse] {
       override def onNext(value: ExecutePlanResponse): Unit = {
         // 观察者绝不抛（executeCommand 同款教训：抛=grpc 吞异常伪装 CANCELLED）
@@ -259,10 +268,10 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     val s = session.asInstanceOf[SparkEngineSession]
     val request = MaterializationPlanner.commandPlanRequest(s.user, s.gatewaySessionId, sql)
     val future = new CompletableFuture[CommandOutcome]()
-    val capture = new CancelCapture
-    val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
-      ch => SparkConnectServiceGrpc.newStub(ch),
-      s.user, s.gatewaySessionId, capture)
+    // D39 后补：同 submit——手工持有 ClientCall（fail/超时熔断的 cancel 必定生效；
+    // 原 CancelCapture no-op 导致命令超时/结果超限时引擎流从未被取消，命令在引擎侧裸跑）
+    val callRef = new java.util.concurrent.atomic.AtomicReference[
+        io.grpc.ClientCall[ExecutePlanRequest, ExecutePlanResponse]]()
 
     val timeoutMs = config.getDurationMs("fg.command.timeout")
     val maxBytes = config.getLong("fg.command.result.max-bytes")
@@ -287,7 +296,10 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     }
 
     def fail(message: String): Unit = {
-      capture.cancel("fg: command failed: " + message)
+      val call = callRef.get()
+      if (call != null) {
+        call.cancel("fg: command failed: " + message, null)
+      }
       closeResources()
       future.complete(CommandOutcome.failed(message))
     }
@@ -299,7 +311,7 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
       },
       timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
 
-    async.executePlan(request, new StreamObserver[ExecutePlanResponse] {
+    val observer = new StreamObserver[ExecutePlanResponse] {
       override def onNext(value: ExecutePlanResponse): Unit = synchronized {
         // 观察者绝不可抛：grpc-java 会因此 cancel 流并以 CANCELLED 回调 onError，
         // 真实异常被吞（曾把 schema/batch 重组失败伪装成"Query was cancelled"）。
@@ -390,7 +402,9 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
           closeResources()
         }
       }
-    })
+    }
+    callRef.set(channel.startServerStreaming(
+      SparkConnectServiceGrpc.getExecutePlanMethod, s.user, s.gatewaySessionId, request, observer))
     future
   }
 
@@ -513,7 +527,7 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
       .build()
     val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
       ch => SparkConnectServiceGrpc.newStub(ch),
-      s.user, s.gatewaySessionId, new CancelCapture)
+      s.user, s.gatewaySessionId)
 
     async.reattachExecute(request, new StreamObserver[ExecutePlanResponse] {
       override def onNext(value: ExecutePlanResponse): Unit = {
