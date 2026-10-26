@@ -203,7 +203,7 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     val async = channel.serverStreamingStub[SparkConnectServiceGrpc.SparkConnectServiceStub](
       ch => SparkConnectServiceGrpc.newStub(ch),
       s.user, s.gatewaySessionId)
-    async.reattachExecute(b.build(), new StreamObserver[ExecutePlanResponse] {
+    val delegate = new StreamObserver[ExecutePlanResponse] {
       override def onNext(value: ExecutePlanResponse): Unit = {
         // 观察者绝不抛（executeCommand 同款教训：抛=grpc 吞异常伪装 CANCELLED）
         try {
@@ -242,7 +242,20 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
         logger.info(s"inline reattach onCompleted: op=${handle.handle()}")
         future.complete(ExecutionOutcome.completed())
       }
-    })
+    }
+    // D39b 排障修复：无界初始需求——依赖 ClientCalls 逐条 request(1) 的自动流量控制时，
+    // 服务端连发（重放缓冲恰好是连发形态）会丢消息（实测：连发 4 条丢第 2 条）。
+    // 背压已由 relayInline 的 ReadyGate 在消费端实施，此处取尽流。
+    val consumerObserver =
+      new io.grpc.stub.ClientResponseObserver[ReattachExecuteRequest, ExecutePlanResponse] {
+        override def beforeStart(
+            requestStream: io.grpc.stub.ClientCallStreamObserver[ReattachExecuteRequest]): Unit =
+          requestStream.request(Int.MaxValue)
+        override def onNext(value: ExecutePlanResponse): Unit = delegate.onNext(value)
+        override def onError(t: Throwable): Unit = delegate.onError(t)
+        override def onCompleted(): Unit = delegate.onCompleted()
+      }
+    async.reattachExecute(b.build(), consumerObserver)
     future
   }
 

@@ -58,6 +58,70 @@ class SubmitDetachTest {
     server.awaitTermination(5, TimeUnit.SECONDS)
   }
 
+  /** D39b 排障延伸：验证我们的 reattach 消费端能完整接收多消息流（排除 grpc 客户端
+    * 只 request(1) 不续读的可能——那也会表现成"恰好一条消息后静默"）。假 reattach 连发
+    * schema + 2×batch + result_complete，InlineConsumer 必须全部收到。 */
+  @Test
+  def attachInlineConsumesMultiMessageReplay(): Unit = {
+    val schemaPayload = org.apache.spark.connect.proto.ExecutePlanResponse.newBuilder()
+      .setResponseId("r-1")
+      .setOperationId("op-multi")
+      .setSchema(org.apache.spark.connect.proto.DataType.newBuilder()
+        .setStruct(org.apache.spark.connect.proto.DataType.Struct.newBuilder()))
+      .build()
+    val service = new SparkConnectServiceGrpc.SparkConnectServiceImplBase {
+      override def reattachExecute(
+          request: org.apache.spark.connect.proto.ReattachExecuteRequest,
+          observer: StreamObserver[ExecutePlanResponse]): Unit = {
+        val batchProto = org.apache.spark.connect.proto.ExecutePlanResponse.newBuilder()
+          .setResponseId("r-2")
+          .setArrowBatch(
+            org.apache.spark.connect.proto.ExecutePlanResponse.ArrowBatch.newBuilder()
+              .setRowCount(1)
+              .setData(com.google.protobuf.ByteString.copyFromUtf8("fake-ipc")))
+          .build()
+        // 连发（重放缓冲的真实形态——修复前实测丢第 2 条）
+        observer.onNext(schemaPayload)
+        observer.onNext(batchProto.toBuilder().setResponseId("r-2").build())
+        observer.onNext(batchProto.toBuilder().setResponseId("r-3").build())
+        observer.onNext(org.apache.spark.connect.proto.ExecutePlanResponse.newBuilder()
+          .setResponseId("r-4")
+          .setResultComplete(
+            org.apache.spark.connect.proto.ExecutePlanResponse.ResultComplete.getDefaultInstance)
+          .build())
+        observer.onCompleted()
+      }
+    }
+    val srv = NettyServerBuilder.forPort(0).addService(service).build().start()
+    val eng = new SparkEngineClient(GatewayConfig.create(), s"sc://localhost:${srv.getPort}", 0)
+    try {
+      val schemas = new java.util.concurrent.atomic.AtomicInteger()
+      val batches = java.util.Collections.synchronizedList(new java.util.ArrayList[String]())
+      val completes = new java.util.concurrent.atomic.AtomicInteger()
+      val outcome = eng
+        .attachInline(
+          eng.openSession(new GatewaySession("s-1", "alice")),
+          new EngineExecutionHandle("spark", "op-multi"),
+          null,
+          new org.fg.spi.SqlEngine.InlineConsumer {
+            override def onSchema(s: org.apache.arrow.vector.types.pojo.Schema): Unit =
+              schemas.incrementAndGet()
+            override def onBatch(responseId: String, ipcStreamBytes: Array[Byte]): Unit =
+              batches.add(responseId)
+            override def onResultComplete(): Unit = completes.incrementAndGet()
+          })
+        .get(5, TimeUnit.SECONDS)
+      Assertions.assertEquals(1, schemas.get, "onSchema 应恰好一次")
+      Assertions.assertEquals(java.util.Arrays.asList("r-2", "r-3"), batches, "两批应全量到达")
+      Assertions.assertEquals(1, completes.get, "onResultComplete 应恰好一次")
+      Assertions.assertEquals(org.fg.spi.ExecutionOutcome.OutcomeStatus.COMPLETED, outcome.status())
+    } finally {
+      eng.close()
+      srv.shutdownNow()
+      srv.awaitTermination(5, TimeUnit.SECONDS)
+    }
+  }
+
   private def session: org.fg.spi.EngineSession =
     engine.openSession(new GatewaySession("s-1", "alice"))
 
