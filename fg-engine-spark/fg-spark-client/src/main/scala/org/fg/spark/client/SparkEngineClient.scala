@@ -150,7 +150,13 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
     val observer = new StreamObserver[ExecutePlanResponse] {
       private var done = false
       override def onNext(value: ExecutePlanResponse): Unit = synchronized {
-        if (done) return
+        if (done) {
+          // D39b 排障：detach 后仍收消息 = 引擎未把 cancel 当 detach（僵尸证据）
+          logger.info(
+            s"inline submit post-detach onNext: op=${clientHandle.handle()}" +
+              s" responseId=${value.getResponseId}")
+          return
+        }
         val opId = value.getOperationId
         if (opId != null && !opId.isEmpty && !future.isDone) {
           done = true
@@ -159,6 +165,7 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
           future.complete(clientHandle)
           val call = callRef.get() // 提交即 detach（同 submit）
           if (call != null) {
+            logger.info(s"inline submit detaching after operationId capture: op=${clientHandle.handle()}")
             call.cancel("fg: detached after operationId capture", null)
           }
         }
@@ -200,6 +207,16 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
       override def onNext(value: ExecutePlanResponse): Unit = {
         // 观察者绝不抛（executeCommand 同款教训：抛=grpc 吞异常伪装 CANCELLED）
         try {
+          // D39b 排障：逐响应事实日志（定位 inline 饿死问题的关键证据——schema 后是否静默）
+          val respType =
+            if (value.hasSchema) "SCHEMA"
+            else if (value.hasArrowBatch) "ARROW_BATCH"
+            else if (value.hasResultComplete) "RESULT_COMPLETE"
+            else value.getResponseTypeCase.toString
+          val rowCount = if (value.hasArrowBatch) value.getArrowBatch.getRowCount else -1L
+          logger.info(
+            s"inline reattach onNext: op=${handle.handle()} responseId=${value.getResponseId}" +
+              s" type=$respType rowCount=$rowCount")
           if (value.hasSchema && value.getSchema.hasStruct) {
             consumer.onSchema(
               MaterializationPlanner.toArrowSchema(value.getSchema.getStruct))
@@ -218,9 +235,11 @@ final class SparkEngineClient(config: GatewayConfig, connectUri: String, adminPo
         }
       }
       override def onError(t: Throwable): Unit = {
+        logger.info(s"inline reattach onError: op=${handle.handle()} err=$t")
         future.complete(SparkEngineClient.classifyInlineAttachError(t))
       }
       override def onCompleted(): Unit = {
+        logger.info(s"inline reattach onCompleted: op=${handle.handle()}")
         future.complete(ExecutionOutcome.completed())
       }
     })
