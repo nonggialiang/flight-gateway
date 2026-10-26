@@ -423,10 +423,15 @@ final class ResultRelay {
     ReadyGate gate = new ReadyGate(listener);
     VectorSchemaRoot out = null; // D38 泄漏修复:finally 必须关(out 的向量持 child 内存)
     try {
-      // 行终态即错误面（inline 票只服务在途消费；终态行给终态错误/空完成）
+      // 行终态即错误面（inline 票只服务在途消费）。D39b 修复：COMPLETED 行此前给"空完成"
+      // （无 start 无 schema）——pyarrow 直接报 "Server never sent a data message"（INTERNAL）；
+      // 且 COMPLETED 意味着 result_complete 已消费、游标已 releaseAll——无论 resume 头指向哪，
+      // 该点之后的数据都不可再取，显式 INVALID_ARGUMENT（与已释放游标同族，客户端重跑）。
       if (row.status().terminal()) {
         switch (row.status()) {
-          case COMPLETED -> listener.completed(); // 已消费完的续传点：空完成（客户端已收全部）
+          case COMPLETED -> fail(listener, CallStatus.INVALID_ARGUMENT,
+              "Resume cursor no longer available (query completed and results released);"
+                  + " re-execute the query");
           case CANCELLED -> fail(listener, CallStatus.CANCELLED, "Query was cancelled");
           default -> fail(listener, CallStatus.INTERNAL,
               "Query failed: " + (row.error() == null ? "unknown" : row.error()));
@@ -478,6 +483,14 @@ final class ResultRelay {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException(e);
               }
+              // D39b 僵尸击杀：客户端断开后（pyarrow reader.cancel() 实证不触发服务端
+              // onCancel 回调）grpc 释放流控窗口 → gate 敞开 → 缓冲余量全部灌向死流并被
+              // 静默丢弃——且逐批 releaseUntil 把游标推到底、行被 casCompleteInline 终态化
+              // → 续传 DoGet 只能拿到"已释放"错误。putNext 前查 isCancelled：本批不再投递、
+              // **不前推游标**，续传窗口保留在最后 ack 的批。
+              if (listener.isCancelled()) {
+                throw new IllegalStateException("inline client cancelled: " + t.queryId());
+              }
               // metadata 盖 responseId（SPI onBatch 直参）——直达 FlightData.app_metadata（arrow19 实证）
               org.apache.arrow.memory.ArrowBuf meta = null;
               if (rid != null) {
@@ -504,10 +517,26 @@ final class ResultRelay {
       // 注:inline 的 ArrowRecordBatch 构造在 consumer 内((rowCount, bodyBuffers) 两参形态
       // 经 CompressionUtil 兼容——见下 onBatch 实现)
 
-      // 等待:引擎流终 or 客户端断流
+      // 等待:引擎流终 or 客户端断流。D39b：onCancel 回调实证不可靠（pyarrow cancel 后
+      // 服务端 GetListener.onCancel 未触达）——以 500ms 轮询 listener.isCancelled() 兜底
       java.util.concurrent.CompletableFuture<Object> either =
           java.util.concurrent.CompletableFuture.anyOf(f, clientGone);
-      either.join();
+      while (!f.isDone() && !clientGone.isDone()) {
+        if (listener.isCancelled()) {
+          clientGone.complete(null);
+          break;
+        }
+        try {
+          either.get(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException te) {
+          // 回圈重查 isCancelled
+        } catch (java.util.concurrent.ExecutionException ee) {
+          break; // anyOf 已完成（f 异常完成），交由下方 f.join 处理
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          break;
+        }
+      }
       if (clientGone.isDone() && !f.isDone()) {
         // 客户端断流：不迁行不释放（续传窗口保留）；流留给引擎缓存,由续传或 sweeper 收尾
         logger.info("Inline client disconnected: {} lastAcked={}", t.queryId(), lastAcked.get());
